@@ -40,7 +40,7 @@ public static class KitchenEndpoints
         await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
             """
             SELECT o.PreparationId, o.OrderNumber, o.SaleId, o.BranchId, o.PrintGroupId,
-                   o.CustomerName, o.TotalH, o.Status, o.CreatedAtUtc, o.UpdatedAtUtc,
+                   o.CustomerName, o.TotalH, o.Status, o.OrderType, o.CreatedAtUtc, o.UpdatedAtUtc,
                    DATEDIFF(SECOND, o.CreatedAtUtc, SYSUTCDATETIME()) AS ElapsedSeconds
             FROM sales.PreparationOrder AS o
             WHERE (@BranchId IS NULL OR o.BranchId = @BranchId OR o.BranchId IS NULL)

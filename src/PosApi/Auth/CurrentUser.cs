@@ -16,43 +16,47 @@ public interface ICurrentUser
 
 public sealed class CurrentUser : ICurrentUser
 {
-    private readonly ClaimsPrincipal? _principal;
+    private readonly IHttpContextAccessor _accessor;
 
-    public CurrentUser(IHttpContextAccessor accessor)
-    {
-        _principal = accessor.HttpContext?.User;
+    public CurrentUser(IHttpContextAccessor accessor) => _accessor = accessor;
 
-        Permissions = _principal?.FindAll(JwtTokenService.PermissionClaim)
-            .Select(c => c.Value).ToHashSet(StringComparer.OrdinalIgnoreCase)
-            ?? new HashSet<string>();
+    /*
+     * Read on every access, never captured in the constructor.
+     *
+     * The audit middleware runs before authentication and asks for this
+     * service, so a scoped instance is built while the request is still
+     * anonymous. Capturing the principal then froze that anonymous user for the
+     * whole request: /me returned 401, every actor was blank, and an empty
+     * branch set made CanSeeBranch allow every branch.
+     */
+    private ClaimsPrincipal? Principal => _accessor.HttpContext?.User;
 
-        BranchIds = _principal?.FindAll(JwtTokenService.BranchClaim)
-            .Select(c => c.Value).ToHashSet(StringComparer.OrdinalIgnoreCase)
-            ?? new HashSet<string>();
-    }
-
-    public bool IsAuthenticated => _principal?.Identity?.IsAuthenticated ?? false;
+    public bool IsAuthenticated => Principal?.Identity?.IsAuthenticated ?? false;
 
     /* Inbound claim mapping is off, so these are the names the token actually
        carries. The ClaimTypes fallbacks cover a token minted before that
        change, so an existing session does not break on deploy. */
     public string UserId =>
-        _principal?.FindFirstValue("sub")
-        ?? _principal?.FindFirstValue(ClaimTypes.NameIdentifier)
+        Principal?.FindFirstValue("sub")
+        ?? Principal?.FindFirstValue(ClaimTypes.NameIdentifier)
         ?? string.Empty;
 
     public string Username =>
-        _principal?.FindFirstValue("unique_name")
-        ?? _principal?.FindFirstValue(ClaimTypes.Name)
+        Principal?.FindFirstValue("unique_name")
+        ?? Principal?.FindFirstValue(ClaimTypes.Name)
         ?? string.Empty;
 
     public string RoleId =>
-        _principal?.FindFirstValue(ClaimTypes.Role)
-        ?? _principal?.FindFirstValue("role")
+        Principal?.FindFirstValue(ClaimTypes.Role)
+        ?? Principal?.FindFirstValue("role")
         ?? string.Empty;
 
-    public IReadOnlySet<string> Permissions { get; }
-    public IReadOnlySet<string> BranchIds { get; }
+    public IReadOnlySet<string> Permissions => ClaimSet(JwtTokenService.PermissionClaim);
+    public IReadOnlySet<string> BranchIds => ClaimSet(JwtTokenService.BranchClaim);
+
+    private HashSet<string> ClaimSet(string type) =>
+        Principal?.FindAll(type).Select(c => c.Value).ToHashSet(StringComparer.OrdinalIgnoreCase)
+        ?? new HashSet<string>();
 
     public bool Can(string permission) => Permissions.Contains(permission);
 

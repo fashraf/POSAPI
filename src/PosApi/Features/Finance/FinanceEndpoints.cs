@@ -2,6 +2,7 @@ using Dapper;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
+using PosApi.Localization;
 
 namespace PosApi.Features.Finance;
 
@@ -113,14 +114,29 @@ public static class FinanceEndpoints
     /// The finance dashboard figures for one month.
     ///
     /// Derived from the ledger rather than recomputed from sales, so every
-    /// number on the screen can be traced to the entries behind it.
+    /// number on the screen can be traced to the entries behind it. The
+    /// payment mix and refunds are the exception: they describe how sales
+    /// were tendered, which lives on the sale.
+    ///
+    /// Branch scoping: with no <c>branchId</c> the figures cover every entry.
+    /// With one, the top-level figures cover only entries tagged to that
+    /// branch, and entries with no branch (business-wide costs such as rent
+    /// or payroll recorded without a branch) are reported separately under
+    /// <c>businessWide</c> — never folded into every branch's figures.
     /// </summary>
     private static async Task<IResult> SummaryAsync(
-        ISqlConnectionFactory db, string? branchId, string? month, CancellationToken ct = default)
+        ISqlConnectionFactory db, ICurrentUser current, ILanguageContext language,
+        string? branchId, string? month, CancellationToken ct = default)
     {
         var period = string.IsNullOrWhiteSpace(month)
             ? DateTime.UtcNow.ToString("yyyy-MM")
-            : month;
+            : month.Trim();
+
+        if (!DateOnly.TryParseExact(period + "-01", "yyyy-MM-dd", out _))
+            return ProcErrors.Field("month", "Months are YYYY-MM.", "الشهر بصيغة YYYY-MM.");
+
+        var branch = ProcErrors.Blank(branchId);
+        if (!current.CanSeeBranch(branch)) return Results.Forbid();
 
         await using var connection = db.Create();
 
@@ -128,35 +144,151 @@ public static class FinanceEndpoints
             DECLARE @Start DATE = CAST(@Period + '-01' AS DATE);
             DECLARE @Next  DATE = DATEADD(MONTH, 1, @Start);
 
-            WITH Scoped AS (
-                SELECT l.AccountCode, l.DebitH, l.CreditH
-                FROM fin.JournalEntry AS e
-                JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId
-                WHERE e.PostedAtUtc >= @Start AND e.PostedAtUtc < @Next
-                  AND (@BranchId IS NULL OR e.BranchId = @BranchId OR e.BranchId IS NULL)
-            ),
-            AllTime AS (
-                SELECT l.AccountCode, l.DebitH, l.CreditH
-                FROM fin.JournalEntry AS e
-                JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId
-                WHERE (@BranchId IS NULL OR e.BranchId = @BranchId OR e.BranchId IS NULL)
-            )
+            -- 1. Per account, per scope: the month's movement and the all-time balance.
             SELECT
-                ISNULL((SELECT SUM(CreditH - DebitH) FROM Scoped WHERE AccountCode = '4100'), 0) AS RevenueH,
-                ISNULL((SELECT SUM(DebitH - CreditH) FROM Scoped WHERE AccountCode = '5100'), 0) AS CogsH,
-                ISNULL((SELECT SUM(DebitH - CreditH) FROM Scoped
-                        WHERE AccountCode IN ('6000','6100','6200','6300','5200')), 0) AS ExpensesH,
-                ISNULL((SELECT SUM(DebitH - CreditH) FROM AllTime WHERE AccountCode IN ('1000','1100')), 0) AS CashH,
-                ISNULL((SELECT SUM(DebitH - CreditH) FROM AllTime WHERE AccountCode = '1400'), 0) AS ReceivableH,
-                ISNULL((SELECT SUM(CreditH - DebitH) FROM AllTime WHERE AccountCode = '2000'), 0) AS PayableH,
-                ISNULL((SELECT SUM(DebitH - CreditH) FROM AllTime WHERE AccountCode = '1500'), 0) AS PrepaidH,
-                ISNULL((SELECT SUM(DebitH - CreditH) FROM AllTime WHERE AccountCode = '1150'), 0) AS CardClearingH;
+                CASE WHEN e.BranchId IS NULL THEN N'business' ELSE N'branch' END AS Scope,
+                l.AccountCode,
+                SUM(CASE WHEN e.PostedAtUtc >= @Start AND e.PostedAtUtc < @Next THEN l.DebitH  ELSE 0 END) AS PeriodDebitH,
+                SUM(CASE WHEN e.PostedAtUtc >= @Start AND e.PostedAtUtc < @Next THEN l.CreditH ELSE 0 END) AS PeriodCreditH,
+                SUM(CASE WHEN e.PostedAtUtc >= @Start AND e.PostedAtUtc < @Next AND e.Kind = N'return'
+                         THEN l.DebitH - l.CreditH ELSE 0 END) AS PeriodReturnNetH,
+                SUM(l.DebitH)  AS TotalDebitH,
+                SUM(l.CreditH) AS TotalCreditH
+            FROM fin.JournalEntry AS e
+            JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId
+            WHERE (@BranchId IS NULL OR e.BranchId = @BranchId OR e.BranchId IS NULL)
+            GROUP BY CASE WHEN e.BranchId IS NULL THEN N'business' ELSE N'branch' END, l.AccountCode;
+
+            -- 2. Operating expense accounts, for the per-account split.
+            SELECT AccountCode, NameAr, NameEn FROM fin.Account
+            WHERE AccountType = N'expense' AND AccountCode <> N'5100'
+            ORDER BY AccountCode;
+
+            -- 3. How the month's sales were tendered (voided sales excluded).
+            SELECT p.Method, SUM(p.AmountH) AS AmountH
+            FROM sales.SalePayment AS p
+            JOIN sales.Sale AS s ON s.SaleId = p.SaleId
+            WHERE s.Status <> N'voided' AND s.SoldAtUtc >= @Start AND s.SoldAtUtc < @Next
+              AND (@BranchId IS NULL OR s.BranchId = @BranchId)
+            GROUP BY p.Method;
+
+            SELECT ISNULL(SUM(s.ChangeH), 0) AS ChangeH, COUNT(*) AS SaleCount
+            FROM sales.Sale AS s
+            WHERE s.Status <> N'voided' AND s.SoldAtUtc >= @Start AND s.SoldAtUtc < @Next
+              AND (@BranchId IS NULL OR s.BranchId = @BranchId);
+
+            -- 4. Refunds on credit notes issued in the month.
+            SELECT ISNULL(r.RefundMethod, N'cash') AS Method, SUM(r.RefundH) AS AmountH, COUNT(*) AS NoteCount
+            FROM sales.SaleReturn AS r
+            WHERE r.ReturnedAtUtc >= @Start AND r.ReturnedAtUtc < @Next
+              AND (@BranchId IS NULL OR r.BranchId = @BranchId)
+            GROUP BY ISNULL(r.RefundMethod, N'cash');
             """;
 
-        var summary = await connection.QuerySingleAsync(new CommandDefinition(sql,
-            new { Period = period, BranchId = branchId }, cancellationToken: ct));
+        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(sql,
+            new { Period = period, BranchId = branch }, cancellationToken: ct));
 
-        return Results.Ok(summary);
+        var accounts = (await multi.ReadAsync<SummaryAccountRow>()).ToList();
+        var expenseAccounts = (await multi.ReadAsync<(string AccountCode, string NameAr, string NameEn)>()).ToList();
+        var tendered = (await multi.ReadAsync<(string Method, long AmountH)>()).ToDictionary(r => r.Method, r => r.AmountH);
+        var sales = await multi.ReadSingleAsync<(long ChangeH, int SaleCount)>();
+        var refunds = (await multi.ReadAsync<(string Method, long AmountH, int NoteCount)>()).ToList();
+
+        SummaryFigures Figures(Func<SummaryAccountRow, bool> inScope)
+        {
+            var rows = accounts.Where(inScope).ToList();
+
+            long Period(string code, bool debitNormal) => rows.Where(r => r.AccountCode == code)
+                .Sum(r => debitNormal ? r.PeriodDebitH - r.PeriodCreditH : r.PeriodCreditH - r.PeriodDebitH);
+
+            long Balance(bool debitNormal, params string[] codes) => rows.Where(r => codes.Contains(r.AccountCode))
+                .Sum(r => debitNormal ? r.TotalDebitH - r.TotalCreditH : r.TotalCreditH - r.TotalDebitH);
+
+            var byAccount = expenseAccounts.Select(a => new ExpenseAccountAmount(
+                a.AccountCode, a.NameAr, a.NameEn, language.Pick(a.NameAr, a.NameEn),
+                Period(a.AccountCode, true))).ToList();
+
+            return new SummaryFigures(
+                Period("4100", false),
+                rows.Where(r => r.AccountCode == "4100").Sum(r => r.PeriodReturnNetH),
+                Period("5100", true),
+                byAccount.Sum(a => a.AmountH),
+                byAccount,
+                Balance(true, "1000", "1100"),
+                Balance(true, "1400"),
+                Balance(false, "2000"),
+                Balance(true, "1500"),
+                Balance(true, "1150"));
+        }
+
+        var top = Figures(r => branch is null || r.Scope == "branch");
+
+        long Tender(string method) => tendered.TryGetValue(method, out var v) ? v : 0;
+        long Refund(string method) => refunds.Where(r => r.Method == method).Sum(r => r.AmountH);
+
+        var cashNet = Math.Max(0, Tender("cash") - sales.ChangeH);
+
+        return Results.Ok(new
+        {
+            period,
+            branchId = branch,
+            revenueH = top.RevenueH,
+            returnsH = top.ReturnsH,
+            cogsH = top.CogsH,
+            expensesH = top.ExpensesH,
+            expensesByAccount = top.ExpensesByAccount,
+            cashH = top.CashH,
+            receivableH = top.ReceivableH,
+            payableH = top.PayableH,
+            prepaidH = top.PrepaidH,
+            cardClearingH = top.CardClearingH,
+            paymentMix = new
+            {
+                cashH = cashNet,
+                cardH = Tender("card"),
+                creditH = Tender("credit"),
+                bankH = Tender("bank"),
+                totalH = cashNet + Tender("card") + Tender("credit") + Tender("bank"),
+                saleCount = sales.SaleCount
+            },
+            refunds = new
+            {
+                cashH = Refund("cash"),
+                cardH = Refund("card"),
+                creditH = Refund("credit"),
+                bankH = Refund("bank"),
+                totalH = refunds.Sum(r => r.AmountH),
+                noteCount = refunds.Sum(r => r.NoteCount)
+            },
+            businessWide = branch is null ? null : Figures(r => r.Scope == "business")
+        });
+    }
+
+    public sealed record ExpenseAccountAmount(
+        string AccountCode, string NameAr, string NameEn, string Name, long AmountH);
+
+    /// <summary>One scope's figures: period movement for P&amp;L lines, all-time balances for the rest.</summary>
+    public sealed record SummaryFigures(
+        long RevenueH,
+        long ReturnsH,
+        long CogsH,
+        long ExpensesH,
+        IReadOnlyList<ExpenseAccountAmount> ExpensesByAccount,
+        long CashH,
+        long ReceivableH,
+        long PayableH,
+        long PrepaidH,
+        long CardClearingH);
+
+    private sealed record SummaryAccountRow
+    {
+        public string Scope { get; init; } = string.Empty;
+        public string AccountCode { get; init; } = string.Empty;
+        public long PeriodDebitH { get; init; }
+        public long PeriodCreditH { get; init; }
+        public long PeriodReturnNetH { get; init; }
+        public long TotalDebitH { get; init; }
+        public long TotalCreditH { get; init; }
     }
 
     private static async Task<IResult> CommissionAsync(

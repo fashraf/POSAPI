@@ -15,7 +15,8 @@ public sealed record ReceivePurchaseRequest(
     string? InvoiceNumber,
     decimal VatRate,
     bool PaidOnReceipt,
-    IReadOnlyList<PurchaseLineInput> Lines);
+    IReadOnlyList<PurchaseLineInput> Lines,
+    string? Note = null);
 
 public sealed record AdjustStockRequest(
     string BranchId,
@@ -44,8 +45,7 @@ public static class InventoryEndpoints
         group.MapPost("/items/{itemId}/adjust", AdjustAsync)
              .RequireAuthorization(PermissionPolicy.For("inventory.adjust"));
 
-        group.MapGet("/vendors", VendorsAsync)
-             .RequireAuthorization(PermissionPolicy.For("vendors.view"));
+        /* Vendors and the purchase list: VendorEndpoints. */
     }
 
     /// <summary>
@@ -159,6 +159,7 @@ public static class InventoryEndpoints
         parameters.Add("@VatRate", request.VatRate <= 0 ? 15.00m : request.VatRate);
         parameters.Add("@PaidOnReceipt", request.PaidOnReceipt);
         parameters.Add("@ReceivedBy", current.Username);
+        parameters.Add("@Note", ProcErrors.Blank(request.Note));
         parameters.Add("@Lines", lines.AsTableValuedParameter("inv.PurchaseLineTable"));
         parameters.Add("@PurchaseId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
         parameters.Add("@Reference", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
@@ -217,29 +218,6 @@ public static class InventoryEndpoints
         }
 
         return Results.NoContent();
-    }
-
-    private static async Task<IResult> VendorsAsync(ISqlConnectionFactory db, CancellationToken ct)
-    {
-        await using var connection = db.Create();
-
-        var rows = await connection.QueryAsync(new CommandDefinition(
-            """
-            SELECT v.VendorId, v.NameAr, v.NameEn, v.ContactPerson, v.Phone, v.Email,
-                   v.VatNumber, v.PaymentTermDays, v.IsActive,
-                   ISNULL(owed.BalanceH, 0) AS BalanceH
-            FROM core.Vendor AS v
-            OUTER APPLY (
-                SELECT SUM(p.TotalH) AS BalanceH
-                FROM inv.Purchase AS p
-                WHERE p.VendorId = v.VendorId AND p.PaidOnReceipt = 0
-            ) AS owed
-            WHERE v.IsActive = 1
-            ORDER BY v.NameEn;
-            """,
-            cancellationToken: ct));
-
-        return Results.Ok(rows);
     }
 
     internal static ApiError Translate(int number, string fallback) => number switch

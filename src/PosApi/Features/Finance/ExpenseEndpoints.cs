@@ -38,11 +38,7 @@ public static class ExpenseEndpoints
         group.MapPost("", RecordAsync)
              .RequireAuthorization(PermissionPolicy.For("finance.expenses"));
 
-        group.MapGet("/categories", CategoriesAsync)
-             .RequireAuthorization(PermissionPolicy.For("finance.expenses"));
-
-        group.MapGet("/recurring", RecurringAsync)
-             .RequireAuthorization(PermissionPolicy.For("finance.expenses"));
+        /* Categories, recurring schedules and recognition: ExpenseSetupEndpoints. */
     }
 
     private static async Task<IResult> ListAsync(
@@ -134,43 +130,5 @@ public static class ExpenseEndpoints
         }
 
         return Results.Ok(new { expenseId = parameters.Get<string>("@ExpenseId") });
-    }
-
-    private static async Task<IResult> CategoriesAsync(ISqlConnectionFactory db, CancellationToken ct)
-    {
-        await using var connection = db.Create();
-
-        var rows = await connection.QueryAsync(new CommandDefinition(
-            "SELECT CategoryId, NameAr, NameEn, AccountCode FROM fin.ExpenseCategory WHERE IsActive = 1 ORDER BY NameEn;",
-            cancellationToken: ct));
-
-        return Results.Ok(rows);
-    }
-
-    private static async Task<IResult> RecurringAsync(
-        ISqlConnectionFactory db, string? branchId, CancellationToken ct = default)
-    {
-        await using var connection = db.Create();
-
-        // Urgency is derived here rather than stored, so a payment that becomes
-        // overdue overnight reads as overdue with nothing to refresh.
-        var rows = await connection.QueryAsync(new CommandDefinition(
-            """
-            SELECT r.*, c.NameAr AS CategoryNameAr, c.NameEn AS CategoryNameEn,
-                   DATEDIFF(DAY, CAST(SYSUTCDATETIME() AS DATE), r.NextDueOn) AS DaysUntilDue,
-                   CASE
-                       WHEN r.NextDueOn <  CAST(SYSUTCDATETIME() AS DATE) THEN N'overdue'
-                       WHEN r.NextDueOn =  CAST(SYSUTCDATETIME() AS DATE) THEN N'today'
-                       WHEN DATEDIFF(DAY, CAST(SYSUTCDATETIME() AS DATE), r.NextDueOn) <= 5 THEN N'soon'
-                       ELSE N'normal'
-                   END AS Urgency
-            FROM fin.RecurringPayment AS r
-            JOIN fin.ExpenseCategory AS c ON c.CategoryId = r.CategoryId
-            WHERE (@BranchId IS NULL OR r.BranchId = @BranchId OR r.BranchId IS NULL)
-            ORDER BY r.NextDueOn;
-            """,
-            new { BranchId = branchId }, cancellationToken: ct));
-
-        return Results.Ok(rows);
     }
 }

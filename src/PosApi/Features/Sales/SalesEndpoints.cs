@@ -33,7 +33,17 @@ public sealed record CommitSaleRequest(
     long DiscountH,
     long? TenderedH,
     IReadOnlyList<SaleLineInput> Lines,
-    IReadOnlyList<SalePaymentInput> Payments);
+    IReadOnlyList<SalePaymentInput> Payments,
+    /*
+     * Who approved a discount above its approval threshold. The signed-in
+     * user may name themself (they must hold discounts.approve); naming
+     * anyone else needs that person's password in ApproverPassword. Ignored
+     * when the discount needs no approval.
+     */
+    string? ApprovedByUserId = null,
+    string? ApproverPassword = null,
+    /* dine_in | takeaway | delivery | other — shown on the kitchen board. */
+    string? OrderType = null);
 
 public sealed record VoidSaleRequest(string Reason);
 
@@ -74,6 +84,7 @@ public static class SalesEndpoints
         CommitSaleRequest request,
         ISqlConnectionFactory db,
         ICurrentUser current,
+        IPasswordHasher hasher,
         ILogger<Program> logger,
         CancellationToken ct)
     {
@@ -90,6 +101,32 @@ public static class SalesEndpoints
                 "branch_forbidden",
                 "You cannot record a sale for that branch.",
                 "لا يمكنك تسجيل فاتورة لهذا الفرع."), statusCode: 403);
+        }
+
+        /* The approver is someone this request can vouch for: the signed-in
+           user, or another user whose password was just given. Whether they
+           may approve — and whether approval is needed at all — is decided
+           in the procedure, against their permissions as they stand. */
+        var approverId = ProcErrors.Blank(request.ApprovedByUserId);
+
+        if (approverId is not null && !string.Equals(approverId, current.UserId, StringComparison.Ordinal))
+        {
+            await using var check = db.Create();
+
+            var approver = await check.QuerySingleOrDefaultAsync<(string? Hash, string? Salt)>(new CommandDefinition(
+                "SELECT PasswordHash, PasswordSalt FROM core.AppUser WHERE UserId = @UserId AND Status = N'active';",
+                new { UserId = approverId }, cancellationToken: ct));
+
+            if (string.IsNullOrEmpty(request.ApproverPassword) ||
+                approver.Hash is null || approver.Salt is null ||
+                !hasher.Verify(request.ApproverPassword, approver.Hash, approver.Salt))
+            {
+                return Results.UnprocessableEntity(ApiError.Create(
+                    "approval_invalid",
+                    "The approver's password is not correct.",
+                    "كلمة مرور المعتمِد غير صحيحة.",
+                    new Dictionary<string, string[]> { ["approverPassword"] = ["The approver's password is not correct."] }));
+            }
         }
 
         var lines = new DataTable();
@@ -125,6 +162,8 @@ public static class SalesEndpoints
         parameters.Add("@DiscountH", request.DiscountH);
         parameters.Add("@TenderedH", request.TenderedH);
         parameters.Add("@IdempotencyKey", request.IdempotencyKey);
+        parameters.Add("@ApprovedByUserId", approverId);
+        parameters.Add("@OrderType", ProcErrors.Blank(request.OrderType)?.ToLowerInvariant());
         parameters.Add("@Lines", lines.AsTableValuedParameter("sales.SaleLineTable"));
         parameters.Add("@Payments", payments.AsTableValuedParameter("sales.SalePaymentTable"));
         parameters.Add("@SaleId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
@@ -140,7 +179,7 @@ public static class SalesEndpoints
                 commandType: CommandType.StoredProcedure,
                 cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 52000 && ex.Number < 53000)
+        catch (SqlException ex) when (ex.Number is (>= 52000 and < 53000) or 63050 or 63051)
         {
             // The procedure's own rules. These are business outcomes, not
             // faults, so they come back as 422 with the reason intact.
@@ -225,8 +264,10 @@ public static class SalesEndpoints
             GROUP BY CAST(s.SoldAtUtc AS DATE)
             ORDER BY [Date];
 
-            -- 4. By payment method
-            SELECT p.Method, SUM(p.AmountH) AS AmountH
+            -- 4. By payment method. Cash is stored as handed over (one row per
+            --    sale), so the change given back is taken off to show takings.
+            SELECT p.Method,
+                   SUM(p.AmountH - CASE WHEN p.Method = N'cash' THEN s.ChangeH ELSE 0 END) AS AmountH
             FROM sales.SalePayment AS p
             JOIN sales.Sale AS s ON s.SaleId = p.SaleId
             WHERE s.Status <> N'voided'
@@ -358,6 +399,12 @@ public static class SalesEndpoints
                 commandType: CommandType.StoredProcedure,
                 cancellationToken: ct));
         }
+        catch (SqlException ex) when (ex.Number == 67012)
+        {
+            return ProcErrors.Conflict("sale_has_returns",
+                "This sale has returns against it and cannot be voided. Return the remaining items instead.",
+                "على هذه الفاتورة مرتجعات ولا يمكن إلغاؤها. أرجع الأصناف المتبقية بدلًا من ذلك.");
+        }
         catch (SqlException ex) when (ex.Number >= 52000 && ex.Number < 53000)
         {
             return Results.Json(Translate(ex.Number, ex.Message),
@@ -403,6 +450,18 @@ public static class SalesEndpoints
             "Customer not found.", "العميل غير موجود."),
         52022 => ApiError.Create("over_collection",
             "That is more than this customer owes.", "المبلغ أكبر مما على العميل."),
+        52030 => ApiError.Create("bad_order_type",
+            "Order type is dine_in, takeaway, delivery or other.",
+            "نوع الطلب: محلي أو سفري أو توصيل أو أخرى."),
+        52031 => ApiError.Create("non_cash_overpaid",
+            "Card, bank and credit payments cannot exceed the total; only cash gives change.",
+            "لا يمكن أن تتجاوز مدفوعات البطاقة أو التحويل أو الآجل الإجمالي؛ الباقي يُعاد نقدًا فقط."),
+        63050 => ApiError.Create("discount_approval_required",
+            "This discount is above its approval limit and needs approval from someone allowed to approve discounts.",
+            "هذا الخصم يتجاوز حد الموافقة ويحتاج موافقة من شخص مخوّل باعتماد الخصومات."),
+        63051 => ApiError.Create("approver_not_allowed",
+            "The approver is not allowed to approve discounts.",
+            "المعتمِد غير مخوّل باعتماد الخصومات."),
         _ => ApiError.Create("sale_failed", fallback, "تعذّر إتمام العملية.")
     };
 }

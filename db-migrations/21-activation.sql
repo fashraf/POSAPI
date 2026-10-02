@@ -194,7 +194,7 @@ BEGIN
         UPDATE core.BillTemplate
         SET    IsActive = @IsActive,
                UpdatedAtUtc = SYSUTCDATETIME()
-        WHERE  TemplateId = @EntityId;
+        WHERE  BillId = @EntityId;
     ELSE
     IF @EntityType = N'branch'
         UPDATE core.Branch

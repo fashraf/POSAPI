@@ -289,7 +289,7 @@ BEGIN
             WHERE IdempotencyKey = @IdempotencyKey;
 
             IF @SaleId IS NOT NULL RETURN;
-        END
+        END;  -- THROW requires the preceding statement to end with a semicolon
 
         THROW;
     END CATCH

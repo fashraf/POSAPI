@@ -81,10 +81,17 @@ public static class AuthEndpoints
     /// No session is issued here. Registration ends at the OTP step, so an
     /// address nobody controls cannot become a working account.
     /// </summary>
+    /* Names the wizard field a refusal belongs to, so the form can take the
+       person back to the step that holds it instead of failing silently. */
+    private static Dictionary<string, string[]> Field(string field, string message) =>
+        new() { [field] = [message] };
+
     private static async Task<IResult> RegisterAsync(
         RegisterRequest request,
         ISqlConnectionFactory db,
         IOtpService otp,
+        IPasswordHasher hasher,
+        IOptions<AuthOptions> authOptions,
         ILogger<Program> logger,
         CancellationToken ct)
     {
@@ -98,6 +105,19 @@ public static class AuthEndpoints
 
         if (string.IsNullOrWhiteSpace(request.Owner.Email))
             fieldErrors["owner.email"] = ["An email address is required."];
+
+        /* In single-password mode the password is the only way in, so an owner
+           registered without one would be locked out of their own business. */
+        var password = request.Owner.Password;
+        if (string.IsNullOrEmpty(password))
+        {
+            if (authOptions.Value.LoginMode == LoginMode.SinglePassword)
+                fieldErrors["owner.password"] = ["A password is required."];
+        }
+        else if (password.Length < 8)
+        {
+            fieldErrors["owner.password"] = ["The password needs at least 8 characters."];
+        }
 
         if (fieldErrors.Count > 0)
         {
@@ -125,6 +145,16 @@ public static class AuthEndpoints
         parameters.Add("@OwnerEmail", request.Owner.Email.Trim());
         parameters.Add("@OwnerPhone", string.IsNullOrWhiteSpace(request.Owner.Mobile)
             ? null : request.Owner.Mobile.Trim());
+
+        // Hashed here with the hasher sign-in verifies against; the plain
+        // password never reaches SQL or the logs.
+        if (!string.IsNullOrEmpty(password))
+        {
+            var (hash, salt) = hasher.Hash(password);
+            parameters.Add("@PasswordHash", hash);
+            parameters.Add("@PasswordSalt", salt);
+        }
+
         parameters.Add("@UserId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
         parameters.Add("@BranchId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
 
@@ -149,13 +179,16 @@ public static class AuthEndpoints
                     "An email address is required.", "البريد الإلكتروني مطلوب."),
                 53002 => ApiError.Create("email_taken",
                     "An account already exists for that email address.",
-                    "يوجد حساب مسجّل بهذا البريد الإلكتروني."),
+                    "يوجد حساب مسجّل بهذا البريد الإلكتروني.",
+                    Field("email", "An account already exists for that email address.")),
                 53003 => ApiError.Create("mobile_taken",
                     "An account already exists for that mobile number.",
-                    "يوجد حساب مسجّل بهذا الرقم."),
+                    "يوجد حساب مسجّل بهذا الرقم.",
+                    Field("mobile", "An account already exists for that mobile number.")),
                 53004 => ApiError.Create("bad_vat",
                     "A Saudi VAT number is 15 digits beginning and ending with 3.",
-                    "الرقم الضريبي السعودي ١٥ رقمًا يبدأ وينتهي بالرقم ٣."),
+                    "الرقم الضريبي السعودي ١٥ رقمًا يبدأ وينتهي بالرقم ٣.",
+                    Field("vatNumber", "A Saudi VAT number is 15 digits beginning and ending with 3.")),
                 _ => ApiError.Create("registration_failed",
                     "Registration could not be completed.", "تعذّر إكمال التسجيل.")
             };

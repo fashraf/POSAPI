@@ -97,6 +97,7 @@ public static class PayrollEndpoints
                    (SELECT COUNT(*) FROM fin.PayrollLine WHERE RunId = r.RunId) AS EmployeeCount,
                    ISNULL((SELECT SUM(BaseSalaryH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0) AS SalariesH,
                    ISNULL((SELECT SUM(CommissionH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0) AS CommissionH,
+                   ISNULL((SELECT SUM(AllowancesH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0) AS AllowancesH,
                    ISNULL((SELECT SUM(DeductionsH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0) AS DeductionsH
             FROM fin.PayrollRun AS r
             WHERE (@BranchId IS NULL OR r.BranchId = @BranchId OR r.BranchId IS NULL)

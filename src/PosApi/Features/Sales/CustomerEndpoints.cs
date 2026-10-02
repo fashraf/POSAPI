@@ -16,6 +16,20 @@ public sealed record CustomerInput(
     string CustomerType,
     long CreditLimitH);
 
+/// <summary>
+/// Edit a customer. The balance is never written here. <c>CustomerType</c>
+/// and <c>Status</c> left null keep what is stored.
+/// </summary>
+public sealed record UpdateCustomerRequest(
+    string NameAr,
+    string NameEn,
+    string? Phone,
+    string? Email,
+    string? VatNumber,
+    string? CustomerType,
+    long CreditLimitH,
+    string? Status);
+
 public sealed record CollectionRequest(
     long AmountH,
     string Method,
@@ -43,10 +57,16 @@ public static class CustomerEndpoints
         group.MapPost("", CreateAsync)
              .RequireAuthorization(PermissionPolicy.For("customers.create"));
 
+        group.MapPut("/{customerId}", UpdateAsync)
+             .RequireAuthorization(PermissionPolicy.For("customers.edit"));
+
         group.MapPost("/{customerId}/collect", CollectAsync)
              .RequireAuthorization(PermissionPolicy.For("customers.credit"));
 
         group.MapGet("/receivables", ReceivablesAsync)
+             .RequireAuthorization(PermissionPolicy.For("finance.view"));
+
+        group.MapGet("/receivables/summary", ReceivablesSummaryAsync)
              .RequireAuthorization(PermissionPolicy.For("finance.view"));
     }
 
@@ -150,6 +170,20 @@ public static class CustomerEndpoints
                  ON l.EntryId = e.EntryId AND l.AccountCode = N'1400'
             WHERE e.Kind = N'customer_collection'
               AND e.SourceReference = @CustomerId
+              AND e.ReversesEntryId IS NULL
+              AND e.ReversedByEntryId IS NULL
+
+            UNION ALL
+
+            /* A return refunded to the account lowers what is owed. */
+            SELECT
+                r.ReturnId      AS Id,
+                r.NoteNumber    AS Reference,
+                r.ReturnedAtUtc AS OccurredAtUtc,
+                N'credit_note'  AS Kind,
+                -r.RefundH      AS AmountH
+            FROM sales.SaleReturn AS r
+            WHERE r.CustomerId = @CustomerId AND r.RefundMethod = N'credit' AND r.RefundH > 0
 
             ORDER BY OccurredAtUtc;
             """,
@@ -243,15 +277,139 @@ public static class CustomerEndpoints
         return Results.Ok(new { entryId = parameters.Get<string>("@EntryId") });
     }
 
+    /// <summary>
+    /// Customers who owe, oldest debt first. Each row also carries
+    /// <c>collectedH</c>: everything collected from that customer, lifetime
+    /// (collections later reversed are left out).
+    /// </summary>
     private static async Task<IResult> ReceivablesAsync(
         ISqlConnectionFactory db, CancellationToken ct)
     {
         await using var connection = db.Create();
 
         var rows = await connection.QueryAsync(new CommandDefinition(
-            "SELECT * FROM fin.vw_Receivables ORDER BY AgeDays DESC;",
+            $"""
+            SELECT r.*, ISNULL(c.CollectedH, 0) AS CollectedH
+            FROM fin.vw_Receivables AS r
+            OUTER APPLY (
+                SELECT SUM(l.CreditH) AS CollectedH
+                FROM fin.JournalEntry AS e
+                JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId AND l.AccountCode = N'1400'
+                WHERE {CollectionFilter} AND e.SourceReference = r.CustomerId
+            ) AS c
+            ORDER BY r.AgeDays DESC;
+            """,
             cancellationToken: ct));
 
         return Results.Ok(rows);
     }
+
+    /* A collection that stands: neither reversed nor itself a reversal. */
+    private const string CollectionFilter =
+        "e.Kind = N'customer_collection' AND e.ReversesEntryId IS NULL AND e.ReversedByEntryId IS NULL";
+
+    /// <summary>
+    /// The receivables cards. <c>collectedH</c> covers <c>from</c>..<c>to</c>
+    /// (dates, inclusive), or all time when neither is given.
+    /// </summary>
+    private static async Task<IResult> ReceivablesSummaryAsync(
+        ISqlConnectionFactory db, DateOnly? from, DateOnly? to, CancellationToken ct)
+    {
+        await using var connection = db.Create();
+
+        var row = await connection.QuerySingleAsync(new CommandDefinition(
+            $"""
+            SELECT
+                ISNULL((SELECT SUM(BalanceH) FROM core.Customer WHERE BalanceH > 0), 0) AS OutstandingH,
+                (SELECT COUNT(*) FROM core.Customer WHERE BalanceH > 0) AS WithBalance,
+                (SELECT COUNT(*) FROM core.Customer WHERE BalanceH > 0 AND BalanceH > CreditLimitH) AS OverLimit,
+                ISNULL((SELECT SUM(l.CreditH)
+                        FROM fin.JournalEntry AS e
+                        JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId AND l.AccountCode = N'1400'
+                        WHERE {CollectionFilter}
+                          AND (@From IS NULL OR CAST(e.PostedAtUtc AS DATE) >= @From)
+                          AND (@To   IS NULL OR CAST(e.PostedAtUtc AS DATE) <= @To)), 0) AS CollectedH,
+                (SELECT COUNT(*) FROM fin.JournalEntry AS e
+                 WHERE {CollectionFilter}
+                   AND (@From IS NULL OR CAST(e.PostedAtUtc AS DATE) >= @From)
+                   AND (@To   IS NULL OR CAST(e.PostedAtUtc AS DATE) <= @To)) AS CollectionCount;
+            """,
+            new { From = from, To = to }, cancellationToken: ct));
+
+        return Results.Ok(row);
+    }
+
+    /// <summary>
+    /// Edit a customer through core.usp_UpdateCustomer. Returns the stored row,
+    /// the same shape as GET /api/customers/{customerId}.
+    /// </summary>
+    private static async Task<IResult> UpdateAsync(
+        string customerId,
+        UpdateCustomerRequest request,
+        ISqlConnectionFactory db,
+        ICurrentUser current,
+        HttpContext http,
+        ILogger<Program> logger,
+        CancellationToken ct)
+    {
+        if (request.Status is not (null or "active" or "inactive"))
+            return ProcErrors.Field("status", "Status must be active or inactive.", "الحالة إما نشط أو غير نشط.");
+
+        var email = ProcErrors.Blank(request.Email);
+        if (email is not null && (!email.Contains('@', StringComparison.Ordinal) || email.Contains(' ', StringComparison.Ordinal)))
+            return ProcErrors.Field("email", "Enter a valid email address, or leave it empty.",
+                "أدخل بريدًا إلكترونيًا صحيحًا أو اتركه فارغًا.");
+
+        await using var connection = db.Create();
+
+        try
+        {
+            await connection.ExecuteAsync(new CommandDefinition(
+                "core.usp_UpdateCustomer",
+                new
+                {
+                    CustomerId = customerId,
+                    NameAr = request.NameAr?.Trim(),
+                    NameEn = request.NameEn?.Trim(),
+                    Phone = ProcErrors.Blank(request.Phone),
+                    Email = email,
+                    VatNumber = ProcErrors.Blank(request.VatNumber),
+                    CustomerType = ProcErrors.Blank(request.CustomerType),
+                    request.CreditLimitH,
+                    IsActive = request.Status is null ? (bool?)null : request.Status == "active",
+                    Actor = current.Username
+                },
+                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+        }
+        catch (SqlException ex) when (MapUpdateError(ex, request) is { } mapped)
+        {
+            return mapped;
+        }
+
+        logger.LogInformation("Customer {CustomerId} updated by {Actor}.", customerId, current.Username);
+        http.Items["AuditEntityId"] = customerId;
+
+        var customer = await connection.QuerySingleAsync(new CommandDefinition(
+            "SELECT * FROM core.Customer WHERE CustomerId = @CustomerId;",
+            new { CustomerId = customerId }, cancellationToken: ct));
+
+        return Results.Ok(customer);
+    }
+
+    private static IResult? MapUpdateError(SqlException ex, UpdateCustomerRequest request) => ex.Number switch
+    {
+        68000 => ProcErrors.Field(string.IsNullOrWhiteSpace(request.NameAr) ? "nameAr" : "nameEn",
+            "Both the Arabic and English name are required.", "الاسم بالعربية والإنجليزية مطلوبان."),
+        68001 => ProcErrors.Field("creditLimitH", "A credit limit cannot be negative.", "لا يمكن أن يكون حد الائتمان سالبًا."),
+        68002 => Results.UnprocessableEntity(ApiError.Create("limit_below_balance",
+            "The new limit is below what this customer already owes. Collect a payment first, or set a higher limit.",
+            "الحد الجديد أقل مما على العميل. حصّل دفعة أولًا أو ارفع الحد.",
+            new Dictionary<string, string[]> { ["creditLimitH"] = ["Must be at least the current balance."] })),
+        68003 => ProcErrors.NotFound("Customer not found.", "العميل غير موجود."),
+        68004 => ProcErrors.Field("customerType", "A customer is an individual or a business.", "العميل فرد أو منشأة."),
+        68005 => ProcErrors.Conflict("customer_has_balance",
+            "This customer still owes money. Settle the balance before deactivating.",
+            "على هذا العميل مبلغ مستحق. سدّد الرصيد قبل التعطيل."),
+        _ => null
+    };
 }
