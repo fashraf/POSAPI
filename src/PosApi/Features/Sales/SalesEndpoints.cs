@@ -43,7 +43,16 @@ public sealed record CommitSaleRequest(
     string? ApprovedByUserId = null,
     string? ApproverPassword = null,
     /* dine_in | takeaway | delivery | other — shown on the kitchen board. */
-    string? OrderType = null);
+    string? OrderType = null,
+    /*
+     * Why a price or discount differs from the catalog and the discount rules.
+     * The server prices the sale itself: a line price must equal the catalog
+     * price and the invoice discount must be what DiscountId gives. Anything
+     * else is an override, accepted only with this reason and someone holding
+     * pos.override_price (the cashier, or ApprovedByUserId with their
+     * password). Recorded on the sale. Leave null for an ordinary sale.
+     */
+    string? OverrideReason = null);
 
 public sealed record VoidSaleRequest(string Reason);
 
@@ -164,6 +173,8 @@ public static class SalesEndpoints
         parameters.Add("@IdempotencyKey", request.IdempotencyKey);
         parameters.Add("@ApprovedByUserId", approverId);
         parameters.Add("@OrderType", ProcErrors.Blank(request.OrderType)?.ToLowerInvariant());
+        parameters.Add("@CashierUserId", current.UserId);
+        parameters.Add("@OverrideReason", ProcErrors.Blank(request.OverrideReason));
         parameters.Add("@Lines", lines.AsTableValuedParameter("sales.SaleLineTable"));
         parameters.Add("@Payments", payments.AsTableValuedParameter("sales.SalePaymentTable"));
         parameters.Add("@SaleId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
@@ -206,6 +217,22 @@ public static class SalesEndpoints
     ///
     /// The previous period is returned alongside, because a total without a
     /// comparison says nothing about whether things are going well.
+    ///
+    /// Returns count in the period they are issued, the way the ledger books
+    /// them (4100 is debited on the credit note's date):
+    /// <list type="bullet">
+    /// <item><c>salesH</c> — invoices including VAT, less refunds on credit notes
+    /// (<c>grossSalesH</c> − <c>returnsH</c>). Voided sales are excluded everywhere.</item>
+    /// <item><c>netRevenueH</c> — the same excluding VAT: what the P&amp;L calls net revenue.</item>
+    /// <item><c>cogsH</c>, <c>grossProfitH</c>, <c>grossMargin</c> — the gross-profit rule
+    /// below, identical to GET /api/finance/summary.</item>
+    /// </list>
+    ///
+    /// Gross profit, the one rule every screen uses:
+    ///   net revenue   = sales excluding VAT − returns excluding VAT
+    ///   cost of sales = line cost of the goods and services sold − line cost of what came back
+    ///   gross profit  = net revenue − cost of sales
+    ///   gross margin  = gross profit ÷ net revenue (never the VAT-inclusive price)
     /// </summary>
     private static async Task<IResult> AnalyticsAsync(
         ISqlConnectionFactory db, string? branchId, int days = 7,
@@ -217,89 +244,177 @@ public static class SalesEndpoints
 
         await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
             """
-            DECLARE @Start DATETIME2(0) = DATEADD(DAY, -@Days, SYSUTCDATETIME());
-            DECLARE @PrevStart DATETIME2(0) = DATEADD(DAY, -(@Days * 2), SYSUTCDATETIME());
+            DECLARE @Now DATETIME2(0) = SYSUTCDATETIME();
+            DECLARE @Start DATETIME2(0) = DATEADD(DAY, -@Days, @Now);
+            DECLARE @PrevStart DATETIME2(0) = DATEADD(DAY, -(@Days * 2), @Now);
 
             /* Voided sales are excluded everywhere here: they are reversed in
                the ledger, and counting them would overstate every figure. */
 
-            -- 1. This period
+            -- 1 and 2. This period and the one before it, for comparison.
+            WITH Periods AS (
+                SELECT 0 AS Prev, @Start AS FromUtc, @Now AS ToUtc
+                UNION ALL
+                SELECT 1, @PrevStart, @Start
+            ),
+            Sold AS (
+                SELECT p.Prev,
+                       COUNT(s.SaleId)                                AS Transactions,
+                       ISNULL(SUM(s.TotalH), 0)                       AS GrossSalesH,
+                       ISNULL(SUM(s.TotalH - s.TaxH), 0)              AS NetSalesH,
+                       ISNULL(SUM(c.CostH), 0)                        AS CostH
+                FROM Periods AS p
+                LEFT JOIN sales.Sale AS s
+                       ON s.Status <> N'voided'
+                      AND s.SoldAtUtc >= p.FromUtc AND s.SoldAtUtc < p.ToUtc
+                      AND (@BranchId IS NULL OR s.BranchId = @BranchId)
+                OUTER APPLY (
+                    SELECT SUM(CAST(ROUND(l.UnitCostH * l.Quantity, 0) AS BIGINT)) AS CostH
+                    FROM sales.SaleLine AS l WHERE l.SaleId = s.SaleId
+                ) AS c
+                GROUP BY p.Prev
+            ),
+            Returned AS (
+                SELECT p.Prev,
+                       ISNULL(SUM(r.RefundH), 0)    AS ReturnsH,
+                       ISNULL(SUM(r.SubtotalH), 0)  AS NetReturnsH,
+                       ISNULL(SUM(c.CostH), 0)      AS CostH
+                FROM Periods AS p
+                LEFT JOIN sales.SaleReturn AS r
+                       ON r.ReturnedAtUtc >= p.FromUtc AND r.ReturnedAtUtc < p.ToUtc
+                      AND (@BranchId IS NULL OR r.BranchId = @BranchId)
+                OUTER APPLY (
+                    SELECT SUM(CAST(ROUND(rl.UnitCostH * rl.Quantity, 0) AS BIGINT)) AS CostH
+                    FROM sales.SaleReturnLine AS rl WHERE rl.ReturnId = r.ReturnId
+                ) AS c
+                GROUP BY p.Prev
+            )
             SELECT
-                ISNULL(SUM(s.TotalH), 0)                       AS SalesH,
-                COUNT(*)                                       AS Transactions,
-                ISNULL(AVG(CAST(s.TotalH AS BIGINT)), 0)       AS AverageH,
-                ISNULL(SUM(s.TotalH - s.TaxH - ISNULL(c.CostH, 0)), 0) AS GrossProfitH
-            FROM sales.Sale AS s
-            OUTER APPLY (
-                SELECT SUM(l.UnitCostH * l.Quantity) AS CostH
-                FROM sales.SaleLine AS l WHERE l.SaleId = s.SaleId
-            ) AS c
-            WHERE s.Status <> N'voided'
-              AND s.SoldAtUtc >= @Start
-              AND (@BranchId IS NULL OR s.BranchId = @BranchId);
+                s.Prev,
+                s.GrossSalesH - r.ReturnsH                         AS SalesH,
+                s.GrossSalesH,
+                r.ReturnsH,
+                s.Transactions,
+                CASE WHEN s.Transactions = 0 THEN 0
+                     ELSE (s.GrossSalesH - r.ReturnsH) / s.Transactions END AS AverageH,
+                s.NetSalesH - r.NetReturnsH                        AS NetRevenueH,
+                s.CostH - r.CostH                                  AS CogsH,
+                (s.NetSalesH - r.NetReturnsH) - (s.CostH - r.CostH) AS GrossProfitH
+            FROM Sold AS s
+            JOIN Returned AS r ON r.Prev = s.Prev
+            ORDER BY s.Prev;
 
-            -- 2. The period before it, for comparison
-            SELECT
-                ISNULL(SUM(s.TotalH), 0)                       AS SalesH,
-                COUNT(*)                                       AS Transactions,
-                ISNULL(AVG(CAST(s.TotalH AS BIGINT)), 0)       AS AverageH,
-                ISNULL(SUM(s.TotalH - s.TaxH - ISNULL(c.CostH, 0)), 0) AS GrossProfitH
-            FROM sales.Sale AS s
-            OUTER APPLY (
-                SELECT SUM(l.UnitCostH * l.Quantity) AS CostH
-                FROM sales.SaleLine AS l WHERE l.SaleId = s.SaleId
-            ) AS c
-            WHERE s.Status <> N'voided'
-              AND s.SoldAtUtc >= @PrevStart AND s.SoldAtUtc < @Start
-              AND (@BranchId IS NULL OR s.BranchId = @BranchId);
-
-            -- 3. Daily totals
-            SELECT
-                CAST(s.SoldAtUtc AS DATE) AS [Date],
-                SUM(s.TotalH)             AS SalesH
-            FROM sales.Sale AS s
-            WHERE s.Status <> N'voided'
-              AND s.SoldAtUtc >= @Start
-              AND (@BranchId IS NULL OR s.BranchId = @BranchId)
-            GROUP BY CAST(s.SoldAtUtc AS DATE)
+            -- 3. Daily totals, net of the refunds issued that day.
+            SELECT [Date], SUM(AmountH) AS SalesH
+            FROM (
+                SELECT CAST(s.SoldAtUtc AS DATE) AS [Date], s.TotalH AS AmountH
+                FROM sales.Sale AS s
+                WHERE s.Status <> N'voided'
+                  AND s.SoldAtUtc >= @Start
+                  AND (@BranchId IS NULL OR s.BranchId = @BranchId)
+                UNION ALL
+                SELECT CAST(r.ReturnedAtUtc AS DATE), -r.RefundH
+                FROM sales.SaleReturn AS r
+                WHERE r.ReturnedAtUtc >= @Start
+                  AND (@BranchId IS NULL OR r.BranchId = @BranchId)
+            ) AS d
+            GROUP BY [Date]
             ORDER BY [Date];
 
             -- 4. By payment method. Cash is stored as handed over (one row per
-            --    sale), so the change given back is taken off to show takings.
-            SELECT p.Method,
-                   SUM(p.AmountH - CASE WHEN p.Method = N'cash' THEN s.ChangeH ELSE 0 END) AS AmountH
-            FROM sales.SalePayment AS p
-            JOIN sales.Sale AS s ON s.SaleId = p.SaleId
-            WHERE s.Status <> N'voided'
-              AND s.SoldAtUtc >= @Start
-              AND (@BranchId IS NULL OR s.BranchId = @BranchId)
-            GROUP BY p.Method;
+            --    sale), so the change given back is taken off to show takings,
+            --    and refunds come off the method they were paid back by.
+            SELECT Method, SUM(AmountH) AS AmountH
+            FROM (
+                SELECT p.Method,
+                       p.AmountH - CASE WHEN p.Method = N'cash' THEN s.ChangeH ELSE 0 END AS AmountH
+                FROM sales.SalePayment AS p
+                JOIN sales.Sale AS s ON s.SaleId = p.SaleId
+                WHERE s.Status <> N'voided'
+                  AND s.SoldAtUtc >= @Start
+                  AND (@BranchId IS NULL OR s.BranchId = @BranchId)
+                UNION ALL
+                SELECT ISNULL(r.RefundMethod, N'cash'), -r.RefundH
+                FROM sales.SaleReturn AS r
+                WHERE r.ReturnedAtUtc >= @Start
+                  AND (@BranchId IS NULL OR r.BranchId = @BranchId)
+            ) AS m
+            GROUP BY Method;
 
-            -- 5. Best sellers
+            -- 5. Best sellers, by what was sold and kept: returned quantities
+            --    (and their share of the line discount) are taken off.
             SELECT TOP (5)
                 l.ItemId, l.NameAr, l.NameEn,
-                SUM(l.Quantity)                          AS Quantity,
-                SUM(l.UnitPriceH * l.Quantity - l.LineDiscountH) AS RevenueH
+                SUM(l.Quantity - l.ReturnedQty)          AS Quantity,
+                SUM(CAST(ROUND((l.UnitPriceH * l.Quantity - l.LineDiscountH)
+                               * (l.Quantity - l.ReturnedQty) / NULLIF(l.Quantity, 0), 0) AS BIGINT)) AS RevenueH
             FROM sales.SaleLine AS l
             JOIN sales.Sale AS s ON s.SaleId = l.SaleId
             WHERE s.Status <> N'voided'
               AND s.SoldAtUtc >= @Start
               AND (@BranchId IS NULL OR s.BranchId = @BranchId)
+              AND l.Quantity - l.ReturnedQty > 0
             GROUP BY l.ItemId, l.NameAr, l.NameEn
             ORDER BY RevenueH DESC;
             """,
             new { Days = window, BranchId = branchId },
             cancellationToken: ct));
 
-        var current = await multi.ReadSingleAsync();
-        var previous = await multi.ReadSingleAsync();
+        var periods = (await multi.ReadAsync<AnalyticsPeriod>()).ToList();
         var daily = (await multi.ReadAsync()).ToList();
         var byMethod = (await multi.ReadAsync()).ToList();
         var topItems = (await multi.ReadAsync()).ToList();
 
+        object Shape(AnalyticsPeriod p) => new
+        {
+            salesH = p.SalesH,
+            grossSalesH = p.GrossSalesH,
+            returnsH = p.ReturnsH,
+            transactions = p.Transactions,
+            averageH = p.AverageH,
+            netRevenueH = p.NetRevenueH,
+            cogsH = p.CogsH,
+            grossProfitH = p.GrossProfitH,
+            grossMargin = p.NetRevenueH > 0 ? Math.Round((decimal)p.GrossProfitH / p.NetRevenueH, 4) : (decimal?)null
+        };
+
+        var current = Shape(periods.Single(p => p.Prev == 0));
+        var previous = Shape(periods.Single(p => p.Prev == 1));
+
         return Results.Ok(new { current, previous, daily, byMethod, topItems });
     }
 
+    private sealed record AnalyticsPeriod
+    {
+        public int Prev { get; init; }
+        public long SalesH { get; init; }
+        public long GrossSalesH { get; init; }
+        public long ReturnsH { get; init; }
+        public int Transactions { get; init; }
+        public long AverageH { get; init; }
+        public long NetRevenueH { get; init; }
+        public long CogsH { get; init; }
+        public long GrossProfitH { get; init; }
+    }
+
+    /// <summary>
+    /// A page of sale headers, newest first.
+    ///
+    /// Status and payment method are filtered here, in SQL, so the count, the
+    /// pages and the summary all describe the filtered set. Narrowing the
+    /// loaded page in the browser showed 3 of 9 voided sales — the ones that
+    /// happened to fall on page one.
+    /// </summary>
+    /// <remarks>
+    /// <c>status</c>: completed | voided | partially_returned | returned.
+    /// <c>method</c>: cash | card | credit | bank — a sale that used that
+    /// method at all, alone or with another — or <c>mixed</c> for sales paid
+    /// more than one way. Each row carries <c>paymentMethod</c> (the one method,
+    /// or <c>mixed</c>) and <c>itemCount</c>. <c>summary</c> totals the whole
+    /// filtered set: <c>netH</c> (sales that are not voided, less the refunds
+    /// on their credit notes), <c>returnsH</c> (those refunds), <c>invoices</c>
+    /// (not voided) and <c>returned</c> (returned or partially returned).
+    /// </remarks>
     private static async Task<IResult> ListAsync(
         ISqlConnectionFactory db,
         ICurrentUser current,
@@ -307,28 +422,68 @@ public static class SalesEndpoints
         string? search,
         DateOnly? from,
         DateOnly? to,
+        string? status,
+        string? method,
         int page = 1,
         int pageSize = 25,
         CancellationToken ct = default)
     {
         var paging = new PageQuery { Page = page <= 0 ? 1 : page, PageSize = pageSize };
 
+        var statusFilter = ProcErrors.Blank(status)?.ToLowerInvariant();
+        var methodFilter = ProcErrors.Blank(method)?.ToLowerInvariant();
+
+        if (statusFilter is not null and not ("completed" or "voided" or "partially_returned" or "returned"))
+        {
+            return Results.UnprocessableEntity(ApiError.Create(
+                "bad_status",
+                "Status is completed, voided, partially_returned or returned.",
+                "الحالة: مكتملة أو ملغاة أو مرتجعة جزئيًا أو مرتجعة.",
+                new Dictionary<string, string[]> { ["status"] = ["Unknown status."] }));
+        }
+
+        if (methodFilter is not null and not ("cash" or "card" or "credit" or "bank" or "mixed"))
+        {
+            return Results.UnprocessableEntity(ApiError.Create(
+                "bad_method",
+                "Payment method is cash, card, credit, bank or mixed.",
+                "طريقة الدفع: نقدًا أو بطاقة أو آجل أو تحويل أو مختلطة.",
+                new Dictionary<string, string[]> { ["method"] = ["Unknown payment method."] }));
+        }
+
         await using var connection = db.Create();
 
-        const string sql = """
-            SELECT COUNT(*)
-            FROM sales.vw_SaleSummary AS s
-            WHERE (@BranchId IS NULL OR s.BranchId = @BranchId OR s.BranchId IS NULL)
-              AND (@Search IS NULL OR s.InvoiceNumber LIKE N'%' + @Search + N'%')
-              AND (@From IS NULL OR CAST(s.SoldAtUtc AS DATE) >= @From)
-              AND (@To   IS NULL OR CAST(s.SoldAtUtc AS DATE) <= @To);
-
-            SELECT *
-            FROM sales.vw_SaleSummary AS s
+        const string filter = """
             WHERE (@BranchId IS NULL OR s.BranchId = @BranchId OR s.BranchId IS NULL)
               AND (@Search IS NULL OR s.InvoiceNumber LIKE N'%' + @Search + N'%')
               AND (@From IS NULL OR CAST(s.SoldAtUtc AS DATE) >= @From)
               AND (@To   IS NULL OR CAST(s.SoldAtUtc AS DATE) <= @To)
+              AND (@Status IS NULL OR s.Status = @Status)
+              AND (@Method IS NULL
+                   OR (@Method = N'mixed' AND s.PaymentMethod = N'mixed')
+                   OR (@Method <> N'mixed' AND EXISTS (
+                           SELECT 1 FROM sales.SalePayment AS p
+                           WHERE p.SaleId = s.SaleId AND p.Method = @Method AND p.AmountH > 0)))
+            """;
+
+        var sql = $"""
+            /* Net of returns: what these sales took less what their credit
+               notes refunded (SaleReturn.RefundH, VAT inclusive — the figure
+               the finance summary's returnsH sums), so the KPI agrees with it. */
+            SELECT COUNT(*) AS TotalCount,
+                   ISNULL(SUM(CASE WHEN s.Status <> N'voided' THEN s.TotalH END), 0)
+                     - ISNULL(SUM(CASE WHEN s.Status <> N'voided' THEN rf.RefundH END), 0) AS NetH,
+                   SUM(CASE WHEN s.Status <> N'voided' THEN 1 ELSE 0 END) AS Invoices,
+                   SUM(CASE WHEN s.Status IN (N'returned', N'partially_returned') THEN 1 ELSE 0 END) AS Returned,
+                   ISNULL(SUM(CASE WHEN s.Status <> N'voided' THEN rf.RefundH END), 0) AS ReturnsH
+            FROM sales.vw_SaleSummary AS s
+            OUTER APPLY (SELECT SUM(r.RefundH) AS RefundH
+                         FROM sales.SaleReturn AS r WHERE r.SaleId = s.SaleId) AS rf
+            {filter};
+
+            SELECT *
+            FROM sales.vw_SaleSummary AS s
+            {filter}
             ORDER BY s.SoldAtUtc DESC
             OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY;
             """;
@@ -340,20 +495,38 @@ public static class SalesEndpoints
                 Search = string.IsNullOrWhiteSpace(search) ? null : search.Trim(),
                 From = from,
                 To = to,
+                Status = statusFilter,
+                Method = methodFilter,
                 paging.Offset,
                 paging.PageSize
             },
             cancellationToken: ct));
 
-        var total = await multi.ReadSingleAsync<int>();
+        var totals = await multi.ReadSingleAsync<(int TotalCount, long NetH, int? Invoices, int? Returned, long ReturnsH)>();
         var rows = (await multi.ReadAsync()).ToList();
 
-        return Results.Ok(new PagedResult<object>
+        var result = new PagedResult<object>
         {
             Items = rows.Cast<object>().ToList(),
             Page = paging.Page,
             PageSize = paging.PageSize,
-            TotalCount = total
+            TotalCount = totals.TotalCount
+        };
+
+        return Results.Ok(new
+        {
+            result.Items,
+            result.Page,
+            result.PageSize,
+            result.TotalCount,
+            result.TotalPages,
+            Summary = new
+            {
+                totals.NetH,
+                totals.ReturnsH,
+                Invoices = totals.Invoices ?? 0,
+                Returned = totals.Returned ?? 0
+            }
         });
     }
 
@@ -456,6 +629,31 @@ public static class SalesEndpoints
         52031 => ApiError.Create("non_cash_overpaid",
             "Card, bank and credit payments cannot exceed the total; only cash gives change.",
             "لا يمكن أن تتجاوز مدفوعات البطاقة أو التحويل أو الآجل الإجمالي؛ الباقي يُعاد نقدًا فقط."),
+        /* The server prices the sale (migration 004). */
+        52040 => ApiError.Create("price_mismatch",
+            "A price in this sale differs from the catalog. The prices have been reloaded — check the total and try again.",
+            "يختلف سعر في هذه الفاتورة عن سعر الصنف. أُعيد تحميل الأسعار — راجع الإجمالي وحاول مرة أخرى.",
+            new Dictionary<string, string[]> { ["lines"] = ["A price differs from the catalog."] }),
+        52041 => ApiError.Create("price_override_not_allowed",
+            "Changing a price needs someone with the override price permission.",
+            "تغيير السعر يحتاج إلى شخص لديه صلاحية تعديل السعر.",
+            new Dictionary<string, string[]> { ["lines"] = ["Changing a price needs the override price permission."] }),
+        52042 => ApiError.Create("line_discount_not_allowed",
+            "A line discount needs a reason and someone with the override price permission.",
+            "خصم السطر يحتاج إلى سبب وإلى شخص لديه صلاحية تعديل السعر.",
+            new Dictionary<string, string[]> { ["lines"] = ["A line discount needs a reason and the override price permission."] }),
+        52043 => ApiError.Create("discount_needs_rule",
+            "A discount must be chosen from the configured discounts.",
+            "يجب اختيار الخصم من الخصومات المعرّفة.",
+            new Dictionary<string, string[]> { ["discountId"] = ["Choose a configured discount."] }),
+        52044 => ApiError.Create("discount_not_applicable",
+            "That discount does not apply to this sale (its dates, days, branch, role, minimum or items). Remove it or choose another.",
+            "هذا الخصم لا ينطبق على هذه الفاتورة (التواريخ أو الأيام أو الفرع أو الدور أو الحد الأدنى أو الأصناف). أزله أو اختر غيره.",
+            new Dictionary<string, string[]> { ["discountId"] = ["That discount does not apply to this sale."] }),
+        52045 => ApiError.Create("discount_mismatch",
+            "The discount is more than its rule allows. Choose the discount again.",
+            "الخصم أكبر مما تسمح به قاعدته. اختر الخصم مرة أخرى.",
+            new Dictionary<string, string[]> { ["discountH"] = ["The discount is more than its rule allows."] }),
         63050 => ApiError.Create("discount_approval_required",
             "This discount is above its approval limit and needs approval from someone allowed to approve discounts.",
             "هذا الخصم يتجاوز حد الموافقة ويحتاج موافقة من شخص مخوّل باعتماد الخصومات."),

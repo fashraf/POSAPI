@@ -123,12 +123,31 @@ public static class ExpenseEndpoints
                 "fin.usp_RecordExpense", parameters,
                 commandType: CommandType.StoredProcedure, cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 54000 && ex.Number < 55000)
+        catch (SqlException ex) when (MapRecordError(ex) is { } mapped)
         {
-            return Results.Json(InventoryEndpoints.Translate(ex.Number, ex.Message),
-                statusCode: StatusCodes.Status422UnprocessableEntity);
+            return mapped;
         }
 
         return Results.Ok(new { expenseId = parameters.Get<string>("@ExpenseId") });
     }
+
+    /// <summary>
+    /// What fin.usp_RecordExpense (directly, or through a recurring
+    /// instalment) can refuse, as responses. A duplicate key — an expense
+    /// number already taken — is a 409 the user can retry, never a 500.
+    /// </summary>
+    internal static IResult? MapRecordError(SqlException ex) => ex.Number switch
+    {
+        54024 => ProcErrors.Field("categoryId",
+            "Salaries and commission are paid through payroll, not as an expense. Choose another category.",
+            "الرواتب والعمولات تُصرف من خلال مسير الرواتب وليس كمصروف. اختر تصنيفًا آخر."),
+        54025 => ProcErrors.Conflict("already_posted",
+            "This expense is already posted.", "هذا المصروف مرحّل مسبقًا."),
+        2601 or 2627 => ProcErrors.Conflict("duplicate_reference",
+            "That expense number was just taken. Try again — the next number will be used.",
+            "رقم المصروف هذا مستخدم للتو. أعد المحاولة وسيُستخدم الرقم التالي."),
+        >= 54000 and < 55000 => Results.Json(InventoryEndpoints.Translate(ex.Number, ex.Message),
+            statusCode: StatusCodes.Status422UnprocessableEntity),
+        _ => null
+    };
 }

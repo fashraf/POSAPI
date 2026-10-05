@@ -15,7 +15,7 @@ namespace PosApi.Features.Catalog;
 /// There is no delete. A record that has been sold against, paid against or
 /// reported on must stay, or last month's invoice stops adding up.
 /// </summary>
-public static class ActivationEndpoints
+public static partial class ActivationEndpoints
 {
     public static void MapActivationEndpoints(this IEndpointRouteBuilder app)
     {
@@ -82,7 +82,7 @@ public static class ActivationEndpoints
             logger.LogInformation(
                 "Deactivation of {Type} {Id} blocked: {Reason}", entityType, entityId, blocked);
 
-            return Results.Conflict(ApiError.Create("deactivation_blocked", blocked, blocked));
+            return Results.Conflict(ApiError.Create("deactivation_blocked", blocked, BlockedArabic(blocked)));
         }
 
         /* So the audit entry names the record, not just the route. */
@@ -94,3 +94,34 @@ public static class ActivationEndpoints
 }
 
 public sealed record SetActiveRequest(bool IsActive);
+
+public static partial class ActivationEndpoints
+{
+    /*
+     * core.usp_SetActive explains a refusal in English only. The client shows
+     * messageAr to an Arabic user, so the known sentences are given their
+     * Arabic here (with the count carried over); an unknown one falls back to
+     * the English rather than to nothing.
+     */
+    private static string BlockedArabic(string blocked)
+    {
+        var count = System.Text.RegularExpressions.Regex.Match(blocked, @"\d+").Value;
+
+        if (blocked.StartsWith("This category still has", StringComparison.Ordinal))
+            return $"ما زال هذا التصنيف يحتوي على {count} من الأصناف النشطة. انقلها أو عطّلها أولًا.";
+        if (blocked.StartsWith("This print group is still used", StringComparison.Ordinal))
+            return "ما زالت أصناف نشطة تستخدم مجموعة الطباعة هذه. انقلها أولًا وإلا فلن تُطبع تذاكرها.";
+        if (blocked.StartsWith("This customer still owes money", StringComparison.Ordinal))
+            return "ما زال على هذا العميل مبلغ مستحق. سدّد الرصيد قبل التعطيل.";
+        if (blocked.StartsWith("This vendor has", StringComparison.Ordinal))
+            return $"لدى هذا المورد {count} من التوريدات غير المسددة. سدّدها قبل التعطيل.";
+        if (blocked.StartsWith("This branch has an open cash drawer", StringComparison.Ordinal))
+            return "يوجد درج نقد مفتوح في هذا الفرع. أغلقه أولًا.";
+        if (blocked.StartsWith("This branch has an open balance period", StringComparison.Ordinal))
+            return "توجد فترة أرصدة مفتوحة في هذا الفرع. أغلقها أولًا.";
+        if (blocked.StartsWith("This is the only active branch", StringComparison.Ordinal))
+            return "هذا هو الفرع النشط الوحيد. يجب أن يبقى فرع واحد على الأقل.";
+
+        return blocked;
+    }
+}

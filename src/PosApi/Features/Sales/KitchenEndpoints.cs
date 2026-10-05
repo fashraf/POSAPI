@@ -76,15 +76,35 @@ public static class KitchenEndpoints
                 "bad_status", "That is not a valid status.", "هذه الحالة غير صحيحة."));
         }
 
+        var status = request.Status.ToLowerInvariant();
+
         await using var connection = db.Create();
 
-        var affected = await connection.ExecuteAsync(new CommandDefinition(
+        /* Ready and completed mean every line is done, so the lines are brought
+           up in the same batch. The board used to send one request per line
+           first and the status last; one failure in between left an order
+           marked ready with lines still open, and "Mark ready" depended on
+           the browser finishing a chain of calls. */
+        var affected = await connection.ExecuteScalarAsync<int>(new CommandDefinition(
             """
+            SET XACT_ABORT ON;
+            BEGIN TRAN;
+
             UPDATE sales.PreparationOrder
             SET Status = @Status, UpdatedAtUtc = SYSUTCDATETIME()
             WHERE PreparationId = @PreparationId;
+
+            DECLARE @Affected INT = @@ROWCOUNT;
+
+            IF @Affected > 0 AND @Status IN (N'ready', N'completed')
+                UPDATE sales.PreparationItem
+                SET CompletedQty = Quantity
+                WHERE PreparationId = @PreparationId AND CompletedQty < Quantity;
+
+            COMMIT;
+            SELECT @Affected;
             """,
-            new { PreparationId = preparationId, request.Status },
+            new { PreparationId = preparationId, Status = status },
             cancellationToken: ct));
 
         return affected == 0 ? Results.NotFound() : Results.NoContent();

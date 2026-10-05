@@ -305,6 +305,14 @@ public static class CatalogEndpoints
                 new Dictionary<string, string[]> { ["kind"] = ["Choose product or service."] }));
         }
 
+        /* A product is counted and received by its SKU; the form marks it
+           required, and this is where that promise is kept (the procedure
+           checks again, 59006). A service has nothing on a shelf. */
+        if (request.Kind == "product" && string.IsNullOrWhiteSpace(request.Sku))
+        {
+            return ProcErrors.Field("sku", "A product needs a SKU.", "المنتج يحتاج إلى رمز SKU.");
+        }
+
         var parameters = new DynamicParameters();
         parameters.Add("@ItemId", itemId);
         parameters.Add("@Kind", request.Kind);
@@ -342,10 +350,11 @@ public static class CatalogEndpoints
         {
             return Results.NotFound(ApiError.Create("not_found", "No such item.", "لا يوجد صنف بهذا المعرف."));
         }
-        catch (SqlException ex) when (ex.Number is >= 59000 and < 59005)
+        catch (SqlException ex) when (ex.Number is >= 59000 and < 59005 or 59006)
         {
             var (field, messageEn, messageAr) = ex.Number switch
             {
+                59006 => ("sku", "A product needs a SKU.", "المنتج يحتاج إلى رمز SKU."),
                 59000 => ("nameEn", "Both names are required.", "الاسمان العربي والإنجليزي مطلوبان."),
                 59001 => ("priceH", "A price cannot be negative.", "لا يمكن أن يكون السعر سالبًا."),
                 59002 => ("costH", "A cost cannot be negative.", "لا يمكن أن تكون التكلفة سالبة."),
@@ -484,6 +493,10 @@ public static class CatalogEndpoints
                     "ما زال هذا التصنيف يحتوي على أصناف نشطة. انقلها أو عطّلها أولًا."),
                 65001 => ProcErrors.Field("appliesTo",
                     "A category holds products, services or both.", "التصنيف يضم منتجات أو خدمات أو كليهما."),
+                65004 => ProcErrors.Field("nameAr",
+                    "Another category already has this Arabic name.", "يوجد تصنيف آخر بهذا الاسم العربي."),
+                65005 => ProcErrors.Field("nameEn",
+                    "Another category already has this English name.", "يوجد تصنيف آخر بهذا الاسم الإنجليزي."),
                 _ => ProcErrors.Field(string.IsNullOrWhiteSpace(request.NameAr) ? "nameAr" : "nameEn",
                     "Both names are required.", "الاسمان العربي والإنجليزي مطلوبان.")
             };
@@ -584,6 +597,10 @@ public static class CatalogEndpoints
                 65012 => ProcErrors.Conflict("deactivation_blocked",
                     "This print group is still used by active items. Reassign them first, or their tickets will not print.",
                     "ما زالت أصناف نشطة تستخدم مجموعة الطباعة هذه. انقلها أولًا وإلا فلن تُطبع تذاكرها."),
+                65013 => ProcErrors.Field("nameAr",
+                    "Another print group already has this Arabic name.", "توجد مجموعة طباعة أخرى بهذا الاسم العربي."),
+                65014 => ProcErrors.Field("nameEn",
+                    "Another print group already has this English name.", "توجد مجموعة طباعة أخرى بهذا الاسم الإنجليزي."),
                 _ => ProcErrors.Field(string.IsNullOrWhiteSpace(request.NameAr) ? "nameAr" : "nameEn",
                     "Both names are required.", "الاسمان العربي والإنجليزي مطلوبان.")
             };

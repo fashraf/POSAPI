@@ -205,11 +205,12 @@ GO
 
 GO
 
+/* No salaries schedule: payroll posts salaries (6200) itself, and a recurring
+   payment for them would count the same pay twice (011 refuses one). */
 INSERT INTO fin.RecurringPayment
     (RecurringId, DescriptionAr, DescriptionEn, CategoryId, BranchId, AmountH, Frequency, NextDueOn, LastPaidOn, PaymentMethod)
 VALUES
     (N'rec_rent',   N'إيجار المحل',       N'Shop rent',             N'exc_rent', N'brn_001', 800000, N'monthly', DATEADD(DAY,  3, CAST(SYSUTCDATETIME() AS DATE)), DATEADD(DAY, -27, CAST(SYSUTCDATETIME() AS DATE)), N'bank'),
-    (N'rec_salary', N'رواتب الموظفين',    N'Employee salaries',     N'exc_sal',  NULL,       600000, N'monthly', DATEADD(DAY,  9, CAST(SYSUTCDATETIME() AS DATE)), DATEADD(DAY, -21, CAST(SYSUTCDATETIME() AS DATE)), N'bank'),
     (N'rec_elec',   N'الكهرباء',          N'Electricity',           N'exc_util', N'brn_001', 185000, N'monthly', DATEADD(DAY,  5, CAST(SYSUTCDATETIME() AS DATE)), DATEADD(DAY, -25, CAST(SYSUTCDATETIME() AS DATE)), N'bank'),
     (N'rec_net',    N'الإنترنت',          N'Internet',              N'exc_util', NULL,        30000, N'monthly', DATEADD(DAY, 22, CAST(SYSUTCDATETIME() AS DATE)), DATEADD(DAY,  -8, CAST(SYSUTCDATETIME() AS DATE)), N'bank'),
     (N'rec_ins',    N'تأمين المنشأة',     N'Business insurance',    N'exc_ins',  NULL,       450000, N'yearly',  DATEADD(DAY, 18, CAST(SYSUTCDATETIME() AS DATE)), NULL,                                              N'bank'),
@@ -373,7 +374,10 @@ VALUES
      DATEFROMPARTS(YEAR(SYSUTCDATETIME()), 12, 31),
      N'System');
 
-EXEC fin.usp_BuildExpenseRecognition @ExpenseId = @InsId;
+/* Through the same posting as a recorded expense (011): the payment to
+   prepaid in January, then one release into 6000 on the first of each month,
+   so the ledger-based P&L shows 1,000 in every month of the year. */
+EXEC fin.usp_PostExpenseLedger @ExpenseId = @InsId, @Actor = N'System';
 GO
 
 PRINT N'10 · Trading history ready.';
@@ -428,4 +432,90 @@ GO
 GO
 
 PRINT N'900 · Demo data loaded. Demo accounts sign in with 1234.';
+GO
+
+/*------------------------------------------------- realign the sequences */
+
+/* The rows above carry literal numbers (EXP-401, the branch ids), while the
+   sequences that number new rows still sit at their starting values. Without
+   this, the next expense recorded draws EXP-401 and fails as a duplicate.
+   The same block as migration 010 — that one runs before this file on a new
+   database, so it cannot see these rows. */
+
+USE POSMAIN;
+GO
+
+SET NOCOUNT ON;
+GO
+
+DECLARE @Map TABLE
+(
+    SequenceName SYSNAME       NOT NULL,   -- schema.name
+    TableName    NVARCHAR(256) NOT NULL,   -- schema.table
+    ColumnName   SYSNAME       NOT NULL,
+    Prefix       NVARCHAR(10)  NOT NULL    -- the text before the number
+);
+
+INSERT INTO @Map (SequenceName, TableName, ColumnName, Prefix) VALUES
+    (N'core.BranchSequence',          N'core.Branch',         N'BranchId',    N'brn_'),
+    (N'fin.JournalSequence',          N'fin.JournalEntry',    N'Reference',   N'JE-'),
+    (N'fin.JournalSequence',          N'fin.JournalEntry',    N'EntryId',     N'jrn_'),
+    (N'fin.SettlementSequence',       N'fin.CardSettlement',  N'Reference',   N'SET-'),
+    (N'fin.PayrollSequence',          N'fin.PayrollRun',      N'Reference',   N'PR-'),
+    (N'fin.ExpenseSequence',          N'fin.Expense',         N'Reference',   N'EXP-'),
+    (N'inv.VendorPaymentSequence',    N'inv.VendorPayment',   N'Reference',   N'VP-'),
+    (N'inv.PurchaseSequence',         N'inv.Purchase',        N'Reference',   N'PO-'),
+    (N'sales.CreditNoteSequence',     N'sales.SaleReturn',    N'NoteNumber',  N'CN-');
+
+DECLARE @Seq SYSNAME, @Table NVARCHAR(256), @Column SYSNAME, @Prefix NVARCHAR(10),
+        @Sql NVARCHAR(MAX), @Like NVARCHAR(20), @MaxUsed BIGINT, @Current BIGINT;
+
+DECLARE map CURSOR LOCAL FAST_FORWARD FOR
+    SELECT SequenceName, TableName, ColumnName, Prefix FROM @Map;
+
+OPEN map;
+FETCH NEXT FROM map INTO @Seq, @Table, @Column, @Prefix;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    IF OBJECT_ID(@Table, N'U') IS NOT NULL
+       AND EXISTS (SELECT 1 FROM sys.sequences WHERE object_id = OBJECT_ID(@Seq))
+    BEGIN
+        /* Only values that are the prefix followed by digits alone count:
+           anything else (a hand-made reference) was never drawn from it. */
+        SET @Sql = N'SELECT @MaxUsed = MAX(TRY_CAST(SUBSTRING(' + QUOTENAME(@Column) + N', '
+                 + CAST(LEN(@Prefix) + 1 AS NVARCHAR(10)) + N', 40) AS BIGINT)) FROM '
+                 + QUOTENAME(PARSENAME(@Table, 2)) + N'.' + QUOTENAME(PARSENAME(@Table, 1))
+                 + N' WHERE ' + QUOTENAME(@Column) + N' LIKE @Like'
+                 + N' AND SUBSTRING(' + QUOTENAME(@Column) + N', '
+                 + CAST(LEN(@Prefix) + 1 AS NVARCHAR(10)) + N', 40) NOT LIKE N''%[^0-9]%'';';
+
+        SET @MaxUsed = NULL;
+        SET @Like = @Prefix + N'%';
+        EXEC sys.sp_executesql @Sql, N'@Like NVARCHAR(20), @MaxUsed BIGINT OUTPUT',
+             @Like = @Like, @MaxUsed = @MaxUsed OUTPUT;
+
+        /* current_value is the last number issued (or the start, if none has
+           been). Restarting at MaxUsed + 1 only when that is not already
+           ahead keeps every number unique. */
+        SELECT @Current = CAST(current_value AS BIGINT)
+        FROM sys.sequences WHERE object_id = OBJECT_ID(@Seq);
+
+        IF @MaxUsed IS NOT NULL AND @MaxUsed >= @Current
+        BEGIN
+            SET @Sql = N'ALTER SEQUENCE ' + QUOTENAME(PARSENAME(@Seq, 2)) + N'.' + QUOTENAME(PARSENAME(@Seq, 1))
+                     + N' RESTART WITH ' + CAST(@MaxUsed + 1 AS NVARCHAR(20)) + N';';
+            EXEC sys.sp_executesql @Sql;
+            PRINT CONCAT(N'    ', @Seq, N' restarted at ', @MaxUsed + 1, N' (', @Table, N'.', @Column, N' uses up to ', @MaxUsed, N').');
+        END
+    END
+
+    FETCH NEXT FROM map INTO @Seq, @Table, @Column, @Prefix;
+END
+
+CLOSE map;
+DEALLOCATE map;
+GO
+
+PRINT N'900 · Sequences realigned above the demo rows.';
 GO

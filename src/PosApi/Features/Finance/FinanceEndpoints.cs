@@ -183,6 +183,40 @@ public static class FinanceEndpoints
             WHERE r.ReturnedAtUtc >= @Start AND r.ReturnedAtUtc < @Next
               AND (@BranchId IS NULL OR r.BranchId = @BranchId)
             GROUP BY ISNULL(r.RefundMethod, N'cash');
+
+            -- 5. Cost sold that the ledger does not carry, per scope: each
+            --    sale's (and credit note's) line cost less what its own entry
+            --    put through 5100. Today that is services and untracked items,
+            --    whose cost never moves stock and so is never posted.
+            SELECT Scope, SUM(CostH) AS CostH
+            FROM (
+                SELECT CASE WHEN s.BranchId IS NULL THEN N'business' ELSE N'branch' END AS Scope,
+                       ISNULL(lc.CostH, 0) - ISNULL(gl.PostedH, 0) AS CostH
+                FROM sales.Sale AS s
+                OUTER APPLY (SELECT SUM(CAST(ROUND(l.UnitCostH * l.Quantity, 0) AS BIGINT)) AS CostH
+                             FROM sales.SaleLine AS l WHERE l.SaleId = s.SaleId) AS lc
+                OUTER APPLY (SELECT SUM(jl.DebitH - jl.CreditH) AS PostedH
+                             FROM fin.JournalEntry AS je
+                             JOIN fin.JournalLine AS jl ON jl.EntryId = je.EntryId AND jl.AccountCode = N'5100'
+                             WHERE je.Kind = N'sale' AND je.SourceReference = s.InvoiceNumber
+                               AND je.ReversesEntryId IS NULL) AS gl
+                WHERE s.Status <> N'voided' AND s.SoldAtUtc >= @Start AND s.SoldAtUtc < @Next
+                  AND (@BranchId IS NULL OR s.BranchId = @BranchId OR s.BranchId IS NULL)
+
+                UNION ALL
+
+                SELECT CASE WHEN r.BranchId IS NULL THEN N'business' ELSE N'branch' END,
+                       -(ISNULL(rc.CostH, 0) - ISNULL(gl.PostedH, 0))
+                FROM sales.SaleReturn AS r
+                OUTER APPLY (SELECT SUM(CAST(ROUND(rl.UnitCostH * rl.Quantity, 0) AS BIGINT)) AS CostH
+                             FROM sales.SaleReturnLine AS rl WHERE rl.ReturnId = r.ReturnId) AS rc
+                OUTER APPLY (SELECT SUM(jl.CreditH - jl.DebitH) AS PostedH
+                             FROM fin.JournalLine AS jl
+                             WHERE jl.EntryId = r.EntryId AND jl.AccountCode = N'5100') AS gl
+                WHERE r.ReturnedAtUtc >= @Start AND r.ReturnedAtUtc < @Next
+                  AND (@BranchId IS NULL OR r.BranchId = @BranchId OR r.BranchId IS NULL)
+            ) AS c
+            GROUP BY Scope;
             """;
 
         await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(sql,
@@ -193,8 +227,22 @@ public static class FinanceEndpoints
         var tendered = (await multi.ReadAsync<(string Method, long AmountH)>()).ToDictionary(r => r.Method, r => r.AmountH);
         var sales = await multi.ReadSingleAsync<(long ChangeH, int SaleCount)>();
         var refunds = (await multi.ReadAsync<(string Method, long AmountH, int NoteCount)>()).ToList();
+        var offLedgerCost = (await multi.ReadAsync<(string Scope, long CostH)>()).ToList();
 
-        SummaryFigures Figures(Func<SummaryAccountRow, bool> inScope)
+        /*
+         * Gross profit — the one rule every screen uses (the dashboard's
+         * GET /api/sales/analytics computes the same thing from the sales):
+         *
+         *   net revenue  = sales excluding VAT, less returns excluding VAT
+         *                  (4100 credits less its return debits)
+         *   cost of sales = cost of the goods AND services sold, less the cost
+         *                  of what came back (5100, plus the line cost of
+         *                  services and untracked items, which the ledger
+         *                  never posts — query 5)
+         *   gross profit = net revenue − cost of sales
+         *   gross margin = gross profit ÷ net revenue (never the VAT-inclusive price)
+         */
+        SummaryFigures Figures(Func<SummaryAccountRow, bool> inScope, Func<string, bool> scopeMatches)
         {
             var rows = accounts.Where(inScope).ToList();
 
@@ -208,10 +256,20 @@ public static class FinanceEndpoints
                 a.AccountCode, a.NameAr, a.NameEn, language.Pick(a.NameAr, a.NameEn),
                 Period(a.AccountCode, true))).ToList();
 
+            var revenueH = Period("4100", false);
+            var goodsCostH = Period("5100", true);
+            var serviceCostH = offLedgerCost.Where(c => scopeMatches(c.Scope)).Sum(c => c.CostH);
+            var cogsH = goodsCostH + serviceCostH;
+            var grossProfitH = revenueH - cogsH;
+
             return new SummaryFigures(
-                Period("4100", false),
+                revenueH,
                 rows.Where(r => r.AccountCode == "4100").Sum(r => r.PeriodReturnNetH),
-                Period("5100", true),
+                cogsH,
+                goodsCostH,
+                serviceCostH,
+                grossProfitH,
+                revenueH > 0 ? Math.Round((decimal)grossProfitH / revenueH, 4) : null,
                 byAccount.Sum(a => a.AmountH),
                 byAccount,
                 Balance(true, "1000", "1100"),
@@ -221,7 +279,7 @@ public static class FinanceEndpoints
                 Balance(true, "1150"));
         }
 
-        var top = Figures(r => branch is null || r.Scope == "branch");
+        var top = Figures(r => branch is null || r.Scope == "branch", scope => branch is null || scope == "branch");
 
         long Tender(string method) => tendered.TryGetValue(method, out var v) ? v : 0;
         long Refund(string method) => refunds.Where(r => r.Method == method).Sum(r => r.AmountH);
@@ -235,6 +293,10 @@ public static class FinanceEndpoints
             revenueH = top.RevenueH,
             returnsH = top.ReturnsH,
             cogsH = top.CogsH,
+            goodsCostH = top.GoodsCostH,
+            serviceCostH = top.ServiceCostH,
+            grossProfitH = top.GrossProfitH,
+            grossMargin = top.GrossMargin,
             expensesH = top.ExpensesH,
             expensesByAccount = top.ExpensesByAccount,
             cashH = top.CashH,
@@ -260,7 +322,7 @@ public static class FinanceEndpoints
                 totalH = refunds.Sum(r => r.AmountH),
                 noteCount = refunds.Sum(r => r.NoteCount)
             },
-            businessWide = branch is null ? null : Figures(r => r.Scope == "business")
+            businessWide = branch is null ? null : Figures(r => r.Scope == "business", scope => scope == "business")
         });
     }
 
@@ -271,7 +333,14 @@ public static class FinanceEndpoints
     public sealed record SummaryFigures(
         long RevenueH,
         long ReturnsH,
+        /// <summary>Cost of goods and services sold: <c>GoodsCostH + ServiceCostH</c>.</summary>
         long CogsH,
+        /// <summary>5100, as posted for stocked goods.</summary>
+        long GoodsCostH,
+        /// <summary>Line cost of services and untracked items, net of returns; not in the ledger.</summary>
+        long ServiceCostH,
+        long GrossProfitH,
+        decimal? GrossMargin,
         long ExpensesH,
         IReadOnlyList<ExpenseAccountAmount> ExpensesByAccount,
         long CashH,

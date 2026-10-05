@@ -380,25 +380,36 @@ try
             return;
         }
 
-        logger.LogError(feature?.Error, "Unhandled exception on {Path}", context.Request.Path);
+        /*
+         * The full exception goes to the log, keyed by the correlation id; the
+         * client gets the generic bilingual message and that id, nothing more.
+         * The id is how a reported 500 is matched to this log line.
+         */
+        var correlationId = context.Items["CorrelationId"] as string
+                            ?? Guid.NewGuid().ToString("N")[..16];
+
+        logger.LogError(feature?.Error,
+            "Unhandled exception on {Method} {Path} (correlation {CorrelationId})",
+            context.Request.Method, context.Request.Path, correlationId);
 
         context.Response.StatusCode = StatusCodes.Status500InternalServerError;
 
         /*
-         * In Development, say what actually happened.
+         * Exception details in the response only when explicitly switched on.
          *
-         * A generic message is right in production — an exception can name
-         * tables, paths and versions an attacker would rather not have to
-         * guess. But it is the wrong trade while building: a 500 saying "try
-         * again" sends you hunting through console output for a line you may
-         * have already scrolled past.
-         *
-         * The correlation id is returned either way, so a production report can
-         * still be matched to the logged exception.
+         * An exception message carries SQL text, table names, paths and
+         * versions, and a stack trace maps the code — none of it belongs in a
+         * response by default, not even in Development (a dev box exposed on a
+         * LAN is still exposed). Errors:IncludeDetails turns it on for local
+         * debugging, and Production ignores it even if set, so a config file
+         * copied to the server cannot leak it.
          */
-        var correlationId = context.Items["CorrelationId"] as string;
+        var environment = context.RequestServices.GetRequiredService<IHostEnvironment>();
+        var includeDetails = !environment.IsProduction() &&
+                             context.RequestServices.GetRequiredService<IConfiguration>()
+                                 .GetValue("Errors:IncludeDetails", false);
 
-        if (context.RequestServices.GetRequiredService<IHostEnvironment>().IsDevelopment())
+        if (includeDetails)
         {
             var error = feature?.Error;
 
@@ -407,8 +418,9 @@ try
                 code = "server_error",
                 messageEn = "Something went wrong. Please try again.",
                 messageAr = "حدث خطأ ما. حاول مرة أخرى.",
+                traceId = correlationId,
                 correlationId,
-                /* Development only. */
+                /* Errors:IncludeDetails only, never in Production. */
                 developerMessage = error?.Message,
                 exceptionType = error?.GetType().FullName,
                 innerMessage = error?.InnerException?.Message,
@@ -418,10 +430,14 @@ try
             return;
         }
 
-        await context.Response.WriteAsJsonAsync(ApiError.Create(
-            "server_error",
-            "Something went wrong. Please try again.",
-            "حدث خطأ ما. حاول مرة أخرى.") with { TraceId = correlationId });
+        await context.Response.WriteAsJsonAsync(new
+        {
+            code = "server_error",
+            messageEn = "Something went wrong. Please try again.",
+            messageAr = "حدث خطأ ما. حاول مرة أخرى.",
+            traceId = correlationId,
+            correlationId
+        });
     }));
 
     if (app.Environment.IsDevelopment())
@@ -486,6 +502,8 @@ try
     app.MapDeviceEndpoints();
     app.MapDiscoveryEndpoints();
     app.MapAuditEndpoints();
+    app.MapSearchEndpoints();
+    app.MapStocktakeEndpoints();
 
     app.MapGet("/health", () => Results.Ok(new
     {

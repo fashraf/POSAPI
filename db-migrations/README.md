@@ -18,6 +18,13 @@ apply-migrations.cmd -S VMI1342014\SQLEXPRESS --dry-run
 apply-migrations.cmd -S 127.0.0.1,1433 -U sa -P "..." --recreate --demo
 ```
 
+On Linux or macOS use `apply-migrations.sh`, which takes the same options and keeps the same tracking table, so either script can update a database the other built. Linux has no Windows login, so pass a SQL login. If SQL Server runs in Docker and there is no local `sqlcmd`, add `--docker <container>` to use the container's own `sqlcmd`:
+
+```
+./apply-migrations.sh -S 127.0.0.1,1433 -U sa -P '...'
+./apply-migrations.sh --docker sql2019 -U sa -P '...' --dry-run
+```
+
 - `--dry-run` lists what would run and changes nothing.
 - `--adopt` is for a database built by the old migration files (11–43, replaced by 001 and 002 on 2026-10-03). If that database has all of them applied, its schema already matches 001, and the script records 001 and 002 without running them. It refuses a database that stopped part-way.
 - `--recreate` drops `POSMAIN` and builds it again. It asks you to type `POSMAIN` first unless you pass `--yes`.

@@ -480,6 +480,13 @@ public static partial class CompanyEndpoints
         62023 => ProcErrors.Field("printGroupId", "Choose which print group this ticket is for.", "اختر مجموعة الطباعة لهذه التذكرة."),
         62024 => ProcErrors.Field("printGroupId", "No such print group.", "لا توجد مجموعة طباعة بهذا المعرف."),
         62025 => ProcErrors.Field("showGrandTotal", "A customer receipt must show the total.", "يجب أن تظهر فاتورة العميل الإجمالي."),
+        /* ZATCA simplified tax invoice fields — see core.usp_SaveBillTemplate. */
+        62031 => ProcErrors.Field("showVatNumber", "A customer receipt is a tax invoice and must show the VAT number.",
+            "فاتورة العميل فاتورة ضريبية ويجب أن يظهر فيها الرقم الضريبي."),
+        62032 => ProcErrors.Field("showVat", "A customer receipt is a tax invoice and must show the VAT amount.",
+            "فاتورة العميل فاتورة ضريبية ويجب أن يظهر فيها مبلغ الضريبة."),
+        62033 => ProcErrors.Field("showZatcaQr", "A customer receipt is a tax invoice and must show the ZATCA QR code.",
+            "فاتورة العميل فاتورة ضريبية ويجب أن يظهر فيها رمز الاستجابة السريعة (زاتكا)."),
         62027 => ProcErrors.Field("language", "Language must be ar, en or both.", "اللغة ar أو en أو both."),
         62028 => ProcErrors.Field("headerAlignment", "That header layout is not recognised.", "تنسيق الترويسة غير معروف."),
         _ => null

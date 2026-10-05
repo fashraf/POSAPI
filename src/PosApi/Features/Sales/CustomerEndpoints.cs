@@ -7,14 +7,22 @@ using PosApi.Data;
 
 namespace PosApi.Features.Sales;
 
+/// <summary>
+/// A new customer. <c>OpeningBalanceH</c> is what they already owed before
+/// the system; it is posted to the ledger (Dr 1400 / Cr 3900) dated
+/// <c>OpeningAsOf</c> (today when null) and tagged to <c>BranchId</c>.
+/// </summary>
 public sealed record CustomerInput(
     string NameAr,
     string NameEn,
     string? Phone,
     string? Email,
     string? VatNumber,
-    string CustomerType,
-    long CreditLimitH);
+    string? CustomerType,
+    long CreditLimitH,
+    long OpeningBalanceH = 0,
+    DateOnly? OpeningAsOf = null,
+    string? BranchId = null);
 
 /// <summary>
 /// Edit a customer. The balance is never written here. <c>CustomerType</c>
@@ -134,64 +142,155 @@ public static class CustomerEndpoints
     }
 
     /// <summary>
-    /// The customer's account, oldest first.
+    /// The customer's account, oldest first, ending on <c>core.Customer.BalanceH</c>.
     ///
-    /// Credit sales and collections in one sequence, because "what do they owe
-    /// and why" is a single question.
+    /// Every movement of what they owe, signed from the customer's side
+    /// (positive raises the balance, negative lowers it), with the running
+    /// balance after each:
+    /// <list type="bullet">
+    /// <item><c>opening_balance</c> — an opening receivable posted when the customer was created.</item>
+    /// <item><c>credit_sale</c> — the part of a sale put on account (voided sales left out).</item>
+    /// <item><c>collection</c> — a payment received; <c>collection_reversed</c> is its reversal,
+    /// shown beside it so the account reads the way it happened.</item>
+    /// <item><c>credit_note</c> — a return refunded to the account.</item>
+    /// <item><c>balance_forward</c> — first line, only when the balance includes debt
+    /// from before any of these records (seeded or imported balances), so the
+    /// running balance still ends where the account does.</item>
+    /// </list>
     /// </summary>
     private static async Task<IResult> StatementAsync(
         string customerId, ISqlConnectionFactory db, CancellationToken ct = default)
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var customer = await connection.QuerySingleOrDefaultAsync<(long BalanceH, DateTime CreatedAtUtc)?>(
+            new CommandDefinition(
+                "SELECT BalanceH, CreatedAtUtc FROM core.Customer WHERE CustomerId = @CustomerId;",
+                new { CustomerId = customerId }, cancellationToken: ct));
+
+        if (customer is null)
+            return ProcErrors.NotFound("Customer not found.", "العميل غير موجود.");
+
+        var movements = (await connection.QueryAsync<StatementRow>(new CommandDefinition(
             """
-            SELECT
-                s.SaleId        AS Id,
-                s.InvoiceNumber AS Reference,
-                s.SoldAtUtc     AS OccurredAtUtc,
-                N'credit_sale'  AS Kind,
-                p.AmountH       AS AmountH
-            FROM sales.Sale AS s
-            JOIN sales.SalePayment AS p
-                 ON p.SaleId = s.SaleId AND p.Method = N'credit'
-            WHERE s.CustomerId = @CustomerId AND s.Status <> N'voided'
+            SELECT Id, Reference, OccurredAtUtc, Kind, AmountH, SortOrder
+            FROM (
+                /* Opening receivable, and its reversal if it was taken back. */
+                SELECT
+                    e.EntryId       AS Id,
+                    e.Reference     AS Reference,
+                    e.PostedAtUtc   AS OccurredAtUtc,
+                    CASE WHEN e.ReversesEntryId IS NULL THEN N'opening_balance'
+                         ELSE N'opening_reversed' END AS Kind,
+                    SUM(l.DebitH - l.CreditH) AS AmountH,
+                    0               AS SortOrder
+                FROM fin.JournalEntry AS e
+                JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId AND l.AccountCode = N'1400'
+                WHERE e.Kind = N'customer_opening' AND e.SourceReference = @CustomerId
+                GROUP BY e.EntryId, e.Reference, e.PostedAtUtc, e.ReversesEntryId
 
-            UNION ALL
+                UNION ALL
 
-            SELECT
-                e.EntryId       AS Id,
-                e.Reference     AS Reference,
-                e.PostedAtUtc   AS OccurredAtUtc,
-                N'collection'   AS Kind,
-                -l.CreditH      AS AmountH
-            FROM fin.JournalEntry AS e
-            JOIN fin.JournalLine  AS l
-                 ON l.EntryId = e.EntryId AND l.AccountCode = N'1400'
-            WHERE e.Kind = N'customer_collection'
-              AND e.SourceReference = @CustomerId
-              AND e.ReversesEntryId IS NULL
-              AND e.ReversedByEntryId IS NULL
+                SELECT
+                    s.SaleId        AS Id,
+                    s.InvoiceNumber AS Reference,
+                    s.SoldAtUtc     AS OccurredAtUtc,
+                    N'credit_sale'  AS Kind,
+                    SUM(p.AmountH)  AS AmountH,
+                    1               AS SortOrder
+                FROM sales.Sale AS s
+                JOIN sales.SalePayment AS p
+                     ON p.SaleId = s.SaleId AND p.Method = N'credit'
+                WHERE s.CustomerId = @CustomerId AND s.Status <> N'voided'
+                GROUP BY s.SaleId, s.InvoiceNumber, s.SoldAtUtc
 
-            UNION ALL
+                UNION ALL
 
-            /* A return refunded to the account lowers what is owed. */
-            SELECT
-                r.ReturnId      AS Id,
-                r.NoteNumber    AS Reference,
-                r.ReturnedAtUtc AS OccurredAtUtc,
-                N'credit_note'  AS Kind,
-                -r.RefundH      AS AmountH
-            FROM sales.SaleReturn AS r
-            WHERE r.CustomerId = @CustomerId AND r.RefundMethod = N'credit' AND r.RefundH > 0
+                /* Collections net of their own 1400 lines: a collection is a
+                   credit (negative here), its reversal a debit (positive). */
+                SELECT
+                    e.EntryId       AS Id,
+                    e.Reference     AS Reference,
+                    e.PostedAtUtc   AS OccurredAtUtc,
+                    CASE WHEN e.ReversesEntryId IS NULL THEN N'collection'
+                         ELSE N'collection_reversed' END AS Kind,
+                    SUM(l.DebitH - l.CreditH) AS AmountH,
+                    3               AS SortOrder
+                FROM fin.JournalEntry AS e
+                JOIN fin.JournalLine  AS l
+                     ON l.EntryId = e.EntryId AND l.AccountCode = N'1400'
+                WHERE e.Kind = N'customer_collection'
+                  AND e.SourceReference = @CustomerId
+                GROUP BY e.EntryId, e.Reference, e.PostedAtUtc, e.ReversesEntryId
 
-            ORDER BY OccurredAtUtc;
+                UNION ALL
+
+                /* A return refunded to the account lowers what is owed. */
+                SELECT
+                    r.ReturnId      AS Id,
+                    r.NoteNumber    AS Reference,
+                    r.ReturnedAtUtc AS OccurredAtUtc,
+                    N'credit_note'  AS Kind,
+                    -r.RefundH      AS AmountH,
+                    2               AS SortOrder
+                FROM sales.SaleReturn AS r
+                WHERE r.CustomerId = @CustomerId AND r.RefundMethod = N'credit' AND r.RefundH > 0
+            ) AS m
+            WHERE AmountH <> 0
+            ORDER BY OccurredAtUtc, SortOrder, Reference;
             """,
-            new { CustomerId = customerId }, cancellationToken: ct));
+            new { CustomerId = customerId }, cancellationToken: ct))).ToList();
+
+        /* Whatever the records above do not explain was owed before them. It
+           opens the statement, so every running balance after it is right. */
+        var forwardH = customer.Value.BalanceH - movements.Sum(m => m.AmountH);
+        if (forwardH != 0)
+        {
+            var first = movements.Count > 0 ? movements[0].OccurredAtUtc : customer.Value.CreatedAtUtc;
+            var at = customer.Value.CreatedAtUtc < first ? customer.Value.CreatedAtUtc : first.AddMilliseconds(-1);
+            movements.Insert(0, new StatementRow
+            {
+                Id = $"bf_{customerId}",
+                Reference = string.Empty,
+                OccurredAtUtc = at,
+                Kind = "balance_forward",
+                AmountH = forwardH
+            });
+        }
+
+        var running = 0L;
+        var rows = movements.Select(m =>
+        {
+            running += m.AmountH;
+            return new
+            {
+                id = m.Id,
+                reference = m.Reference,
+                occurredAtUtc = DateTime.SpecifyKind(m.OccurredAtUtc, DateTimeKind.Utc),
+                kind = m.Kind,
+                amountH = m.AmountH,
+                balanceH = running
+            };
+        }).ToList();
 
         return Results.Ok(rows);
     }
 
+    private sealed record StatementRow
+    {
+        public string Id { get; init; } = string.Empty;
+        public string Reference { get; init; } = string.Empty;
+        public DateTime OccurredAtUtc { get; init; }
+        public string Kind { get; init; } = string.Empty;
+        public long AmountH { get; init; }
+        public int SortOrder { get; init; }
+    }
+
+    /// <summary>
+    /// Create a customer through core.usp_CreateCustomer, which also posts an
+    /// opening balance to the ledger. Returns the new id (and the opening
+    /// entry, when one was posted).
+    /// </summary>
     private static async Task<IResult> CreateAsync(
         CustomerInput input, ISqlConnectionFactory db, ICurrentUser current, CancellationToken ct)
     {
@@ -199,7 +298,7 @@ public static class CustomerEndpoints
         // unreadable to half the staff who will serve them.
         if (string.IsNullOrWhiteSpace(input.NameAr) || string.IsNullOrWhiteSpace(input.NameEn))
         {
-            return Results.BadRequest(ApiError.Create(
+            return Results.UnprocessableEntity(ApiError.Create(
                 "name_required",
                 "Both the Arabic and English name are required.",
                 "الاسم بالعربية والإنجليزية مطلوبان.",
@@ -212,35 +311,92 @@ public static class CustomerEndpoints
                 }));
         }
 
-        var customerId = $"cus_{Guid.NewGuid():N}"[..24];
+        if (CheckFields(input.NameAr, input.NameEn, input.Phone, input.Email, input.VatNumber,
+                        input.CreditLimitH) is { } invalid)
+            return invalid;
+
+        if (input.OpeningBalanceH < 0)
+            return ProcErrors.Field("openingBalanceH", "An opening balance cannot be negative.",
+                "لا يمكن أن يكون الرصيد الافتتاحي سالبًا.");
+
+        var branchId = ProcErrors.Blank(input.BranchId);
+        if (branchId is not null && !current.CanSeeBranch(branchId)) return Results.Forbid();
+
+        var parameters = new DynamicParameters();
+        parameters.Add("@NameAr", input.NameAr.Trim());
+        parameters.Add("@NameEn", input.NameEn.Trim());
+        parameters.Add("@Phone", ProcErrors.Blank(input.Phone));
+        parameters.Add("@Email", ProcErrors.Blank(input.Email));
+        parameters.Add("@VatNumber", ProcErrors.Blank(input.VatNumber));
+        parameters.Add("@CustomerType", ProcErrors.Blank(input.CustomerType));
+        parameters.Add("@CreditLimitH", input.CreditLimitH);
+        parameters.Add("@OpeningBalanceH", input.OpeningBalanceH);
+        parameters.Add("@OpeningAsOf", input.OpeningAsOf);
+        parameters.Add("@BranchId", branchId);
+        parameters.Add("@Actor", current.Username);
+        parameters.Add("@CustomerId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
+        parameters.Add("@EntryId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
 
         await using var connection = db.Create();
 
-        await connection.ExecuteAsync(new CommandDefinition(
-            """
-            INSERT INTO core.Customer
-                (CustomerId, NameAr, NameEn, Phone, Email, VatNumber,
-                 CustomerType, CreditLimitH, BalanceH, CreatedBy)
-            VALUES
-                (@CustomerId, @NameAr, @NameEn, @Phone, @Email, @VatNumber,
-                 @CustomerType, @CreditLimitH, 0, @Actor);
-            """,
-            new
-            {
-                CustomerId = customerId,
-                input.NameAr,
-                input.NameEn,
-                input.Phone,
-                input.Email,
-                input.VatNumber,
-                input.CustomerType,
-                input.CreditLimitH,
-                Actor = current.Username
-            },
-            cancellationToken: ct));
+        try
+        {
+            await connection.ExecuteAsync(new CommandDefinition(
+                "core.usp_CreateCustomer", parameters,
+                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+        }
+        catch (SqlException ex) when (MapCustomerError(ex.Number, input.NameAr) is { } mapped)
+        {
+            return mapped;
+        }
 
-        return Results.Created($"/api/customers/{customerId}", new { customerId });
+        var customerId = parameters.Get<string>("@CustomerId");
+
+        return Results.Created($"/api/customers/{customerId}",
+            new { customerId, openingEntryId = parameters.Get<string?>("@EntryId") });
     }
+
+    /// <summary>
+    /// The checks that would otherwise reach the database as a constraint or
+    /// truncation error (HTTP 500): column lengths and a negative limit.
+    /// </summary>
+    private static IResult? CheckFields(
+        string? nameAr, string? nameEn, string? phone, string? email, string? vatNumber, long creditLimitH)
+    {
+        if (creditLimitH < 0)
+            return ProcErrors.Field("creditLimitH", "A credit limit cannot be negative.", "لا يمكن أن يكون حد الائتمان سالبًا.");
+
+        static bool TooLong(string? value, int max) => value is not null && value.Trim().Length > max;
+
+        if (TooLong(nameAr, 160))
+            return ProcErrors.Field("nameAr", "The name is too long (160 characters at most).", "الاسم طويل جدًا (160 حرفًا على الأكثر).");
+        if (TooLong(nameEn, 160))
+            return ProcErrors.Field("nameEn", "The name is too long (160 characters at most).", "الاسم طويل جدًا (160 حرفًا على الأكثر).");
+        if (TooLong(phone, 30))
+            return ProcErrors.Field("phone", "The phone number is too long (30 characters at most).", "رقم الجوال طويل جدًا (30 حرفًا على الأكثر).");
+        if (TooLong(email, 160))
+            return ProcErrors.Field("email", "The email is too long (160 characters at most).", "البريد الإلكتروني طويل جدًا (160 حرفًا على الأكثر).");
+        if (TooLong(vatNumber, 15))
+            return ProcErrors.Field("vatNumber", "A VAT number is 15 digits.", "الرقم الضريبي 15 رقمًا.");
+
+        return null;
+    }
+
+    /* The THROW numbers core.usp_CreateCustomer and core.usp_UpdateCustomer share. */
+    private static IResult? MapCustomerError(int number, string? nameAr) => number switch
+    {
+        68000 => ProcErrors.Field(string.IsNullOrWhiteSpace(nameAr) ? "nameAr" : "nameEn",
+            "Both the Arabic and English name are required.", "الاسم بالعربية والإنجليزية مطلوبان."),
+        68001 => ProcErrors.Field("creditLimitH", "A credit limit cannot be negative.", "لا يمكن أن يكون حد الائتمان سالبًا."),
+        68004 => ProcErrors.Field("customerType", "A customer is an individual or a business.", "العميل فرد أو منشأة."),
+        68006 => ProcErrors.Field("openingBalanceH", "An opening balance cannot be negative.",
+            "لا يمكن أن يكون الرصيد الافتتاحي سالبًا."),
+        68007 => ProcErrors.Field("openingBalanceH",
+            "The opening balance is above the credit limit. Raise the limit to match.",
+            "الرصيد الافتتاحي أعلى من حد الائتمان. ارفع الحد ليطابقه."),
+        68008 => ProcErrors.Field("branchId", "Unknown branch.", "فرع غير معروف."),
+        _ => null
+    };
 
     private static async Task<IResult> CollectAsync(
         string customerId,
@@ -359,6 +515,10 @@ public static class CustomerEndpoints
         if (email is not null && (!email.Contains('@', StringComparison.Ordinal) || email.Contains(' ', StringComparison.Ordinal)))
             return ProcErrors.Field("email", "Enter a valid email address, or leave it empty.",
                 "أدخل بريدًا إلكترونيًا صحيحًا أو اتركه فارغًا.");
+
+        if (CheckFields(request.NameAr, request.NameEn, request.Phone, email, request.VatNumber,
+                        request.CreditLimitH) is { } invalid)
+            return invalid;
 
         await using var connection = db.Create();
 

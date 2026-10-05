@@ -448,6 +448,9 @@ public static partial class ExpenseSetupEndpoints
         69106 => ProcErrors.Field("branchId", "Unknown branch.", "فرع غير معروف."),
         69107 => RecurringNotFound(),
         69108 => ProcErrors.Field("status", "Status is active or paused.", "الحالة نشط أو موقوف."),
+        69109 => ProcErrors.Field("categoryId",
+            "Salaries and commission are paid through payroll, which already posts them. Choose another category.",
+            "الرواتب والعمولات تُصرف من خلال مسير الرواتب الذي يرحّلها مسبقًا. اختر تصنيفًا آخر."),
         _ => null
     };
 

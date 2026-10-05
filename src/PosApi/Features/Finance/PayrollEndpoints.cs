@@ -363,7 +363,11 @@ public static class PayrollEndpoints
                 "fin.usp_RecordRecurringInstalment", parameters,
                 commandType: CommandType.StoredProcedure, cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 54000 && ex.Number < 57000)
+        catch (SqlException ex) when (ExpenseEndpoints.MapRecordError(ex) is { } mapped)
+        {
+            return mapped;
+        }
+        catch (SqlException ex) when (ex.Number >= 56000 && ex.Number < 57000)
         {
             return Results.Json(Translate(ex.Number, ex.Message),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
