@@ -466,6 +466,10 @@ try
         app.UseHsts();
     }
 
+    /* The built frontend, when present. Before CORS, the audit trail and
+       authentication: loading the app's files needs none of them. */
+    var frontendFiles = app.UseFrontendFiles();
+
     // CORS before authentication: a rejected preflight carries no credentials
     // and must not have to pass an authorization check.
     app.UseCors();
@@ -521,6 +525,9 @@ try
         await using var connection = await db.CreateOpenAsync(ct);
         return Results.Ok(new { status = "ok", database = connection.Database });
     }).AllowAnonymous().WithTags("Health");
+
+    /* Last: only what no API route claimed falls through to the app. */
+    app.MapFrontendFallback(frontendFiles);
 
     /*
      * Print where it is actually listening.

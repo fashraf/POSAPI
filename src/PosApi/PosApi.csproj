@@ -11,6 +11,16 @@
     <UserSecretsId>nazad-pos-api</UserSecretsId>
   </PropertyGroup>
 
+  <!-- The built frontend (build-frontend.sh / .cmd writes it to src/frontend).
+       Published next to the binary as frontend/, where FrontendHosting finds
+       it; `dotnet run` reads it from ../frontend in place. -->
+  <ItemGroup>
+    <Content Include="..\frontend\**\*"
+             Link="frontend\%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToPublishDirectory="PreserveNewest"
+             CopyToOutputDirectory="Never" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Dapper" Version="2.1.35" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.1" />
