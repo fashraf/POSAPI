@@ -15,8 +15,8 @@ public sealed record TokenPair(
 
 public interface IJwtTokenService
 {
-    TokenPair Issue(string userId, string username, string roleId, IEnumerable<string> permissions,
-                    IEnumerable<string> branchIds);
+    TokenPair Issue(string tenantId, string userId, string username, string roleId,
+                    IEnumerable<string> permissions, IEnumerable<string> branchIds);
     string HashRefreshToken(string refreshToken);
 }
 
@@ -39,6 +39,7 @@ public sealed class JwtTokenService : IJwtTokenService
     }
 
     public TokenPair Issue(
+        string tenantId,
         string userId,
         string username,
         string roleId,
@@ -54,7 +55,10 @@ public sealed class JwtTokenService : IJwtTokenService
             new(JwtRegisteredClaimNames.UniqueName, username),
             new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString("N")),
             new(ClaimTypes.Role, roleId),
-            new("role", roleId)
+            new("role", roleId),
+            /* Which database this session works in. Checked against the
+               control database on every request (TenantMiddleware). */
+            new(PosApi.Tenancy.TenantMiddleware.TenantClaim, tenantId)
         };
 
         // Permissions ride in the token so an authorization check is a claim
@@ -73,7 +77,9 @@ public sealed class JwtTokenService : IJwtTokenService
 
         return new TokenPair(
             new JwtSecurityTokenHandler().WriteToken(token),
-            Convert.ToBase64String(RandomNumberGenerator.GetBytes(48)),
+            /* Prefixed with the tenant so the anonymous refresh call can find
+               the database the token is stored in. */
+            PosApi.Tenancy.TenantKey.Compose(tenantId, Convert.ToBase64String(RandomNumberGenerator.GetBytes(48))),
             accessExpires,
             now.AddDays(_options.RefreshTokenDays));
     }

@@ -4,6 +4,7 @@ using Dapper;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
+using PosApi.Tenancy;
 
 namespace PosApi.Features.Devices;
 
@@ -124,7 +125,7 @@ public static class DeviceEndpoints
 
     private static async Task<IResult> CreateAsync(
         CreateDeviceRequest request, ISqlConnectionFactory db, ICurrentUser current,
-        CancellationToken ct = default)
+        ITenantContext tenant, DeviceDirectory directory, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(request.DeviceId) ||
             string.IsNullOrWhiteSpace(request.DeviceName))
@@ -145,7 +146,18 @@ public static class DeviceEndpoints
                 "معرّف الجهاز مستخدم بالفعل."));
         }
 
-        var code = NewRegistrationCode();
+        /* The plan's device limit, counted on active terminals. */
+        if (tenant.Tenant!.MaxDevices is { } maxDevices &&
+            await connection.ExecuteScalarAsync<int>(new CommandDefinition(
+                "SELECT COUNT(*) FROM device.PosDevice WHERE IsActive = 1;", cancellationToken: ct)) >= maxDevices)
+        {
+            return Results.Conflict(ApiError.Create(
+                "plan_limit_devices",
+                $"Your plan allows {maxDevices} active POS devices. Upgrade the plan or deactivate one first.",
+                $"باقتك تسمح بـ {maxDevices} أجهزة نقاط بيع نشطة. رقِّ الباقة أو عطّل جهازًا أولًا."));
+        }
+
+        var code = await ClaimCodeAsync(directory, tenant.Tenant.TenantId, request.DeviceId, ct);
 
         await connection.ExecuteAsync(new CommandDefinition(
             """
@@ -221,9 +233,10 @@ public static class DeviceEndpoints
     /// cannot knock a working till offline.
     /// </summary>
     private static async Task<IResult> RegenerateCodeAsync(
-        string deviceId, ISqlConnectionFactory db, CancellationToken ct = default)
+        string deviceId, ISqlConnectionFactory db, ITenantContext tenant, DeviceDirectory directory,
+        CancellationToken ct = default)
     {
-        var code = NewRegistrationCode();
+        var code = await ClaimCodeAsync(directory, tenant.Tenant!.TenantId, deviceId, ct);
 
         await using var connection = db.Create();
 
@@ -307,7 +320,7 @@ public static class DeviceEndpoints
     /*====================================================== device handlers */
 
     private static async Task<IResult> RegisterAsync(
-        RegisterDeviceRequest request, ISqlConnectionFactory db,
+        RegisterDeviceRequest request, ISqlConnectionFactory db, TenantGate gate, DeviceDirectory directory,
         ILogger<Program> logger, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(request.RegistrationCode) ||
@@ -321,7 +334,20 @@ public static class DeviceEndpoints
         /* The token is returned once and stored hashed, like a refresh token.
            A token readable from the table is a token anyone with a query window
            can use to impersonate a till. */
-        var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+        /* The code names the business: the control database holds code → tenant. */
+        var tenantId = await directory.TenantForCodeAsync(request.RegistrationCode, ct);
+        if (tenantId is null)
+        {
+            return Results.BadRequest(ApiError.Create(
+                "registration_refused", "That registration code is not valid or has expired.",
+                "رمز التسجيل غير صحيح أو منتهي الصلاحية."));
+        }
+
+        if (await gate.EnterAsync(tenantId, ct) is { } refused) return refused;
+
+        /* Prefixed with the tenant, so heartbeats — also anonymous — find the
+           database the device is registered in. */
+        var token = TenantKey.Compose(tenantId, Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)));
 
         var parameters = new DynamicParameters();
         parameters.Add("@RegistrationCode", request.RegistrationCode.Trim().ToUpperInvariant());
@@ -356,14 +382,19 @@ public static class DeviceEndpoints
             "SELECT * FROM device.vw_DeviceStatus WHERE DeviceId = @DeviceId;",
             new { DeviceId = deviceId }, cancellationToken: ct));
 
-        logger.LogInformation("Device {DeviceId} registered.", deviceId);
+        logger.LogInformation("Device {DeviceId} registered for {TenantId}.", deviceId, tenantId);
+
+        await directory.PairedAsync(tenantId, request.RegistrationCode, deviceId, request.SerialNumber, ct);
 
         return Results.Ok(new { deviceToken = token, device });
     }
 
     private static async Task<IResult> HeartbeatAsync(
-        HeartbeatRequest request, ISqlConnectionFactory db, CancellationToken ct = default)
+        HeartbeatRequest request, ISqlConnectionFactory db, TenantGate gate, CancellationToken ct = default)
     {
+        /* A suspended business's tills stop here: refused, not acknowledged. */
+        if (await gate.EnterAsync(TenantKey.TenantOf(request.DeviceToken), ct) is { } refused) return refused;
+
         await using var connection = db.Create();
 
         var deviceId = await AuthenticateDeviceAsync(connection, request.DeviceToken, ct);
@@ -395,9 +426,11 @@ public static class DeviceEndpoints
     }
 
     private static async Task<IResult> CommandResultAsync(
-        string commandId, CommandResultRequest request, ISqlConnectionFactory db,
+        string commandId, CommandResultRequest request, ISqlConnectionFactory db, TenantGate gate,
         CancellationToken ct = default)
     {
+        if (await gate.EnterAsync(TenantKey.TenantOf(request.DeviceToken), ct) is { } refused) return refused;
+
         await using var connection = db.Create();
 
         var deviceId = await AuthenticateDeviceAsync(connection, request.DeviceToken, ct);
@@ -447,6 +480,19 @@ public static class DeviceEndpoints
     /// people mistype from a screen, and a registration that fails for that
     /// reason looks like a broken device.
     /// </summary>
+    /// <summary>A fresh code, recorded against this tenant's device in the control database.</summary>
+    private static async Task<string> ClaimCodeAsync(
+        DeviceDirectory directory, string tenantId, string deviceId, CancellationToken ct)
+    {
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            var code = NewRegistrationCode();
+            if (await directory.TryRecordCodeAsync(tenantId, deviceId, code, ct)) return code;
+        }
+
+        throw new InvalidOperationException("Could not allocate a unique registration code.");
+    }
+
     private static string NewRegistrationCode()
     {
         const string alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";

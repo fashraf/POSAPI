@@ -5,6 +5,7 @@ using Microsoft.Data.SqlClient;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
+using PosApi.Tenancy;
 using PosApi.Localization;
 
 namespace PosApi.Features.Access;
@@ -198,13 +199,15 @@ public static partial class UserEndpoints
 
     private static Task<IResult> CreateAsync(
         SaveUserRequest request, ISqlConnectionFactory db, ICurrentUser current,
-        IPasswordHasher hasher, HttpContext http, ILogger<Program> logger, CancellationToken ct) =>
-        SaveUserAsync(null, request, db, current, hasher, http, logger, ct);
+        IPasswordHasher hasher, LoginDirectory directory, ITenantContext tenant,
+        HttpContext http, ILogger<Program> logger, CancellationToken ct) =>
+        SaveUserAsync(null, request, db, current, hasher, directory, tenant, http, logger, ct);
 
     private static Task<IResult> UpdateAsync(
         string userId, SaveUserRequest request, ISqlConnectionFactory db, ICurrentUser current,
-        IPasswordHasher hasher, HttpContext http, ILogger<Program> logger, CancellationToken ct) =>
-        SaveUserAsync(userId, request, db, current, hasher, http, logger, ct);
+        IPasswordHasher hasher, LoginDirectory directory, ITenantContext tenant,
+        HttpContext http, ILogger<Program> logger, CancellationToken ct) =>
+        SaveUserAsync(userId, request, db, current, hasher, directory, tenant, http, logger, ct);
 
     /// <summary>
     /// Both create and edit go through core.usp_SaveUser, which writes the
@@ -224,6 +227,8 @@ public static partial class UserEndpoints
         ISqlConnectionFactory db,
         ICurrentUser current,
         IPasswordHasher hasher,
+        LoginDirectory directory,
+        ITenantContext tenant,
         HttpContext http,
         ILogger<Program> logger,
         CancellationToken ct)
@@ -270,7 +275,34 @@ public static partial class UserEndpoints
                      ?? ProcErrors.Blank($"{request.FirstName} {request.LastName}")
                      ?? username;
 
+        /* Sign-in identifiers are unique across the whole platform — the login
+           directory is how sign-in finds a business — so another business's
+           "ahmed" is as taken as this one's. */
+        var tenantId = tenant.Tenant!.TenantId;
+        var taken = await directory.FirstTakenAsync(tenantId, userId, [username, email, request.Phone], ct);
+        if (taken is not null)
+        {
+            var field = taken == username ? "username" : taken == email ? "email" : "phone";
+            return ProcErrors.Field(field,
+                $"'{taken}' is already used by another account on the platform.",
+                $"'{taken}' مستخدم لحساب آخر على المنصة.");
+        }
+
         await using var connection = db.Create();
+
+        /* The plan's user limit, counted on active accounts. */
+        if (userId is null && tenant.Tenant.MaxUsers is { } maxUsers)
+        {
+            var activeUsers = await connection.ExecuteScalarAsync<int>(new CommandDefinition(
+                "SELECT COUNT(*) FROM core.AppUser WHERE Status = N'active';", cancellationToken: ct));
+
+            if (activeUsers >= maxUsers)
+            {
+                return ProcErrors.Conflict("plan_limit_users",
+                    $"Your plan allows {maxUsers} active users. Upgrade the plan or suspend someone first.",
+                    $"باقتك تسمح بـ {maxUsers} مستخدمين نشطين. رقِّ الباقة أو أوقف مستخدمًا أولًا.");
+            }
+        }
 
         /*---------------------------------------------- checks about the caller */
 
@@ -366,6 +398,8 @@ public static partial class UserEndpoints
         }
 
         var savedId = parameters.Get<string>("@SavedId");
+
+        await directory.SyncUserAsync(tenantId, connection, savedId, ct);
 
         /* Never the password, never the hash: the id and who did it. */
         logger.LogInformation("User {UserId} {Action} by {Actor}.",

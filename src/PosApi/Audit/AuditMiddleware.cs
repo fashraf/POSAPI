@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using PosApi.Auth;
+using PosApi.Tenancy;
 
 namespace PosApi.Audit;
 
@@ -15,7 +16,6 @@ public sealed class AuditMiddleware
 {
     private readonly RequestDelegate _next;
     private readonly IAuditWriter _audit;
-
     /* Reads are not audited by default. Auditing every GET buries the writes
        that matter under thousands of list refreshes; these are the reads worth
        recording because they expose money or personal data. */
@@ -34,7 +34,8 @@ public sealed class AuditMiddleware
         _audit = audit;
     }
 
-    public async Task InvokeAsync(HttpContext context, ICurrentUser current)
+    public async Task InvokeAsync(
+        HttpContext context, ICurrentUser current, ITenantContext tenant, PlatformMetrics metrics)
     {
         var path = context.Request.Path.Value ?? string.Empty;
 
@@ -42,6 +43,16 @@ public sealed class AuditMiddleware
         if (!path.StartsWith("/api", StringComparison.OrdinalIgnoreCase))
         {
             await _next(context);
+            return;
+        }
+
+        /* The console keeps its own audit in the control database. Its calls
+           are counted for the platform figures but belong to no tenant. */
+        if (path.StartsWith("/api/superadmin", StringComparison.OrdinalIgnoreCase))
+        {
+            var watch = Stopwatch.StartNew();
+            try { await _next(context); }
+            finally { metrics.Record((int)watch.ElapsedMilliseconds, context.Response.StatusCode >= 500); }
             return;
         }
 
@@ -66,15 +77,17 @@ public sealed class AuditMiddleware
             /* Record the failure, then let it propagate. Swallowing it here
                would turn a 500 into a silent success. */
             error = ex.Message;
-            Audit(context, current, path, correlationId, currentPage, previousPage, ex.Message, 500);
+            Audit(context, current, tenant, path, correlationId, currentPage, previousPage, ex.Message, 500);
             throw;
         }
         finally
         {
             stopwatch.Stop();
+            metrics.Record((int)stopwatch.ElapsedMilliseconds, error is not null || context.Response.StatusCode >= 500);
 
             _audit.RecordTiming(new RequestTiming
             {
+                TenantConnection = tenant.Tenant?.ConnectionString,
                 CorrelationId = correlationId,
                 UserId = NullIfEmpty(current.UserId),
                 Username = NullIfEmpty(current.Username),
@@ -93,13 +106,13 @@ public sealed class AuditMiddleware
 
         if (error is null)
         {
-            Audit(context, current, path, correlationId, currentPage, previousPage,
+            Audit(context, current, tenant, path, correlationId, currentPage, previousPage,
                   null, context.Response.StatusCode);
         }
     }
 
     private void Audit(
-        HttpContext context, ICurrentUser current, string path, string correlationId,
+        HttpContext context, ICurrentUser current, ITenantContext tenant, string path, string correlationId,
         string currentPage, string previousPage, string? error, int status)
     {
         var method = context.Request.Method;
@@ -110,6 +123,7 @@ public sealed class AuditMiddleware
 
         _audit.Record(new AuditEntry
         {
+            TenantConnection = tenant.Tenant?.ConnectionString,
             UserId = NullIfEmpty(current.UserId),
             Username = NullIfEmpty(current.Username),
             RoleId = NullIfEmpty(current.RoleId),

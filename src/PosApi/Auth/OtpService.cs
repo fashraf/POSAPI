@@ -26,6 +26,7 @@ public interface IOtpService
 public sealed class OtpService : IOtpService
 {
     private readonly ISqlConnectionFactory _db;
+    private readonly PosApi.Tenancy.ITenantContext _tenant;
     private readonly IPasswordHasher _hasher;
     private readonly AuthOptions _options;
     private readonly IHostEnvironment _environment;
@@ -33,12 +34,14 @@ public sealed class OtpService : IOtpService
 
     public OtpService(
         ISqlConnectionFactory db,
+        PosApi.Tenancy.ITenantContext tenant,
         IPasswordHasher hasher,
         IOptions<AuthOptions> options,
         IHostEnvironment environment,
         ILogger<OtpService> logger)
     {
         _db = db;
+        _tenant = tenant;
         _hasher = hasher;
         _options = options.Value;
         _environment = environment;
@@ -52,7 +55,9 @@ public sealed class OtpService : IOtpService
         var code = UseDevCode ? _options.FixedDevOtp : GenerateCode(_options.OtpLength);
         var (hash, salt) = _hasher.Hash(code);
 
-        var challengeId = Guid.NewGuid().ToString("N");
+        /* Carries the tenant, so the verify call — anonymous — can find the
+           database this challenge was written to. */
+        var challengeId = PosApi.Tenancy.TenantKey.Compose(_tenant.Tenant!.TenantId, Guid.NewGuid().ToString("N"));
         var expiresAt = DateTime.UtcNow.AddMinutes(_options.OtpValidMinutes);
 
         await using var connection = _db.Create();

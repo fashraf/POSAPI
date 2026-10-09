@@ -5,6 +5,7 @@ namespace PosApi.Auth;
 public interface ICurrentUser
 {
     bool IsAuthenticated { get; }
+    string TenantId { get; }
     string UserId { get; }
     string Username { get; }
     string RoleId { get; }
@@ -50,6 +51,8 @@ public sealed class CurrentUser : ICurrentUser
         Principal?.FindFirstValue(ClaimTypes.Role)
         ?? Principal?.FindFirstValue("role")
         ?? string.Empty;
+
+    public string TenantId => Principal?.FindFirstValue(PosApi.Tenancy.TenantMiddleware.TenantClaim) ?? string.Empty;
 
     public IReadOnlySet<string> Permissions => ClaimSet(JwtTokenService.PermissionClaim);
     public IReadOnlySet<string> BranchIds => ClaimSet(JwtTokenService.BranchClaim);

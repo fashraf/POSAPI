@@ -5,6 +5,7 @@ using PosApi.Auth;
 using PosApi.Common;
 using Microsoft.Extensions.Options;
 using PosApi.Data;
+using PosApi.Tenancy;
 
 namespace PosApi.Features.Access;
 
@@ -88,7 +89,8 @@ public static class AuthEndpoints
 
     private static async Task<IResult> RegisterAsync(
         RegisterRequest request,
-        ISqlConnectionFactory db,
+        TenantProvisioner provisioner,
+        TenantGate gate,
         IOtpService otp,
         IPasswordHasher hasher,
         IOptions<AuthOptions> authOptions,
@@ -130,81 +132,61 @@ public static class AuthEndpoints
 
         var ownerName = $"{request.Owner.FirstName} {request.Owner.LastName}".Trim();
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@CompanyNameAr", request.Business.NameAr);
-        parameters.Add("@CompanyNameEn", request.Business.NameEn);
-        parameters.Add("@CrNumber", request.Tax.IsVatRegistered ? request.Tax.CrNumber : null);
-        parameters.Add("@VatNumber", request.Tax.IsVatRegistered ? request.Tax.VatNumber : null);
-        parameters.Add("@City", request.Business.City);
-        parameters.Add("@BranchNameAr", request.Business.NameAr);
-        parameters.Add("@BranchNameEn", request.Business.NameEn);
-        // The wizard collects one name. Storing it in both columns keeps the
-        // NOT NULL contract honest; the owner can correct the Arabic later.
-        parameters.Add("@OwnerNameAr", ownerName);
-        parameters.Add("@OwnerNameEn", ownerName);
-        parameters.Add("@OwnerEmail", request.Owner.Email.Trim());
-        parameters.Add("@OwnerPhone", string.IsNullOrWhiteSpace(request.Owner.Mobile)
-            ? null : request.Owner.Mobile.Trim());
-
-        // Hashed here with the hasher sign-in verifies against; the plain
-        // password never reaches SQL or the logs.
+        string? hash = null, salt = null;
         if (!string.IsNullOrEmpty(password))
-        {
-            var (hash, salt) = hasher.Hash(password);
-            parameters.Add("@PasswordHash", hash);
-            parameters.Add("@PasswordSalt", salt);
-        }
+            (hash, salt) = hasher.Hash(password);
 
-        parameters.Add("@UserId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-        parameters.Add("@BranchId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
-        await using var connection = db.Create();
-
+        /*
+         * A new business is a new tenant: its own database, a free trial, and
+         * its owner in the login directory. The provisioner does all of it or
+         * none of it, so a failed sign-up leaves nothing behind.
+         */
+        ProvisionResult provisioned;
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_RegisterBusiness",
-                parameters,
-                commandType: CommandType.StoredProcedure,
-                cancellationToken: ct));
-        }
-        catch (SqlException ex) when (ex.Number >= 53000 && ex.Number < 54000)
-        {
-            var error = ex.Number switch
+            provisioned = await provisioner.ProvisionAsync(new ProvisionRequest
             {
-                53000 => ApiError.Create("name_required",
-                    "The business needs both an Arabic and an English name.",
-                    "المنشأة تحتاج اسمًا بالعربية وآخر بالإنجليزية."),
-                53001 => ApiError.Create("email_required",
-                    "An email address is required.", "البريد الإلكتروني مطلوب."),
-                53002 => ApiError.Create("email_taken",
-                    "An account already exists for that email address.",
-                    "يوجد حساب مسجّل بهذا البريد الإلكتروني.",
-                    Field("email", "An account already exists for that email address.")),
-                53003 => ApiError.Create("mobile_taken",
-                    "An account already exists for that mobile number.",
-                    "يوجد حساب مسجّل بهذا الرقم.",
-                    Field("mobile", "An account already exists for that mobile number.")),
-                53004 => ApiError.Create("bad_vat",
-                    "A Saudi VAT number is 15 digits beginning and ending with 3.",
-                    "الرقم الضريبي السعودي ١٥ رقمًا يبدأ وينتهي بالرقم ٣.",
-                    Field("vatNumber", "A Saudi VAT number is 15 digits beginning and ending with 3.")),
-                _ => ApiError.Create("registration_failed",
-                    "Registration could not be completed.", "تعذّر إكمال التسجيل.")
-            };
-
-            return Results.Json(error, statusCode: StatusCodes.Status422UnprocessableEntity);
+                Name = request.Business.NameEn.Trim(),
+                NameAr = request.Business.NameAr.Trim(),
+                BusinessType = request.Business.BusinessType,
+                City = request.Business.City,
+                Country = request.Business.Country,
+                CrNumber = request.Tax.IsVatRegistered ? request.Tax.CrNumber : null,
+                VatNumber = request.Tax.IsVatRegistered ? request.Tax.VatNumber : null,
+                Email = request.Owner.Email.Trim(),
+                Phone = string.IsNullOrWhiteSpace(request.Owner.Mobile) ? null : request.Owner.Mobile.Trim(),
+                OwnerName = ownerName,
+                OwnerEmail = request.Owner.Email.Trim(),
+                OwnerPhone = string.IsNullOrWhiteSpace(request.Owner.Mobile) ? null : request.Owner.Mobile.Trim(),
+                OwnerPasswordHash = hash,
+                OwnerPasswordSalt = salt,
+                BranchName = request.Business.NameEn.Trim(),
+                BranchAddress = request.Business.Address,
+                PlanKey = "Trial",
+                Trial = true,
+                Source = "self-signup",
+                RegisteredBy = ownerName
+            }, ct);
+        }
+        catch (ProvisionException ex)
+        {
+            var field = ex.Field switch { "mobile" => "mobile", "vatNumber" => "vatNumber", "username" or "email" => "email", _ => null };
+            return Results.Json(ApiError.Create(ex.Code, ex.Message, ex.MessageAr,
+                field is null ? null : Field(field, ex.Message)), statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 
-        var userId = parameters.Get<string>("@UserId");
-        logger.LogInformation("Business registered, owner {UserId}.", userId);
+        var userId = provisioned.OwnerUserId;
+        logger.LogInformation("Business registered as tenant {TenantId}, owner {UserId}.", provisioned.TenantId, userId);
+
+        if (await gate.EnterAsync(provisioned.TenantId, ct) is { } refused) return refused;
 
         var challenge = await otp.IssueAsync(request.Owner.Email.Trim(), "register", ct);
 
         return Results.Ok(new
         {
             userId,
-            branchId = parameters.Get<string>("@BranchId"),
+            branchId = provisioned.BranchId,
+            tenantId = provisioned.TenantId,
             challengeId = challenge.ChallengeId,
             expiresAtUtc = challenge.ExpiresAtUtc,
             devMode = challenge.IsDevCode
@@ -225,6 +207,8 @@ public static class AuthEndpoints
     private static async Task<IResult> RequestOtpAsync(
         LoginRequest request,
         ISqlConnectionFactory db,
+        LoginDirectory directory,
+        TenantGate gate,
         IOtpService otp,
         IPasswordHasher hasher,
         IJwtTokenService tokens,
@@ -242,6 +226,30 @@ public static class AuthEndpoints
 
         var identifier = request.Identifier.Trim();
 
+        /* Which business this identifier belongs to. Unknown is answered
+           exactly like a wrong password, so the form cannot be used to find
+           out which addresses are registered on the platform. */
+        var tenantId = await directory.FindTenantAsync(identifier, ct);
+
+        if (tenantId is null)
+        {
+            logger.LogInformation("Sign-in for an identifier no tenant holds.");
+
+            if (authOptions.Value.LoginMode == LoginMode.SinglePassword)
+                return await SignInWithPasswordAsync(null!, hasher, tokens, gate, null, request.Password, logger, ct);
+
+            return Results.Ok(new
+            {
+                challengeId = Guid.NewGuid().ToString("N"),
+                expiresAtUtc = DateTime.UtcNow.AddMinutes(authOptions.Value.OtpValidMinutes),
+                devMode = false
+            });
+        }
+
+        /* Not enforced yet: a suspended business is told so only after the
+           password (or code) proves the caller is one of its people. */
+        if (await gate.EnterAsync(tenantId, ct, enforce: false) is { } unknown) return unknown;
+
         await using var connection = db.Create();
 
         var user = await connection.QuerySingleOrDefaultAsync<AuthUserRow>(new CommandDefinition(
@@ -257,7 +265,7 @@ public static class AuthEndpoints
         if (authOptions.Value.LoginMode == LoginMode.SinglePassword)
         {
             return await SignInWithPasswordAsync(
-                connection, hasher, tokens, user, request.Password, logger, ct);
+                connection, hasher, tokens, gate, user, request.Password, logger, ct);
         }
 
         /*----------------------------------------------- two-step: send a code */
@@ -290,6 +298,7 @@ public static class AuthEndpoints
         System.Data.Common.DbConnection connection,
         IPasswordHasher hasher,
         IJwtTokenService tokens,
+        TenantGate gate,
         AuthUserRow? user,
         string? password,
         ILogger<Program> logger,
@@ -328,6 +337,9 @@ public static class AuthEndpoints
 
         if (RejectIfUnusable(user) is { } rejected) return rejected;
 
+        if (TenantCatalog.Refusal(gate.Current) is { } tenantRefusal)
+            return Results.Json(tenantRefusal, statusCode: StatusCodes.Status403Forbidden);
+
         var permissions = (await connection.QueryAsync<string>(new CommandDefinition(
             "SELECT PermissionKey FROM core.vw_EffectivePermission WHERE UserId = @UserId;",
             new { user.UserId }, cancellationToken: ct))).ToList();
@@ -340,17 +352,22 @@ public static class AuthEndpoints
             "Single-step password sign-in for {UserId}. The second factor was skipped.",
             user.UserId);
 
-        return Results.Ok(await IssueSessionAsync(connection, tokens, user, permissions, branches, ct));
+        return Results.Ok(await IssueSessionAsync(connection, tokens, gate.Current.TenantId, user, permissions, branches, ct));
     }
 
     /// <summary>Step two: verify the code and issue a session.</summary>
     private static async Task<IResult> VerifyOtpAsync(
         OtpRequest request,
         ISqlConnectionFactory db,
+        TenantGate gate,
         IOtpService otp,
         IJwtTokenService tokens,
         CancellationToken ct)
     {
+        /* A challenge for an identifier no tenant holds was never stored; it
+           has no prefix and fails here like any wrong code. */
+        if (await gate.EnterAsync(TenantKey.TenantOf(request.ChallengeId), ct) is { } refused) return refused;
+
         var result = await otp.VerifyAsync(request.ChallengeId, request.Code, ct);
 
         if (result != OtpResult.Valid)
@@ -417,7 +434,7 @@ public static class AuthEndpoints
             "SELECT BranchId FROM core.UserBranch WHERE UserId = @UserId;",
             new { user.UserId }, cancellationToken: ct))).ToList();
 
-        return Results.Ok(await IssueSessionAsync(connection, tokens, user, permissions, branches, ct));
+        return Results.Ok(await IssueSessionAsync(connection, tokens, gate.Current.TenantId, user, permissions, branches, ct));
     }
 
     /// <summary>
@@ -429,12 +446,13 @@ public static class AuthEndpoints
     private static async Task<SessionResponse> IssueSessionAsync(
         System.Data.Common.DbConnection connection,
         IJwtTokenService tokens,
+        string tenantId,
         AuthUserRow user,
         IReadOnlyList<string> permissions,
         IReadOnlyList<string> branches,
         CancellationToken ct)
     {
-        var pair = tokens.Issue(user.UserId, user.Username, user.RoleId, permissions, branches);
+        var pair = tokens.Issue(tenantId, user.UserId, user.Username, user.RoleId, permissions, branches);
 
         await connection.ExecuteAsync(new CommandDefinition(
             """
@@ -486,9 +504,14 @@ public static class AuthEndpoints
     private static async Task<IResult> RefreshAsync(
         RefreshRequest request,
         ISqlConnectionFactory db,
+        TenantGate gate,
         IJwtTokenService tokens,
         CancellationToken ct)
     {
+        /* Suspension and expiry are enforced here too: a refresh token is
+           how a session outlives its access token. */
+        if (await gate.EnterAsync(TenantKey.TenantOf(request.RefreshToken), ct) is { } refused) return refused;
+
         var hash = tokens.HashRefreshToken(request.RefreshToken);
 
         await using var connection = db.Create();
@@ -522,7 +545,7 @@ public static class AuthEndpoints
             "SELECT BranchId FROM core.UserBranch WHERE UserId = @UserId;",
             new { UserId = userId }, cancellationToken: ct))).ToList();
 
-        var pair = tokens.Issue(user.UserId, user.Username, user.RoleId, permissions, branches);
+        var pair = tokens.Issue(gate.Current.TenantId, user.UserId, user.Username, user.RoleId, permissions, branches);
 
         // Rotate: the old token is revoked as the new one is issued, so a
         // stolen refresh token is usable at most once before it stops working.

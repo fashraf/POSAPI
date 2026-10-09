@@ -4,6 +4,7 @@ using Dapper;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
+using PosApi.Tenancy;
 
 namespace PosApi.Features.Devices;
 
@@ -116,7 +117,7 @@ public static class DiscoveryEndpoints
 
     private static async Task<IResult> ConnectAsync(
         ConnectRequest request, ISqlConnectionFactory db, ICurrentUser current,
-        CancellationToken ct = default)
+        ITenantContext tenant, DeviceDirectory devices, CancellationToken ct = default)
     {
         await using var connection = db.Create();
 
@@ -168,6 +169,18 @@ public static class DiscoveryEndpoints
             return Results.Conflict(ApiError.Create("connect_blocked", blocked, blocked));
         }
 
+        /* The procedure made the code; the control database must know it, or
+           the terminal's registration (anonymous) cannot find this business. */
+        var code = await connection.QuerySingleOrDefaultAsync<string?>(new CommandDefinition(
+            "SELECT RegistrationCode FROM device.PosDevice WHERE DeviceId = @DeviceId;",
+            new { request.DeviceId }, cancellationToken: ct));
+
+        if (code is not null && !await devices.TryRecordCodeAsync(tenant.Tenant!.TenantId, request.DeviceId, code, ct))
+        {
+            return Results.Conflict(ApiError.Create("connect_blocked",
+                "Please try connecting again.", "يرجى إعادة محاولة الربط."));
+        }
+
         return Results.Ok(new
         {
             success = true,
@@ -190,13 +203,22 @@ public static class DiscoveryEndpoints
     /// </summary>
     private static async Task<IResult> AnnounceAsync(
         AnnounceRequest request, ISqlConnectionFactory db, HttpContext http,
-        CancellationToken ct = default)
+        TenantGate gate, DeviceDirectory devices, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(request.SerialNumber))
         {
             return Results.BadRequest(ApiError.Create(
                 "required", "A serial number is required.", "الرقم التسلسلي مطلوب."));
         }
+
+        /* A terminal is discoverable only by the business the hardware register
+           assigns its serial to. Unassigned, it is acknowledged and nothing is
+           stored: there is no business it could be shown to. */
+        var tenantId = await devices.TenantForSerialAsync(request.SerialNumber, ct);
+        if (tenantId is null)
+            return Results.Ok(new { acknowledged = false, reason = "unassigned", nextAnnounceMs = 30000 });
+
+        if (await gate.EnterAsync(tenantId, ct) is { } refused) return refused;
 
         await using var connection = db.Create();
 
@@ -261,8 +283,14 @@ public static class DiscoveryEndpoints
     /// </summary>
     private static async Task<IResult> AnswerChallengeAsync(
         string challengeId, ChallengeAnswerRequest request, ISqlConnectionFactory db,
-        ILogger<Program> logger, CancellationToken ct = default)
+        TenantGate gate, DeviceDirectory devices, ILogger<Program> logger, CancellationToken ct = default)
     {
+        var tenantId = string.IsNullOrWhiteSpace(request.SerialNumber)
+            ? null : await devices.TenantForSerialAsync(request.SerialNumber, ct);
+        if (tenantId is null) return Results.NotFound();
+
+        if (await gate.EnterAsync(tenantId, ct) is { } refused) return refused;
+
         await using var connection = db.Create();
 
         var challenge = await connection.QuerySingleOrDefaultAsync<ChallengeRow>(

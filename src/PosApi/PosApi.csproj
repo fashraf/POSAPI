@@ -19,6 +19,21 @@
              Link="frontend\%(RecursiveDir)%(Filename)%(Extension)"
              CopyToPublishDirectory="PreserveNewest"
              CopyToOutputDirectory="Never" />
+    <!-- The SaaS console (build-frontend-admin writes src/frontend-admin). -->
+    <Content Include="..\frontend-admin\**\*"
+             Link="frontend-admin\%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToPublishDirectory="PreserveNewest"
+             CopyToOutputDirectory="Never" />
+    <!-- Migrations ship with the app: the control database is built at
+         startup and every new tenant database from db-migrations/. -->
+    <Content Include="..\..\db-migrations\*.sql"
+             Link="db-migrations\%(Filename)%(Extension)"
+             CopyToPublishDirectory="PreserveNewest"
+             CopyToOutputDirectory="Never" />
+    <Content Include="..\..\db-control\*.sql"
+             Link="db-control\%(Filename)%(Extension)"
+             CopyToPublishDirectory="PreserveNewest"
+             CopyToOutputDirectory="Never" />
   </ItemGroup>
 
   <ItemGroup>

@@ -20,6 +20,8 @@ using PosApi.Features.Devices;
 using PosApi.Features.Finance;
 using PosApi.Features.Sales;
 using PosApi.Features.Settings;
+using PosApi.Features.SuperAdmin;
+using PosApi.Tenancy;
 using PosApi.Localization;
 using Serilog;
 
@@ -102,6 +104,8 @@ try
         builder.Configuration.GetSection(AuthOptions.SectionName));
     builder.Services.Configure<JwtOptions>(
         builder.Configuration.GetSection(JwtOptions.SectionName));
+    builder.Services.Configure<TenancyOptions>(
+        builder.Configuration.GetSection(TenancyOptions.SectionName));
 
     var jwt = builder.Configuration.GetSection(JwtOptions.SectionName).Get<JwtOptions>()
               ?? new JwtOptions();
@@ -179,7 +183,31 @@ try
        AuditWriter for why they are not written inline. */
     builder.Services.AddSingleton<IAuditWriter, AuditWriter>();
     builder.Services.AddHostedService<AuditDrainService>();
-    builder.Services.AddSingleton<ISqlConnectionFactory, SqlConnectionFactory>();
+    /*
+     * Tenancy. The control database (tenants, plans, admins) is reached
+     * through TenantCatalog; a tenant's own database only through the scoped
+     * ITenantContext, which a request binds once it knows the tenant.
+     */
+    builder.Services.AddSingleton<TenancyConnections>();
+    builder.Services.AddSingleton<SqlScriptRunner>();
+    builder.Services.AddSingleton<TenantCatalog>();
+    builder.Services.AddSingleton<LoginDirectory>();
+    builder.Services.AddSingleton<DeviceDirectory>();
+    builder.Services.AddSingleton<TenantProvisioner>();
+    builder.Services.AddSingleton<ControlDatabaseInitializer>();
+    builder.Services.AddSingleton<PlatformMetrics>();
+    builder.Services.AddSingleton<TenantMigrationService>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<TenantMigrationService>());
+    builder.Services.AddSingleton<TenantSnapshotService>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<TenantSnapshotService>());
+    builder.Services.AddScoped<ITenantContext, TenantContext>();
+    builder.Services.AddScoped<TenantGate>();
+    builder.Services.AddScoped<ISqlConnectionFactory, SqlConnectionFactory>();
+
+    builder.Services.AddSingleton<AdminSessions>();
+    builder.Services.AddScoped<CurrentAdmin>();
+    builder.Services.AddScoped<AdminAuditor>();
+    builder.Services.AddScoped<ClientReader>();
     builder.Services.AddSingleton<IPasswordHasher, PasswordHasher>();
     builder.Services.AddSingleton(signingKeyProvider);
     builder.Services.AddSingleton<IJwtTokenService, JwtTokenService>();
@@ -220,7 +248,9 @@ try
                 // keeps working for five more, which is five minutes too many.
                 ClockSkew = TimeSpan.Zero
             };
-        });
+        })
+        /* The console's scheme: same key, its own audience. */
+        .AddSuperAdminScheme(jwt, signingKeyProvider);
 
     builder.Services.AddAuthorization();
 
@@ -347,6 +377,9 @@ try
 
     var app = builder.Build();
 
+    /* The control database before the first request: every sign-in needs it. */
+    await app.Services.GetRequiredService<ControlDatabaseInitializer>().InitializeAsync(CancellationToken.None);
+
     /*------------------------------------------------------------- pipeline */
 
     // One error shape for everything, and never the stack trace: an exception
@@ -468,6 +501,7 @@ try
 
     /* The built frontend, when present. Before CORS, the audit trail and
        authentication: loading the app's files needs none of them. */
+    var adminFiles = app.UseAdminFrontendFiles();
     var frontendFiles = app.UseFrontendFiles();
 
     // CORS before authentication: a rejected preflight carries no credentials
@@ -479,6 +513,9 @@ try
     app.UseSerilogRequestLogging();
     app.UseRateLimiter();
     app.UseAuthentication();
+    /* After authentication (it reads the token's tenant), before
+       authorization and every endpoint (they need the tenant bound). */
+    app.UseMiddleware<TenantMiddleware>();
     app.UseAuthorization();
 
     app.MapAuthEndpoints();
@@ -509,6 +546,10 @@ try
     app.MapSearchEndpoints();
     app.MapStocktakeEndpoints();
 
+    /* The SaaS console: /api/superadmin, and its app at /admin. */
+    app.MapAdminAuthEndpoints();
+    app.MapSuperAdminEndpoints();
+
     app.MapGet("/health", () => Results.Ok(new
     {
         status = "ok",
@@ -520,13 +561,15 @@ try
        .AllowAnonymous()
        .WithTags("Health");
 
-    app.MapGet("/health/db", async (ISqlConnectionFactory db, CancellationToken ct) =>
+    app.MapGet("/health/db", async (TenantCatalog catalog, CancellationToken ct) =>
     {
-        await using var connection = await db.CreateOpenAsync(ct);
+        await using var connection = catalog.Control();
+        await connection.OpenAsync(ct);
         return Results.Ok(new { status = "ok", database = connection.Database });
     }).AllowAnonymous().WithTags("Health");
 
     /* Last: only what no API route claimed falls through to the app. */
+    app.MapAdminFrontendFallback(adminFiles);
     app.MapFrontendFallback(frontendFiles);
 
     /*

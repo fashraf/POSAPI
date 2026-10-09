@@ -1,6 +1,5 @@
 using System.Threading.Channels;
 using Dapper;
-using PosApi.Data;
 
 namespace PosApi.Audit;
 
@@ -54,14 +53,11 @@ public sealed class AuditWriter : IAuditWriter
 public sealed class AuditDrainService : BackgroundService
 {
     private readonly AuditWriter _writer;
-    private readonly ISqlConnectionFactory _db;
     private readonly ILogger<AuditDrainService> _logger;
 
-    public AuditDrainService(
-        IAuditWriter writer, ISqlConnectionFactory db, ILogger<AuditDrainService> logger)
+    public AuditDrainService(IAuditWriter writer, ILogger<AuditDrainService> logger)
     {
         _writer = (AuditWriter)writer;
-        _db = db;
         _logger = logger;
     }
 
@@ -71,7 +67,19 @@ public sealed class AuditDrainService : BackgroundService
         {
             try
             {
-                await using var connection = _db.Create();
+                /* Each row goes to the database of the tenant it happened in.
+                   A request no tenant was resolved for (a refused sign-in for
+                   an unknown address) has nowhere to go and is dropped. */
+                var target = item switch
+                {
+                    AuditEntry e => e.TenantConnection,
+                    RequestTiming t => t.TenantConnection,
+                    _ => null
+                };
+
+                if (target is null) continue;
+
+                await using var connection = new Microsoft.Data.SqlClient.SqlConnection(target);
 
                 if (item is AuditEntry entry)
                 {

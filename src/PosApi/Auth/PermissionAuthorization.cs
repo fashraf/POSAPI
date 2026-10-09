@@ -43,6 +43,16 @@ public sealed class PermissionPolicyProvider : IAuthorizationPolicyProvider
 
     public Task<AuthorizationPolicy?> GetPolicyAsync(string policyName)
     {
+        /* The console: its own scheme and audience, never a POS token. */
+        if (policyName == PosApi.Features.SuperAdmin.AdminAuth.Policy)
+        {
+            return Task.FromResult<AuthorizationPolicy?>(
+                new AuthorizationPolicyBuilder(PosApi.Features.SuperAdmin.AdminAuth.Scheme)
+                    .RequireAuthenticatedUser()
+                    .RequireClaim(PosApi.Features.SuperAdmin.AdminAuth.ScopeClaim, "superadmin")
+                    .Build());
+        }
+
         if (!policyName.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase))
         {
             return _fallback.GetPolicyAsync(policyName);

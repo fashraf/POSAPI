@@ -4,6 +4,7 @@ using Microsoft.Data.SqlClient;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
+using PosApi.Tenancy;
 
 namespace PosApi.Features.Settings;
 
@@ -262,8 +263,15 @@ public static class ReferenceEndpoints
         public string? UpdatedBy { get; init; }
     }
 
-    private static async Task<IResult> LanguagesAsync(ISqlConnectionFactory db, CancellationToken ct = default)
+    private static async Task<IResult> LanguagesAsync(
+        ISqlConnectionFactory db, ITenantContext tenant, TenantGate gate, CancellationToken ct = default)
     {
+        /* Asked before sign-in, when no tenant is known. The list is reference
+           data every tenant database carries identically (002), so any
+           tenant's copy answers it. */
+        if (!tenant.IsResolved && await gate.EnterAsync(null, ct, enforce: false) is not null)
+            return Results.Ok(Array.Empty<object>());
+
         await using var connection = db.Create();
 
         var rows = await connection.QueryAsync(new CommandDefinition(

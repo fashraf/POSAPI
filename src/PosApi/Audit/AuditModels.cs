@@ -19,6 +19,9 @@ public static class AuditAction
 
 public sealed record AuditEntry
 {
+    /// <summary>The tenant database the row belongs in; null for a request no tenant was resolved for.</summary>
+    public string? TenantConnection { get; init; }
+
     public string? UserId { get; init; }
     public string? Username { get; init; }
     public string? RoleId { get; init; }
@@ -49,6 +52,8 @@ public sealed record AuditEntry
 
 public sealed record RequestTiming
 {
+    public string? TenantConnection { get; init; }
+
     public required string CorrelationId { get; init; }
     public string? UserId { get; init; }
     public string? Username { get; init; }

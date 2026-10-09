@@ -1,5 +1,5 @@
-using System.Data;
 using Microsoft.Data.SqlClient;
+using PosApi.Tenancy;
 
 namespace PosApi.Data;
 
@@ -10,7 +10,12 @@ public interface ISqlConnectionFactory
 }
 
 /// <summary>
-/// Hands out connections to POSMAIN.
+/// Hands out connections to the current tenant's own database.
+///
+/// Scoped to the request: the tenant comes from ITenantContext, set from the
+/// token (TenantMiddleware) or by an anonymous endpoint once it knows the
+/// tenant. There is no default database — a request that never resolved a
+/// tenant gets an exception rather than somebody else's data.
 ///
 /// Dapper rather than an ORM: the schema already enforces the rules that matter
 /// through constraints and stored procedures, and an ORM that generates its own
@@ -20,20 +25,15 @@ public interface ISqlConnectionFactory
 /// </summary>
 public sealed class SqlConnectionFactory : ISqlConnectionFactory
 {
-    private readonly string _connectionString;
+    private readonly ITenantContext _tenant;
 
-    public SqlConnectionFactory(IConfiguration configuration)
-    {
-        _connectionString = configuration.GetConnectionString("PosMain")
-            ?? throw new InvalidOperationException(
-                "Connection string 'PosMain' is missing. Set it in appsettings.json or the environment.");
-    }
+    public SqlConnectionFactory(ITenantContext tenant) => _tenant = tenant;
 
-    public SqlConnection Create() => new(_connectionString);
+    public SqlConnection Create() => new(_tenant.ConnectionString);
 
     public async Task<SqlConnection> CreateOpenAsync(CancellationToken ct)
     {
-        var connection = new SqlConnection(_connectionString);
+        var connection = new SqlConnection(_tenant.ConnectionString);
         await connection.OpenAsync(ct);
         return connection;
     }

@@ -20,21 +20,25 @@ public static class FrontendHosting
     /* Paths the app never owns. A miss under these is the API's 404, not the
        app's index page — returning HTML to a fetch for /api/... turns a clear
        "not found" into a JSON parse error in the browser. */
-    private static readonly string[] ServerPrefixes = ["/api", "/health", "/swagger"];
+    private static readonly string[] ServerPrefixes = ["/api", "/health", "/swagger", AdminPath];
+
+    /// <summary>Where the SaaS console (POSA, built into src/frontend-admin) is served.</summary>
+    public const string AdminPath = "/admin";
 
     /// <summary>
     /// Where the build is: Frontend:Path if configured, else frontend/ next to
     /// the content root (a published app), else ../frontend (running from
     /// src/PosApi in the repository). Null when none holds an index.html.
     /// </summary>
-    public static string? ResolveRoot(IConfiguration configuration, IWebHostEnvironment environment)
+    public static string? ResolveRoot(IConfiguration configuration, IWebHostEnvironment environment,
+                                      string folder = "frontend", string setting = "Frontend:Path")
     {
-        var configured = configuration["Frontend:Path"];
+        var configured = configuration[setting];
         var candidates = string.IsNullOrWhiteSpace(configured)
             ? new[]
             {
-                Path.Combine(environment.ContentRootPath, "frontend"),
-                Path.Combine(environment.ContentRootPath, "..", "frontend"),
+                Path.Combine(environment.ContentRootPath, folder),
+                Path.Combine(environment.ContentRootPath, "..", folder),
             }
             : new[] { Path.GetFullPath(configured, environment.ContentRootPath) };
 
@@ -118,6 +122,77 @@ public static class FrontendHosting
             context.Response.Headers[HeaderNames.CacheControl] = "no-cache";
             context.Response.ContentType = "text/html; charset=utf-8";
             await context.Response.SendFileAsync(index);
+        }).AllowAnonymous().ExcludeFromDescription();
+    }
+
+    /*-------------------------------------------------------- the console */
+
+    /// <summary>
+    /// The SaaS console's build (build-frontend-admin writes src/frontend-admin),
+    /// at /admin. Frontend:AdminPath overrides where it is read from.
+    /// </summary>
+    public static IFileProvider? UseAdminFrontendFiles(this WebApplication app)
+    {
+        var root = ResolveRoot(app.Configuration, app.Environment, "frontend-admin", "Frontend:AdminPath");
+
+        if (root is null)
+        {
+            app.Logger.LogInformation(
+                "No console build found (run build-frontend-admin). /admin is not served.");
+            return null;
+        }
+
+        var files = new PhysicalFileProvider(root);
+
+        /* The build uses relative asset paths, so /admin must end in a slash
+           or the browser resolves ./assets against the site root. */
+        app.Use(async (context, next) =>
+        {
+            if (context.Request.Path.Equals(AdminPath, StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.Redirect(AdminPath + "/" + context.Request.QueryString);
+                return;
+            }
+
+            await next();
+        });
+
+        app.UseStaticFiles(new StaticFileOptions
+        {
+            FileProvider = files,
+            RequestPath = AdminPath,
+            OnPrepareResponse = context =>
+            {
+                context.Context.Response.Headers[HeaderNames.CacheControl] =
+                    context.Context.Request.Path.StartsWithSegments(AdminPath + "/assets")
+                        ? "public, max-age=31536000, immutable"
+                        : "no-cache";
+            }
+        });
+
+        app.Logger.LogInformation("Serving the console from {Root} at {Path}/", root, AdminPath);
+        return files;
+    }
+
+    /// <summary>/admin/ and anything under it that is not a file opens the console.</summary>
+    public static void MapAdminFrontendFallback(this WebApplication app, IFileProvider? files)
+    {
+        if (files is null) return;
+
+        /* nonfile, as MapFallback() uses: a route that also matched
+           /admin/assets/x.js would claim the request, and static files skip
+           any request that already has an endpoint — every asset would 404. */
+        app.MapFallback(AdminPath + "/{**path:nonfile}", async context =>
+        {
+            if (Path.HasExtension(context.Request.Path.Value) || !HttpMethods.IsGet(context.Request.Method))
+            {
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+
+            context.Response.Headers[HeaderNames.CacheControl] = "no-cache";
+            context.Response.ContentType = "text/html; charset=utf-8";
+            await context.Response.SendFileAsync(files.GetFileInfo("index.html"));
         }).AllowAnonymous().ExcludeFromDescription();
     }
 }
