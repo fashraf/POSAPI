@@ -1,0 +1,1 @@
+import{a as c,j as u,i,l,aP as x}from"./index-BSf3HdAS.js";function p({amount:s,currency:e=x,fromMinorUnits:r=!0,signed:a=!1,className:n}){const{language:t}=c();return u.jsx("span",{className:l("numeric",a&&s<0&&"text-danger-600",a&&s>0&&"text-success-600",n),children:i(s,{language:t,currency:e,fromMinorUnits:r})})}export{p as C};

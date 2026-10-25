@@ -1,1 +1,0 @@
-import{u as a,j as c}from"./index-cTC8F_59.js";import{B as i}from"./Badge-Ct6k3M2F.js";const r={active:"success",inactive:"neutral",archived:"warning"};function v({status:e,className:t}){const{t:n}=a(),o=n(e==="active"?"common.active":e==="inactive"?"common.inactive":"common.archived");return c.jsx(i,{tone:r[e],dot:!0,className:t,children:o})}export{v as S};

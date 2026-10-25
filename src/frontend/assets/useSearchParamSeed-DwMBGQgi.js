@@ -1,0 +1,1 @@
+import{ad as n,r as o}from"./index-BSf3HdAS.js";function m(t,a="q"){const[r,c]=n(),e=r.get(a);o.useEffect(()=>{if(!e)return;t(e);const s=new URLSearchParams(r);s.delete(a),c(s,{replace:!0})},[e])}export{m as u};

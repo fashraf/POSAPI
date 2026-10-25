@@ -1,1 +1,0 @@
-import{ac as n,r as o}from"./index-cTC8F_59.js";function m(t,a="q"){const[r,c]=n(),e=r.get(a);o.useEffect(()=>{if(!e)return;t(e);const s=new URLSearchParams(r);s.delete(a),c(s,{replace:!0})},[e])}export{m as u};

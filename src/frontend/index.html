@@ -37,10 +37,50 @@
         }
       })();
     </script>
-    <script type="module" crossorigin src="/assets/index-cTC8F_59.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-Bf_Z2Ytu.css">
+    <script type="module" crossorigin src="/assets/index-BSf3HdAS.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-IscN5fmq.css">
   </head>
   <body>
     <div id="root"></div>
+
+    <!--
+      Old browsers. The app is built for Chrome / Android WebView 87 and newer
+      (Vite's default target). An older one — the factory WebView 62 on a SUNMI
+      V2 with Android 7 — cannot even parse the bundle and showed a blank page.
+      This runs first, in old-style JavaScript every browser understands, and
+      puts a readable message where the app would have been.
+    -->
+    <script>
+      (function () {
+        var tooOld = false;
+        try {
+          new Function('var o = {}; return o?.a ?? 1;')();
+        } catch (e) {
+          tooOld = true;
+        }
+        var chrome = /Chrom(e|ium)\/(\d+)/.exec(navigator.userAgent);
+        if (chrome && parseInt(chrome[2], 10) < 87) tooOld = true;
+        if (!tooOld) return;
+
+        window.__unsupportedBrowser = true;
+        var android = /Android/.test(navigator.userAgent);
+        var root = document.getElementById('root');
+        root.innerHTML =
+          '<div style="font-family:sans-serif;max-width:420px;margin:15vh auto 0;padding:24px;text-align:center;color:#1f2937">' +
+          '<h1 style="font-size:20px;margin:0 0 12px">\u064a\u062d\u062a\u0627\u062c \u0647\u0630\u0627 \u0627\u0644\u062c\u0647\u0627\u0632 \u0625\u0644\u0649 \u062a\u062d\u062f\u064a\u062b</h1>' +
+          '<p dir="rtl" style="margin:0 0 16px;line-height:1.6">' +
+          (android
+            ? '\u062d\u062f\u0651\u062b \u062a\u0637\u0628\u064a\u0642 Android System WebView \u0645\u0646 \u0645\u062a\u062c\u0631 Google Play\u060c \u062b\u0645 \u0623\u0639\u062f \u0641\u062a\u062d \u0627\u0644\u062a\u0637\u0628\u064a\u0642.'
+            : '\u062d\u062f\u0651\u062b \u0627\u0644\u0645\u062a\u0635\u0641\u062d \u0625\u0644\u0649 \u0623\u062d\u062f\u062b \u0625\u0635\u062f\u0627\u0631.') +
+          '</p>' +
+          '<h2 style="font-size:18px;margin:24px 0 12px">This device needs an update</h2>' +
+          '<p style="margin:0;line-height:1.6">' +
+          (android
+            ? 'Update <b>Android System WebView</b> from Google Play (version 87 or newer), then open the app again.'
+            : 'Please update this browser to a recent version (Chrome 87 or newer).') +
+          '</p></div>';
+      })();
+    </script>
+
   </body>
 </html>
