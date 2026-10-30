@@ -49,7 +49,7 @@ check("no reversible password crypto", not re.search(r'(Encrypt|Decrypt)\w*\(\s*
 # 6. OTP is hashed and attempt-limited.
 check("OTP stored hashed", 'CodeHash' in full and '_hasher.Hash(code)' in full)
 check("OTP attempts counted", 'Attempts + 1' in full)
-check("OTP consumed after use", 'ConsumedAtUtc = SYSUTCDATETIME()' in full)
+check("OTP consumed after use", "ConsumedAtUtc = now() AT TIME ZONE 'utc'" in full)
 check("OTP uses secure RNG", 'RandomNumberGenerator.GetInt32' in full)
 
 # 7. The dev bypass cannot reach production.
@@ -95,9 +95,11 @@ check("errors carry Arabic and English", len(errs) > 0 and len(ar) >= len(errs),
 bad_money = re.findall(r'(?:decimal|double|float)\s+\w*(?:Amount|Price|Total|Cost|Balance)H\b', full, re.I)
 check("money typed as long", not bad_money, str(bad_money))
 
-# 14. Async methods take a CancellationToken.
+# 14. Async methods take a CancellationToken (a CommandDefinition carries one;
+#     Dapper's GridReader reads take none).
 sigs = re.findall(r'(?:private|public|internal)\s+static\s+async\s+Task<[^>]+>\s+(\w+)\s*\(([^)]*)\)', full, re.S)
-no_ct = [n for n, args in sigs if 'CancellationToken' not in args]
+no_ct = [n for n, args in sigs
+         if not any(t in args for t in ('CancellationToken', 'CommandDefinition', 'GridReader'))]
 check("async endpoints accept CancellationToken", not no_ct, str(no_ct))
 
 print()

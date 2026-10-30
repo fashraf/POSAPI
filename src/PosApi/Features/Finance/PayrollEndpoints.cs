@@ -1,6 +1,5 @@
-using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -91,14 +90,14 @@ public static class PayrollEndpoints
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             """
             SELECT r.*,
-                   (SELECT COUNT(*) FROM fin.PayrollLine WHERE RunId = r.RunId) AS EmployeeCount,
-                   ISNULL((SELECT SUM(BaseSalaryH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0) AS SalariesH,
-                   ISNULL((SELECT SUM(CommissionH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0) AS CommissionH,
-                   ISNULL((SELECT SUM(AllowancesH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0) AS AllowancesH,
-                   ISNULL((SELECT SUM(DeductionsH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0) AS DeductionsH
+                   (SELECT COUNT(*)::int FROM fin.PayrollLine WHERE RunId = r.RunId) AS EmployeeCount,
+                   COALESCE((SELECT SUM(BaseSalaryH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0)::bigint AS SalariesH,
+                   COALESCE((SELECT SUM(CommissionH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0)::bigint AS CommissionH,
+                   COALESCE((SELECT SUM(AllowancesH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0)::bigint AS AllowancesH,
+                   COALESCE((SELECT SUM(DeductionsH) FROM fin.PayrollLine WHERE RunId = r.RunId), 0)::bigint AS DeductionsH
             FROM fin.PayrollRun AS r
             WHERE (@BranchId IS NULL OR r.BranchId = @BranchId OR r.BranchId IS NULL)
             ORDER BY r.PeriodMonth DESC;
@@ -113,7 +112,7 @@ public static class PayrollEndpoints
     {
         await using var connection = db.Create();
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(
             """
             SELECT * FROM fin.PayrollRun WHERE RunId = @RunId;
 
@@ -125,10 +124,10 @@ public static class PayrollEndpoints
             """,
             new { RunId = runId }, cancellationToken: ct));
 
-        var run = await multi.ReadSingleOrDefaultAsync();
+        var run = await multi.ReadSingleRowOrDefaultAsync();
         if (run is null) return Results.NotFound();
 
-        var lines = (await multi.ReadAsync()).ToList();
+        var lines = (await multi.ReadRowsAsync()).ToList();
         return Results.Ok(new { run, lines });
     }
 
@@ -136,27 +135,27 @@ public static class PayrollEndpoints
         DraftPayrollRequest request, ISqlConnectionFactory db,
         ICurrentUser current, CancellationToken ct)
     {
-        var parameters = new DynamicParameters();
-        parameters.Add("@PeriodMonth", request.PeriodMonth);
-        parameters.Add("@BranchId", request.BranchId);
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@RunId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string runId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_DraftPayroll", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            runId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT RunId FROM fin.usp_DraftPayroll(
+                    p_PeriodMonth => @PeriodMonth, p_BranchId => @BranchId, p_Actor => @Actor);
+                """,
+                new { request.PeriodMonth, request.BranchId, Actor = current.Username },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 56000 && ex.Number < 57000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 56000 && ex.ErrorNumber() < 57000)
         {
-            return Results.Json(Translate(ex.Number, ex.Message),
+            return Results.Json(Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 
-        return Results.Ok(new { runId = parameters.Get<string>("@RunId") });
+        return Results.Ok(new { runId });
     }
 
     /// <summary>
@@ -179,16 +178,16 @@ public static class PayrollEndpoints
 
         var affected = await connection.ExecuteAsync(new CommandDefinition(
             """
-            UPDATE l
+            UPDATE fin.PayrollLine AS l
             SET BaseSalaryH = @BaseSalaryH,
                 AllowancesH = @AllowancesH,
                 DeductionsH = @DeductionsH
-            FROM fin.PayrollLine AS l
-            JOIN fin.PayrollRun AS r ON r.RunId = l.RunId
-            WHERE l.RunId = @RunId AND l.UserId = @UserId AND r.Status = N'draft';
+            FROM fin.PayrollRun AS r
+            WHERE r.RunId = l.RunId
+              AND l.RunId = @RunId AND l.UserId = @UserId AND r.Status = 'draft';
 
             UPDATE fin.PayrollRun
-            SET TotalH = ISNULL((SELECT SUM(NetPayH) FROM fin.PayrollLine WHERE RunId = @RunId), 0)
+            SET TotalH = COALESCE((SELECT SUM(NetPayH) FROM fin.PayrollLine WHERE RunId = @RunId), 0)::bigint
             WHERE RunId = @RunId;
             """,
             new { RunId = runId, UserId = userId, request.BaseSalaryH, request.AllowancesH, request.DeductionsH },
@@ -206,13 +205,13 @@ public static class PayrollEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_PayPayroll",
+                "SELECT fin.usp_PayPayroll(p_RunId => @RunId, p_PaidOn => @PaidOn::date, p_Actor => @Actor);",
                 new { RunId = runId, request.PaidOn, Actor = current.Username },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 56000 && ex.Number < 57000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 56000 && ex.ErrorNumber() < 57000)
         {
-            return Results.Json(Translate(ex.Number, ex.Message),
+            return Results.Json(Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 
@@ -226,7 +225,7 @@ public static class PayrollEndpoints
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             """
             SELECT p.*, b.NameAr AS BranchNameAr, b.NameEn AS BranchNameEn
             FROM fin.BalancePeriod AS p
@@ -244,7 +243,7 @@ public static class PayrollEndpoints
     {
         await using var connection = db.Create();
 
-        var period = await connection.QuerySingleOrDefaultAsync(new CommandDefinition(
+        var period = await connection.QuerySingleRowOrDefaultAsync(new CommandDefinition(
             "SELECT * FROM fin.BalancePeriod WHERE PeriodId = @PeriodId;",
             new { PeriodId = periodId }, cancellationToken: ct));
 
@@ -258,16 +257,18 @@ public static class PayrollEndpoints
 
         try
         {
-            var row = await connection.QuerySingleAsync(new CommandDefinition(
-                "fin.usp_BalancePeriodExpectation",
-                new { PeriodId = periodId },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            var row = await connection.QuerySingleRowAsync(new CommandDefinition(
+                """
+                SELECT CashH, CardH, CreditH, BankH, InventoryH, PayablesH
+                FROM fin.usp_BalancePeriodExpectation(p_PeriodId => @PeriodId);
+                """,
+                new { PeriodId = periodId }, cancellationToken: ct));
 
             return Results.Ok(row);
         }
-        catch (SqlException ex) when (ex.Number >= 56000 && ex.Number < 57000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 56000 && ex.ErrorNumber() < 57000)
         {
-            return Results.Json(Translate(ex.Number, ex.Message),
+            return Results.Json(Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
     }
@@ -278,69 +279,87 @@ public static class PayrollEndpoints
     {
         if (!current.CanSeeBranch(request.BranchId)) return Results.Forbid();
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@BranchId", request.BranchId);
-        parameters.Add("@Label", request.Label);
-        parameters.Add("@OpenedOn", request.OpenedOn);
-        parameters.Add("@OpeningCashH", request.OpeningCashH);
-        parameters.Add("@OpeningCardH", request.OpeningCardH);
-        parameters.Add("@OpeningCreditH", request.OpeningCreditH);
-        parameters.Add("@OpeningBankH", request.OpeningBankH);
-        parameters.Add("@OpeningInventoryH", request.OpeningInventoryH);
-        parameters.Add("@OpeningPayablesH", request.OpeningPayablesH);
-        parameters.Add("@OpenedBy", current.Username);
-        parameters.Add("@Note", request.Note);
-        parameters.Add("@PeriodId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string periodId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_OpenBalancePeriod", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            periodId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT PeriodId FROM fin.usp_OpenBalancePeriod(
+                    p_BranchId => @BranchId, p_Label => @Label, p_OpenedOn => @OpenedOn::date,
+                    p_OpeningCashH => @OpeningCashH, p_OpeningCardH => @OpeningCardH,
+                    p_OpeningCreditH => @OpeningCreditH, p_OpeningBankH => @OpeningBankH,
+                    p_OpeningInventoryH => @OpeningInventoryH, p_OpeningPayablesH => @OpeningPayablesH,
+                    p_OpenedBy => @OpenedBy, p_Note => @Note);
+                """,
+                new
+                {
+                    request.BranchId,
+                    request.Label,
+                    request.OpenedOn,
+                    request.OpeningCashH,
+                    request.OpeningCardH,
+                    request.OpeningCreditH,
+                    request.OpeningBankH,
+                    request.OpeningInventoryH,
+                    request.OpeningPayablesH,
+                    OpenedBy = current.Username,
+                    request.Note
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 56000 && ex.Number < 57000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 56000 && ex.ErrorNumber() < 57000)
         {
-            return Results.Json(Translate(ex.Number, ex.Message),
+            return Results.Json(Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 
-        return Results.Ok(new { periodId = parameters.Get<string>("@PeriodId") });
+        return Results.Ok(new { periodId });
     }
 
     private static async Task<IResult> ClosePeriodAsync(
         string periodId, ClosePeriodRequest request, ISqlConnectionFactory db,
         ICurrentUser current, CancellationToken ct)
     {
-        var parameters = new DynamicParameters();
-        parameters.Add("@PeriodId", periodId);
-        parameters.Add("@ClosedOn", request.ClosedOn);
-        parameters.Add("@ClosingCashH", request.ClosingCashH);
-        parameters.Add("@ClosingCardH", request.ClosingCardH);
-        parameters.Add("@ClosingCreditH", request.ClosingCreditH);
-        parameters.Add("@ClosingBankH", request.ClosingBankH);
-        parameters.Add("@ClosingInventoryH", request.ClosingInventoryH);
-        parameters.Add("@ClosingPayablesH", request.ClosingPayablesH);
-        parameters.Add("@ClosedBy", current.Username);
-        parameters.Add("@Note", request.Note);
-        parameters.Add("@VarianceH", dbType: DbType.Int64, direction: ParameterDirection.Output);
-
         await using var connection = db.Create();
+
+        long varianceH;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_CloseBalancePeriod", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            varianceH = await connection.QuerySingleAsync<long>(new CommandDefinition(
+                """
+                SELECT VarianceH FROM fin.usp_CloseBalancePeriod(
+                    p_PeriodId => @PeriodId, p_ClosedOn => @ClosedOn::date,
+                    p_ClosingCashH => @ClosingCashH, p_ClosingCardH => @ClosingCardH,
+                    p_ClosingCreditH => @ClosingCreditH, p_ClosingBankH => @ClosingBankH,
+                    p_ClosingInventoryH => @ClosingInventoryH, p_ClosingPayablesH => @ClosingPayablesH,
+                    p_ClosedBy => @ClosedBy, p_Note => @Note);
+                """,
+                new
+                {
+                    PeriodId = periodId,
+                    request.ClosedOn,
+                    request.ClosingCashH,
+                    request.ClosingCardH,
+                    request.ClosingCreditH,
+                    request.ClosingBankH,
+                    request.ClosingInventoryH,
+                    request.ClosingPayablesH,
+                    ClosedBy = current.Username,
+                    request.Note
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 56000 && ex.Number < 57000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 56000 && ex.ErrorNumber() < 57000)
         {
-            return Results.Json(Translate(ex.Number, ex.Message),
+            return Results.Json(Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 
-        return Results.Ok(new { varianceH = parameters.Get<long>("@VarianceH") });
+        return Results.Ok(new { varianceH });
     }
 
     /*--------------------------------------------------- recurring, reversal */
@@ -349,31 +368,31 @@ public static class PayrollEndpoints
         string recurringId, RecordInstalmentRequest request, ISqlConnectionFactory db,
         ICurrentUser current, CancellationToken ct)
     {
-        var parameters = new DynamicParameters();
-        parameters.Add("@RecurringId", recurringId);
-        parameters.Add("@PaidOn", request.PaidOn);
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@ExpenseId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string expenseId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_RecordRecurringInstalment", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            expenseId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT ExpenseId FROM fin.usp_RecordRecurringInstalment(
+                    p_RecurringId => @RecurringId, p_PaidOn => @PaidOn::date, p_Actor => @Actor);
+                """,
+                new { RecurringId = recurringId, request.PaidOn, Actor = current.Username },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (ExpenseEndpoints.MapRecordError(ex) is { } mapped)
+        catch (PostgresException ex) when (ExpenseEndpoints.MapRecordError(ex) is { } mapped)
         {
             return mapped;
         }
-        catch (SqlException ex) when (ex.Number >= 56000 && ex.Number < 57000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 56000 && ex.ErrorNumber() < 57000)
         {
-            return Results.Json(Translate(ex.Number, ex.Message),
+            return Results.Json(Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 
-        return Results.Ok(new { expenseId = parameters.Get<string>("@ExpenseId") });
+        return Results.Ok(new { expenseId });
     }
 
     private static async Task<IResult> ReverseExpenseAsync(
@@ -385,13 +404,13 @@ public static class PayrollEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_ReverseExpense",
+                "SELECT fin.usp_ReverseExpense(p_ExpenseId => @ExpenseId, p_Reason => @Reason, p_Actor => @Actor);",
                 new { ExpenseId = expenseId, request.Reason, Actor = current.Username },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 56000 && ex.Number < 57000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 56000 && ex.ErrorNumber() < 57000)
         {
-            return Results.Json(Translate(ex.Number, ex.Message),
+            return Results.Json(Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 
@@ -402,23 +421,23 @@ public static class PayrollEndpoints
         string entryId, ReverseRequest request, ISqlConnectionFactory db,
         ICurrentUser current, CancellationToken ct)
     {
-        var parameters = new DynamicParameters();
-        parameters.Add("@EntryId", entryId);
-        parameters.Add("@Reason", request.Reason);
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@NewEntryId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string newEntryId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_ReverseJournalEntry", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            newEntryId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT NewEntryId FROM fin.usp_ReverseJournalEntry(
+                    p_EntryId => @EntryId, p_Reason => @Reason, p_Actor => @Actor);
+                """,
+                new { EntryId = entryId, request.Reason, Actor = current.Username },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 51000 && ex.Number < 52000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 51000 && ex.ErrorNumber() < 52000)
         {
-            var error = ex.Number switch
+            var error = ex.ErrorNumber() switch
             {
                 51010 => ApiError.Create("entry_not_found",
                     "Journal entry not found.", "القيد غير موجود."),
@@ -426,13 +445,13 @@ public static class PayrollEndpoints
                     "This entry has already been reversed.", "هذا القيد معكوس مسبقًا."),
                 51012 => ApiError.Create("reason_required",
                     "A reversal needs a reason.", "العكس يحتاج إلى سبب."),
-                _ => ApiError.Create("reverse_failed", ex.Message, "تعذّر عكس القيد.")
+                _ => ApiError.Create("reverse_failed", ex.MessageText, "تعذّر عكس القيد.")
             };
 
             return Results.Json(error, statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 
-        return Results.Ok(new { entryId = parameters.Get<string>("@NewEntryId") });
+        return Results.Ok(new { entryId = newEntryId });
     }
 
     internal static ApiError Translate(int number, string fallback) => number switch

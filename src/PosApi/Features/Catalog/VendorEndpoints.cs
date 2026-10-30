@@ -1,7 +1,6 @@
-using System.Data;
 using System.Text.RegularExpressions;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -199,20 +198,20 @@ public static partial class VendorEndpoints
         var row = await connection.QuerySingleAsync<SummaryRow>(new CommandDefinition(
             """
             SELECT
-                ISNULL((SELECT SUM(TotalH - PaidH) FROM inv.Purchase WHERE PaidOnReceipt = 0), 0) AS PayableH,
-                (SELECT COUNT(*) FROM core.Vendor WHERE IsActive = 1) AS ActiveVendors,
+                COALESCE((SELECT SUM(TotalH - PaidH) FROM inv.Purchase WHERE NOT PaidOnReceipt), 0)::bigint AS PayableH,
+                (SELECT COUNT(*) FROM core.Vendor WHERE IsActive)::int AS ActiveVendors,
                 (SELECT COUNT(*) FROM core.Vendor AS v
                  WHERE EXISTS (SELECT 1 FROM inv.Purchase AS p
-                               WHERE p.VendorId = v.VendorId AND p.PaidOnReceipt = 0 AND p.PaidH < p.TotalH)) AS WithBalance,
-                ISNULL((SELECT SUM(TotalH) FROM inv.Purchase
-                        WHERE (@From IS NULL OR CAST(ReceivedAtUtc AS DATE) >= @From)
-                          AND (@To   IS NULL OR CAST(ReceivedAtUtc AS DATE) <= @To)), 0) AS PurchasedH,
+                               WHERE p.VendorId = v.VendorId AND NOT p.PaidOnReceipt AND p.PaidH < p.TotalH))::int AS WithBalance,
+                COALESCE((SELECT SUM(TotalH) FROM inv.Purchase
+                          WHERE (@From::date IS NULL OR ReceivedAtUtc::date >= @From::date)
+                            AND (@To::date   IS NULL OR ReceivedAtUtc::date <= @To::date)), 0)::bigint AS PurchasedH,
                 (SELECT COUNT(*) FROM inv.Purchase
-                 WHERE (@From IS NULL OR CAST(ReceivedAtUtc AS DATE) >= @From)
-                   AND (@To   IS NULL OR CAST(ReceivedAtUtc AS DATE) <= @To)) AS PurchaseCount,
-                ISNULL((SELECT SUM(AmountH) FROM inv.VendorPayment
-                        WHERE (@From IS NULL OR CAST(PaidAtUtc AS DATE) >= @From)
-                          AND (@To   IS NULL OR CAST(PaidAtUtc AS DATE) <= @To)), 0) AS PaidH;
+                 WHERE (@From::date IS NULL OR ReceivedAtUtc::date >= @From::date)
+                   AND (@To::date   IS NULL OR ReceivedAtUtc::date <= @To::date))::int AS PurchaseCount,
+                COALESCE((SELECT SUM(AmountH) FROM inv.VendorPayment
+                          WHERE (@From::date IS NULL OR PaidAtUtc::date >= @From::date)
+                            AND (@To::date   IS NULL OR PaidAtUtc::date <= @To::date)), 0)::bigint AS PaidH;
             """,
             new { From = from, To = to }, cancellationToken: ct));
 
@@ -258,34 +257,40 @@ public static partial class VendorEndpoints
             return ProcErrors.Field("email", "Enter a valid email address, or leave it empty.",
                 "أدخل بريدًا إلكترونيًا صحيحًا أو اتركه فارغًا.");
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@VendorId", vendorId);
-        parameters.Add("@NameAr", request.NameAr?.Trim());
-        parameters.Add("@NameEn", request.NameEn?.Trim());
-        parameters.Add("@ContactPerson", ProcErrors.Blank(request.ContactPerson));
-        parameters.Add("@Phone", ProcErrors.Blank(request.Phone));
-        parameters.Add("@Email", email);
-        parameters.Add("@VatNumber", ProcErrors.Blank(request.VatNumber));
-        parameters.Add("@City", ProcErrors.Blank(request.City));
-        parameters.Add("@PaymentTermDays", request.PaymentTermDays);
-        parameters.Add("@IsActive", request.Status is null ? (vendorId is null ? true : null) : request.Status == "active");
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@SavedId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string savedId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_SaveVendor", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            savedId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT SavedId FROM core.usp_SaveVendor(
+                    p_VendorId => @VendorId, p_NameAr => @NameAr, p_NameEn => @NameEn,
+                    p_ContactPerson => @ContactPerson, p_Phone => @Phone, p_Email => @Email,
+                    p_VatNumber => @VatNumber, p_City => @City,
+                    p_PaymentTermDays => @PaymentTermDays, p_IsActive => @IsActive, p_Actor => @Actor);
+                """,
+                new
+                {
+                    VendorId = vendorId,
+                    NameAr = request.NameAr?.Trim(),
+                    NameEn = request.NameEn?.Trim(),
+                    ContactPerson = ProcErrors.Blank(request.ContactPerson),
+                    Phone = ProcErrors.Blank(request.Phone),
+                    Email = email,
+                    VatNumber = ProcErrors.Blank(request.VatNumber),
+                    City = ProcErrors.Blank(request.City),
+                    request.PaymentTermDays,
+                    IsActive = request.Status is null ? (vendorId is null ? true : (bool?)null) : request.Status == "active",
+                    Actor = current.Username
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapError(ex, request) is { } mapped)
+        catch (PostgresException ex) when (MapError(ex, request) is { } mapped)
         {
             return mapped;
         }
-
-        var savedId = parameters.Get<string>("@SavedId");
 
         logger.LogInformation("Vendor {VendorId} {Action} by {Actor}.",
             savedId, vendorId is null ? "created" : "updated", current.Username);
@@ -317,35 +322,38 @@ public static partial class VendorEndpoints
         var branchId = ProcErrors.Blank(request.BranchId);
         if (!current.CanSeeBranch(branchId)) return Results.Forbid();
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@VendorId", vendorId);
-        parameters.Add("@AmountH", request.AmountH);
-        parameters.Add("@Method", request.Method?.Trim().ToLowerInvariant());
-        parameters.Add("@PurchaseId", ProcErrors.Blank(request.PurchaseId));
-        parameters.Add("@BranchId", branchId);
-        parameters.Add("@Note", ProcErrors.Blank(request.Note));
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@PaymentId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-        parameters.Add("@Reference", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-        parameters.Add("@EntryId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string paymentId, reference;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "inv.usp_RecordVendorPayment", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            (paymentId, reference, _) = await connection.QuerySingleAsync<(string, string, string)>(new CommandDefinition(
+                """
+                SELECT PaymentId, Reference, EntryId FROM inv.usp_RecordVendorPayment(
+                    p_VendorId => @VendorId, p_AmountH => @AmountH, p_Method => @Method,
+                    p_PurchaseId => @PurchaseId, p_BranchId => @BranchId,
+                    p_Note => @Note, p_Actor => @Actor);
+                """,
+                new
+                {
+                    VendorId = vendorId,
+                    request.AmountH,
+                    Method = request.Method?.Trim().ToLowerInvariant(),
+                    PurchaseId = ProcErrors.Blank(request.PurchaseId),
+                    BranchId = branchId,
+                    Note = ProcErrors.Blank(request.Note),
+                    Actor = current.Username
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapError(ex, null) is { } mapped)
+        catch (PostgresException ex) when (MapError(ex, null) is { } mapped)
         {
             return mapped;
         }
 
-        var paymentId = parameters.Get<string>("@PaymentId");
-
         logger.LogInformation("Vendor payment {Reference} of {AmountH} to {VendorId} by {Actor}.",
-            parameters.Get<string>("@Reference"), request.AmountH, vendorId, current.Username);
+            reference, request.AmountH, vendorId, current.Username);
         http.Items["AuditEntityId"] = paymentId;
 
         var payment = (await LoadPaymentsAsync(connection, vendorId, paymentId, ct)).Single();
@@ -377,15 +385,15 @@ public static partial class VendorEndpoints
 
         var rows = (await connection.QueryAsync<LedgerRow>(new CommandDefinition(
             """
-            SELECT p.PurchaseId AS Id, N'purchase' AS Kind, p.Reference, p.ReceivedAtUtc AS OccurredAtUtc,
-                   p.TotalH AS AmountH, p.PurchaseId, CAST(NULL AS NVARCHAR(40)) AS PaymentId,
-                   CAST(NULL AS NVARCHAR(20)) AS Method, p.InvoiceNumber AS VendorInvoiceNumber, p.Note
+            SELECT p.PurchaseId AS Id, 'purchase' AS Kind, p.Reference, p.ReceivedAtUtc AS OccurredAtUtc,
+                   p.TotalH AS AmountH, p.PurchaseId, NULL::varchar AS PaymentId,
+                   NULL::varchar AS Method, p.InvoiceNumber AS VendorInvoiceNumber, p.Note
             FROM inv.Purchase AS p
-            WHERE p.VendorId = @VendorId AND p.PaidOnReceipt = 0
+            WHERE p.VendorId = @VendorId AND NOT p.PaidOnReceipt
 
             UNION ALL
 
-            SELECT y.PaymentId, N'payment', y.Reference, y.PaidAtUtc,
+            SELECT y.PaymentId, 'payment', y.Reference, y.PaidAtUtc,
                    -y.AmountH, NULL, y.PaymentId, y.Method, NULL, y.Note
             FROM inv.VendorPayment AS y
             WHERE y.VendorId = @VendorId
@@ -429,12 +437,12 @@ public static partial class VendorEndpoints
         const string filter = """
             WHERE (@VendorId IS NULL OR p.VendorId = @VendorId)
               AND (@BranchId IS NULL OR p.BranchId = @BranchId)
-              AND (@From IS NULL OR CAST(p.ReceivedAtUtc AS DATE) >= @From)
-              AND (@To   IS NULL OR CAST(p.ReceivedAtUtc AS DATE) <= @To)
+              AND (@From::date IS NULL OR p.ReceivedAtUtc::date >= @From::date)
+              AND (@To::date   IS NULL OR p.ReceivedAtUtc::date <= @To::date)
               AND (@Status IS NULL
-                   OR (@Status = N'paid'    AND p.PaidH >= p.TotalH)
-                   OR (@Status = N'partial' AND p.PaidH > 0 AND p.PaidH < p.TotalH)
-                   OR (@Status = N'unpaid'  AND p.PaidH = 0 AND p.TotalH > 0))
+                   OR (@Status = 'paid'    AND p.PaidH >= p.TotalH)
+                   OR (@Status = 'partial' AND p.PaidH > 0 AND p.PaidH < p.TotalH)
+                   OR (@Status = 'unpaid'  AND p.PaidH = 0 AND p.TotalH > 0))
             """;
 
         var args = new
@@ -449,7 +457,7 @@ public static partial class VendorEndpoints
         };
 
         var total = await connection.ExecuteScalarAsync<int>(new CommandDefinition(
-            $"SELECT COUNT(*) FROM inv.Purchase AS p {filter};", args, cancellationToken: ct));
+            $"SELECT COUNT(*)::int FROM inv.Purchase AS p {filter};", args, cancellationToken: ct));
 
         var rows = (await connection.QueryAsync<PurchaseRow>(new CommandDefinition(
             $"""
@@ -521,7 +529,7 @@ public static partial class VendorEndpoints
             r.ReceivedAtUtc, r.ReceivedAtUtc, r.ReceivedAtUtc, payments);
 
     private static async Task<ILookup<string, PurchaseLineDto>> LoadPurchaseLinesAsync(
-        SqlConnection connection, IReadOnlyList<string> purchaseIds, CancellationToken ct)
+        NpgsqlConnection connection, IReadOnlyList<string> purchaseIds, CancellationToken ct)
     {
         if (purchaseIds.Count == 0) return Array.Empty<PurchaseLineDto>().ToLookup(_ => string.Empty);
 
@@ -530,44 +538,44 @@ public static partial class VendorEndpoints
             SELECT l.PurchaseId, l.ItemId, i.NameAr, i.NameEn, l.Quantity, l.UnitCostH
             FROM inv.PurchaseLine AS l
             JOIN core.CatalogItem AS i ON i.ItemId = l.ItemId
-            WHERE l.PurchaseId IN @Ids
+            WHERE l.PurchaseId = ANY(@Ids)
             ORDER BY l.PurchaseLineId;
             """,
-            new { Ids = purchaseIds }, cancellationToken: ct));
+            new { Ids = purchaseIds.ToArray() }, cancellationToken: ct));
 
         return rows.ToLookup(r => r.PurchaseId, r => new PurchaseLineDto(
             r.ItemId, r.NameAr, r.NameEn, r.Quantity, r.UnitCostH,
             (long)Math.Round(r.Quantity * r.UnitCostH, MidpointRounding.AwayFromZero)));
     }
 
-    private static async Task<bool> VendorExistsAsync(SqlConnection connection, string vendorId, CancellationToken ct) =>
+    private static async Task<bool> VendorExistsAsync(NpgsqlConnection connection, string vendorId, CancellationToken ct) =>
         await connection.ExecuteScalarAsync<int>(new CommandDefinition(
-            "SELECT COUNT(*) FROM core.Vendor WHERE VendorId = @VendorId;",
+            "SELECT COUNT(*)::int FROM core.Vendor WHERE VendorId = @VendorId;",
             new { VendorId = vendorId }, cancellationToken: ct)) > 0;
 
     internal static async Task<List<VendorDto>> LoadVendorsAsync(
-        SqlConnection connection, string? vendorId, bool includeInactive,
+        NpgsqlConnection connection, string? vendorId, bool includeInactive,
         ILanguageContext language, CancellationToken ct)
     {
         var rows = await connection.QueryAsync<VendorRow>(new CommandDefinition(
             """
             SELECT v.VendorId, v.NameAr, v.NameEn, v.ContactPerson, v.Phone, v.Email, v.VatNumber,
                    v.City, v.PaymentTermDays, v.IsActive, v.CreatedAtUtc, v.UpdatedAtUtc,
-                   ISNULL(p.BalanceH, 0) AS BalanceH, ISNULL(p.PurchasedH, 0) AS PurchasedH,
-                   ISNULL(p.PurchaseCount, 0) AS PurchaseCount, p.LastPurchaseAtUtc,
-                   ISNULL(y.PaidH, 0) AS PaidH
+                   COALESCE(p.BalanceH, 0)::bigint AS BalanceH, COALESCE(p.PurchasedH, 0)::bigint AS PurchasedH,
+                   COALESCE(p.PurchaseCount, 0)::int AS PurchaseCount, p.LastPurchaseAtUtc,
+                   COALESCE(y.PaidH, 0)::bigint AS PaidH
             FROM core.Vendor AS v
-            OUTER APPLY (
-                SELECT SUM(CASE WHEN PaidOnReceipt = 0 THEN TotalH - PaidH ELSE 0 END) AS BalanceH,
+            LEFT JOIN LATERAL (
+                SELECT SUM(CASE WHEN NOT PaidOnReceipt THEN TotalH - PaidH ELSE 0 END) AS BalanceH,
                        SUM(TotalH) AS PurchasedH, COUNT(*) AS PurchaseCount,
                        MAX(ReceivedAtUtc) AS LastPurchaseAtUtc
                 FROM inv.Purchase WHERE VendorId = v.VendorId
-            ) AS p
-            OUTER APPLY (
+            ) AS p ON true
+            LEFT JOIN LATERAL (
                 SELECT SUM(AmountH) AS PaidH FROM inv.VendorPayment WHERE VendorId = v.VendorId
-            ) AS y
+            ) AS y ON true
             WHERE (@VendorId IS NULL OR v.VendorId = @VendorId)
-              AND (@IncludeInactive = 1 OR v.IsActive = 1)
+              AND (@IncludeInactive OR v.IsActive)
             ORDER BY v.NameEn;
             """,
             new { VendorId = vendorId, IncludeInactive = includeInactive }, cancellationToken: ct));
@@ -582,7 +590,7 @@ public static partial class VendorEndpoints
     }
 
     private static async Task<List<VendorPaymentDto>> LoadPaymentsAsync(
-        SqlConnection connection, string vendorId, string? paymentId, CancellationToken ct)
+        NpgsqlConnection connection, string vendorId, string? paymentId, CancellationToken ct)
     {
         await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
             """
@@ -614,7 +622,7 @@ public static partial class VendorEndpoints
     private static IResult VendorNotFound() =>
         ProcErrors.NotFound("No such vendor.", "لا يوجد مورد بهذا المعرف.");
 
-    private static IResult? MapError(SqlException ex, SaveVendorRequest? request) => ex.Number switch
+    private static IResult? MapError(PostgresException ex, SaveVendorRequest? request) => ex.ErrorNumber() switch
     {
         66000 => ProcErrors.Field(string.IsNullOrWhiteSpace(request?.NameAr) ? "nameAr" : "nameEn",
             "Both names are required.", "الاسمان العربي والإنجليزي مطلوبان."),

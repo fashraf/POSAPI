@@ -104,8 +104,9 @@ public static partial class ConfigEndpoints
     {
         var rows = await control.QueryAsync(new CommandDefinition(
             """
-            SELECT Value, Label, LabelAr, Extra, SortOrder, IsActive FROM ctl.MasterItem
-            WHERE SetKey = @Set AND (@All = 1 OR IsActive = 1) ORDER BY SortOrder, Label;
+            SELECT Value AS "Value", Label AS "Label", LabelAr AS "LabelAr", Extra AS "Extra", SortOrder AS "SortOrder", IsActive AS "IsActive"
+            FROM ctl.MasterItem
+            WHERE SetKey = @Set AND (@All OR IsActive) ORDER BY SortOrder, Label;
             """, new { Set = set, All = all }, cancellationToken: ct));
 
         return rows.Select(r =>
@@ -171,11 +172,11 @@ public static partial class ConfigEndpoints
 
         await control.ExecuteAsync(new CommandDefinition(
             clash.Value is not null
-                ? "UPDATE ctl.MasterItem SET Label = @Label, LabelAr = @LabelAr, Extra = @Extra, IsActive = 1 WHERE SetKey = @Set AND Value = @Existing;"
+                ? "UPDATE ctl.MasterItem SET Label = @Label, LabelAr = @LabelAr, Extra = @Extra, IsActive = true WHERE SetKey = @Set AND Value = @Existing;"
                 : """
                   INSERT INTO ctl.MasterItem (SetKey, Value, Label, LabelAr, Extra, SortOrder)
                   VALUES (@Set, @Value, @Label, @LabelAr, @Extra,
-                          ISNULL(@Sort, (SELECT ISNULL(MAX(SortOrder), 0) + 1 FROM ctl.MasterItem WHERE SetKey = @Set)));
+                          COALESCE(@Sort, (SELECT COALESCE(MAX(SortOrder), 0) + 1 FROM ctl.MasterItem WHERE SetKey = @Set)));
                   """,
             new
             {
@@ -197,14 +198,14 @@ public static partial class ConfigEndpoints
         if (before is null) return ClientEndpoints.NotFound("No such item.");
 
         if (await control.ExecuteScalarAsync<int?>(new CommandDefinition(
-                "SELECT 1 FROM ctl.MasterItem WHERE SetKey = @Set AND Label = @Label AND Value <> @Value AND IsActive = 1;",
+                "SELECT 1 FROM ctl.MasterItem WHERE SetKey = @Set AND Label = @Label AND Value <> @Value AND IsActive;",
                 new { Set = set, Label = request.Label!.Trim(), Value = value }, cancellationToken: ct)) is not null)
             return ClientEndpoints.Conflict($"'{request.Label}' is already on the list.");
 
         /* The key never changes: clients store it. */
         await control.ExecuteAsync(new CommandDefinition(
             """
-            UPDATE ctl.MasterItem SET Label = @Label, LabelAr = @LabelAr, Extra = @Extra, SortOrder = ISNULL(@Sort, SortOrder)
+            UPDATE ctl.MasterItem SET Label = @Label, LabelAr = @LabelAr, Extra = @Extra, SortOrder = COALESCE(@Sort, SortOrder)
             WHERE SetKey = @Set AND Value = @Value;
             """, new { Set = set, Value = value, Label = request.Label!.Trim(), LabelAr = request.LabelAr?.Trim(), Extra = ExtraOf(set, request), Sort = request.SortOrder },
             cancellationToken: ct));
@@ -220,7 +221,7 @@ public static partial class ConfigEndpoints
         await using var control = catalog.Control();
 
         var affected = await control.ExecuteAsync(new CommandDefinition(
-            "UPDATE ctl.MasterItem SET IsActive = 0 WHERE SetKey = @Set AND Value = @Value AND IsActive = 1;",
+            "UPDATE ctl.MasterItem SET IsActive = false WHERE SetKey = @Set AND Value = @Value AND IsActive;",
             new { Set = set, Value = value }, cancellationToken: ct));
         if (affected == 0) return ClientEndpoints.NotFound("No such item.");
 
@@ -234,7 +235,7 @@ public static partial class ConfigEndpoints
     {
         await using var control = catalog.Control();
         return Results.Ok(await control.QueryAsync(new CommandDefinition(
-            "SELECT FeatureKey AS [key], Label AS label, Icon AS icon, Blurb AS blurb, IsCore AS core FROM ctl.Feature ORDER BY SortOrder;",
+            "SELECT FeatureKey AS \"key\", Label AS \"label\", Icon AS \"icon\", Blurb AS \"blurb\", IsCore AS \"core\" FROM ctl.Feature ORDER BY SortOrder;",
             cancellationToken: ct)));
     }
 
@@ -250,7 +251,7 @@ public static partial class ConfigEndpoints
 
         /* Every business type on the master list appears, even one with nothing chosen yet. */
         foreach (var type in await control.QueryAsync<string>(new CommandDefinition(
-                     "SELECT Value FROM ctl.MasterItem WHERE SetKey = N'services' AND IsActive = 1;", cancellationToken: ct)))
+                     "SELECT Value FROM ctl.MasterItem WHERE SetKey = 'services' AND IsActive;", cancellationToken: ct)))
             map.TryAdd(type, []);
 
         return map;
@@ -352,7 +353,7 @@ public static partial class ConfigEndpoints
         await control.OpenAsync(ct);
 
         if (await control.ExecuteScalarAsync<int?>(new CommandDefinition(
-                "SELECT 1 FROM ctl.[Plan] WHERE PlanKey = @Plan;", new { Plan = plan }, cancellationToken: ct)) is null)
+                "SELECT 1 FROM ctl.Plan WHERE PlanKey = @Plan;", new { Plan = plan }, cancellationToken: ct)) is null)
             return ClientEndpoints.NotFound($"No plan '{plan}'.");
 
         var allowed = (await TypeMapAsync(control, ct)).GetValueOrDefault(type) ?? [];
@@ -364,21 +365,18 @@ public static partial class ConfigEndpoints
         await using var tx = await control.BeginTransactionAsync(ct);
         await control.ExecuteAsync(new CommandDefinition(
             """
-            MERGE ctl.PlanConfig AS c
-            USING (SELECT @Type AS BusinessType, @Plan AS PlanKey) AS src
-               ON c.BusinessType = src.BusinessType AND c.PlanKey = src.PlanKey
-            WHEN MATCHED THEN UPDATE SET
-                Users = @Users, Devices = @Devices, Branches = @Branches, Duration = ISNULL(@Duration, Duration),
-                DurationUnit = ISNULL(@Unit, DurationUnit), AmountH = @AmountH, Currency = ISNULL(@Currency, Currency),
-                Status = ISNULL(@Status, Status), CustomBilling = ISNULL(@CustomBilling, CustomBilling),
-                AutoRenew = ISNULL(@AutoRenew, AutoRenew), RenewalNoticeDays = ISNULL(@Notice, RenewalNoticeDays),
-                UpdatedAtUtc = SYSUTCDATETIME()
-            WHEN NOT MATCHED THEN INSERT
+            INSERT INTO ctl.PlanConfig AS c
                 (BusinessType, PlanKey, Users, Devices, Branches, Duration, DurationUnit, AmountH, Currency, Status,
                  CustomBilling, AutoRenew, RenewalNoticeDays)
-            VALUES (@Type, @Plan, @Users, @Devices, @Branches, ISNULL(@Duration, 12), ISNULL(@Unit, N'months'), @AmountH,
-                    ISNULL(@Currency, N'SAR'), ISNULL(@Status, N'active'), ISNULL(@CustomBilling, 0), ISNULL(@AutoRenew, 1),
-                    ISNULL(@Notice, 30));
+            VALUES (@Type, @Plan, @Users, @Devices, @Branches, COALESCE(@Duration, 12), COALESCE(@Unit, 'months'), @AmountH,
+                    COALESCE(@Currency, 'SAR'), COALESCE(@Status, 'active'), COALESCE(@CustomBilling, false), COALESCE(@AutoRenew, true),
+                    COALESCE(@Notice, 30))
+            ON CONFLICT (BusinessType, PlanKey) DO UPDATE SET
+                Users = @Users, Devices = @Devices, Branches = @Branches, Duration = COALESCE(@Duration, c.Duration),
+                DurationUnit = COALESCE(@Unit, c.DurationUnit), AmountH = @AmountH, Currency = COALESCE(@Currency, c.Currency),
+                Status = COALESCE(@Status, c.Status), CustomBilling = COALESCE(@CustomBilling, c.CustomBilling),
+                AutoRenew = COALESCE(@AutoRenew, c.AutoRenew), RenewalNoticeDays = COALESCE(@Notice, c.RenewalNoticeDays),
+                UpdatedAtUtc = now() AT TIME ZONE 'utc';
 
             DELETE FROM ctl.PlanConfigFeature WHERE BusinessType = @Type AND PlanKey = @Plan;
             """,
@@ -417,10 +415,10 @@ public static partial class ConfigEndpoints
         await using var control = catalog.Control();
         var affected = await control.ExecuteAsync(new CommandDefinition(
             """
-            UPDATE ctl.[Plan]
-            SET Label = ISNULL(@Label, Label), MonthlyH = @MonthlyH, AnnualH = @AnnualH, Branches = @Branches,
+            UPDATE ctl.Plan
+            SET Label = COALESCE(@Label, Label), MonthlyH = @MonthlyH, AnnualH = @AnnualH, Branches = @Branches,
                 Devices = @Devices, Users = @Users, Transactions = @Transactions, StorageGb = @StorageGb,
-                Highlights = ISNULL(@Highlights, Highlights), IsActive = ISNULL(@IsActive, IsActive)
+                Highlights = COALESCE(@Highlights, Highlights), IsActive = COALESCE(@IsActive, IsActive)
             WHERE PlanKey = @Key;
             """,
             new
@@ -445,9 +443,9 @@ public static partial class ConfigEndpoints
 
         await using var control = catalog.Control();
         var before = await control.ExecuteScalarAsync<string?>(new CommandDefinition(
-            "SELECT Value FROM ctl.Setting WHERE SettingKey = N'trialDays';", cancellationToken: ct));
+            "SELECT Value FROM ctl.Setting WHERE SettingKey = 'trialDays';", cancellationToken: ct));
         await control.ExecuteAsync(new CommandDefinition(
-            "UPDATE ctl.Setting SET Value = @Value, UpdatedAtUtc = SYSUTCDATETIME(), UpdatedBy = @By WHERE SettingKey = N'trialDays';",
+            "UPDATE ctl.Setting SET Value = @Value, UpdatedAtUtc = now() AT TIME ZONE 'utc', UpdatedBy = @By WHERE SettingKey = 'trialDays';",
             new { Value = request.Days.ToString(), By = admin.Name }, cancellationToken: ct));
 
         return Results.Ok(await audit.ResultAsync("settings.update", "Changed trial length", null, "trialDays",
@@ -468,15 +466,15 @@ public static partial class ConfigEndpoints
     public static async Task<IEnumerable<dynamic>> HardwareAsync(DbConnection control, string? tenantId, CancellationToken ct) =>
         await control.QueryAsync(new CommandDefinition(
             """
-            SELECT h.DeviceId AS id, h.Serial AS serial,
-                   CONCAT(ISNULL(h.Manufacturer + N' ', N''), h.Model) AS name,
-                   h.Manufacturer AS manufacturer, h.Model AS model, h.DeviceType AS type, h.Os AS os,
-                   h.MacAddress AS macAddress, h.Imei AS imei, CONVERT(CHAR(10), h.PurchasedOn, 23) AS purchasedOn,
-                   CONVERT(CHAR(10), h.WarrantyEndsOn, 23) AS warrantyEndsOn, h.WarrantyMonths AS warrantyMonths, h.Status AS status,
-                   h.TenantId AS clientId, t.Name AS clientName, h.BranchId AS branchId, h.BranchName AS branchName,
-                   h.TerminalId AS terminalId, CONVERT(CHAR(10), h.InstalledOn, 23) AS installedOn, h.LastOnlineAtUtc AS lastOnlineAt,
-                   h.Notes AS notes,
-                   DATEDIFF(DAY, CAST(SYSUTCDATETIME() AS DATE), h.WarrantyEndsOn) AS daysOfWarranty
+            SELECT h.DeviceId AS "id", h.Serial AS "serial",
+                   COALESCE(h.Manufacturer || ' ', '') || h.Model AS "name",
+                   h.Manufacturer AS "manufacturer", h.Model AS "model", h.DeviceType AS "type", h.Os AS "os",
+                   h.MacAddress AS "macAddress", h.Imei AS "imei", to_char(h.PurchasedOn, 'YYYY-MM-DD') AS "purchasedOn",
+                   to_char(h.WarrantyEndsOn, 'YYYY-MM-DD') AS "warrantyEndsOn", h.WarrantyMonths AS "warrantyMonths", h.Status AS "status",
+                   h.TenantId AS "clientId", t.Name AS "clientName", h.BranchId AS "branchId", h.BranchName AS "branchName",
+                   h.TerminalId AS "terminalId", to_char(h.InstalledOn, 'YYYY-MM-DD') AS "installedOn", h.LastOnlineAtUtc AS "lastOnlineAt",
+                   h.Notes AS "notes",
+                   h.WarrantyEndsOn - (now() AT TIME ZONE 'utc')::date AS "daysOfWarranty"
             FROM ctl.HardwareDevice AS h LEFT JOIN ctl.Tenant AS t ON t.TenantId = h.TenantId
             WHERE @TenantId IS NULL OR h.TenantId = @TenantId
             ORDER BY h.DeviceId;
@@ -501,7 +499,7 @@ public static partial class ConfigEndpoints
     {
         await using var control = catalog.Control();
         return Results.Ok(await control.QueryAsync(new CommandDefinition(
-            "SELECT AtUtc AS [at], Event AS [event], ByName AS [by], Detail AS detail FROM ctl.HardwareDeviceEvent WHERE DeviceId = @Id ORDER BY EventId DESC;",
+            "SELECT AtUtc AS \"at\", Event AS \"event\", ByName AS \"by\", Detail AS \"detail\" FROM ctl.HardwareDeviceEvent WHERE DeviceId = @Id ORDER BY EventId DESC;",
             new { Id = id }, cancellationToken: ct)));
     }
 
@@ -526,7 +524,7 @@ public static partial class ConfigEndpoints
         if (!string.IsNullOrWhiteSpace(request.Id) && existing?.DeviceId is null) return ClientEndpoints.NotFound("No such device.");
 
         if (await control.ExecuteScalarAsync<int?>(new CommandDefinition(
-                "SELECT 1 FROM ctl.HardwareDevice WHERE Serial = @Serial AND DeviceId <> ISNULL(@Id, N'');",
+                "SELECT 1 FROM ctl.HardwareDevice WHERE Serial = @Serial AND DeviceId <> COALESCE(@Id, '');",
                 new { Serial = request.Serial.Trim(), request.Id }, cancellationToken: ct)) is not null)
             return ClientEndpoints.Conflict("Another device already has that serial number.");
 
@@ -548,29 +546,27 @@ public static partial class ConfigEndpoints
         string id;
         if (existing?.DeviceId is null)
         {
-            var number = await control.ExecuteScalarAsync<int>(new CommandDefinition("SELECT NEXT VALUE FOR ctl.HardwareNumber;", cancellationToken: ct));
+            var number = await control.ExecuteScalarAsync<int>(new CommandDefinition("SELECT nextval('ctl.HardwareNumber')::int;", cancellationToken: ct));
             id = $"DEV-{number}";
         }
         else id = existing.Value.DeviceId;
 
         await control.ExecuteAsync(new CommandDefinition(
             """
-            MERGE ctl.HardwareDevice AS h
-            USING (SELECT @Id AS DeviceId) AS src ON h.DeviceId = src.DeviceId
-            WHEN MATCHED THEN UPDATE SET
+            INSERT INTO ctl.HardwareDevice AS h
+                (DeviceId, Serial, Manufacturer, Model, DeviceType, Os, MacAddress, Imei, PurchasedOn, WarrantyEndsOn,
+                 WarrantyMonths, Status, TenantId, BranchId, BranchName, TerminalId, Notes)
+            VALUES (@Id, @Serial, @Manufacturer, @Model, @Type, @Os, @Mac, @Imei, @PurchasedOn, @WarrantyEnds,
+                    @WarrantyMonths, @Status, @ClientId, @BranchId, @BranchName, @TerminalId, @Notes)
+            ON CONFLICT (DeviceId) DO UPDATE SET
                 Serial = @Serial, Manufacturer = @Manufacturer, Model = @Model, DeviceType = @Type, Os = @Os,
                 MacAddress = @Mac, Imei = @Imei, PurchasedOn = @PurchasedOn, WarrantyEndsOn = @WarrantyEnds,
                 WarrantyMonths = @WarrantyMonths, Status = @Status, TenantId = @ClientId,
                 BranchId = CASE WHEN @ClientId IS NULL THEN NULL ELSE @BranchId END,
                 BranchName = CASE WHEN @ClientId IS NULL THEN NULL ELSE @BranchName END,
                 TerminalId = CASE WHEN @ClientId IS NULL THEN NULL ELSE @TerminalId END,
-                LastOnlineAtUtc = CASE WHEN @ClientId IS NULL THEN NULL ELSE LastOnlineAtUtc END,
-                Notes = @Notes, UpdatedAtUtc = SYSUTCDATETIME()
-            WHEN NOT MATCHED THEN INSERT
-                (DeviceId, Serial, Manufacturer, Model, DeviceType, Os, MacAddress, Imei, PurchasedOn, WarrantyEndsOn,
-                 WarrantyMonths, Status, TenantId, BranchId, BranchName, TerminalId, Notes)
-            VALUES (@Id, @Serial, @Manufacturer, @Model, @Type, @Os, @Mac, @Imei, @PurchasedOn, @WarrantyEnds,
-                    @WarrantyMonths, @Status, @ClientId, @BranchId, @BranchName, @TerminalId, @Notes);
+                LastOnlineAtUtc = CASE WHEN @ClientId IS NULL THEN NULL ELSE h.LastOnlineAtUtc END,
+                Notes = @Notes, UpdatedAtUtc = now() AT TIME ZONE 'utc';
 
             INSERT INTO ctl.HardwareDeviceEvent (DeviceId, Event, ByName, Detail)
             VALUES (@Id, @Event, @By, @Detail);
@@ -613,14 +609,14 @@ public static partial class ConfigEndpoints
             """
             UPDATE ctl.HardwareDevice
             SET Status = @To,
-                TenantId = CASE WHEN @Clears = 1 THEN NULL ELSE @ClientId END,
-                BranchId = CASE WHEN @Clears = 1 THEN NULL ELSE BranchId END,
-                BranchName = CASE WHEN @Clears = 1 THEN NULL ELSE BranchName END,
-                TerminalId = CASE WHEN @Clears = 1 THEN NULL ELSE TerminalId END,
-                LastOnlineAtUtc = CASE WHEN @Clears = 1 THEN NULL ELSE LastOnlineAtUtc END,
-                InstalledOn = CASE WHEN @To = N'active' THEN COALESCE(InstalledOn, CAST(SYSUTCDATETIME() AS DATE)) ELSE InstalledOn END,
+                TenantId = CASE WHEN @Clears THEN NULL ELSE @ClientId END,
+                BranchId = CASE WHEN @Clears THEN NULL ELSE BranchId END,
+                BranchName = CASE WHEN @Clears THEN NULL ELSE BranchName END,
+                TerminalId = CASE WHEN @Clears THEN NULL ELSE TerminalId END,
+                LastOnlineAtUtc = CASE WHEN @Clears THEN NULL ELSE LastOnlineAtUtc END,
+                InstalledOn = CASE WHEN @To = 'active' THEN COALESCE(InstalledOn, (now() AT TIME ZONE 'utc')::date) ELSE InstalledOn END,
                 Notes = CASE WHEN @Reason IS NULL THEN Notes ELSE @Reason END,
-                UpdatedAtUtc = SYSUTCDATETIME()
+                UpdatedAtUtc = now() AT TIME ZONE 'utc'
             WHERE DeviceId = @Id;
 
             INSERT INTO ctl.HardwareDeviceEvent (DeviceId, Event, ByName, Detail)
@@ -660,7 +656,7 @@ public static partial class ConfigEndpoints
 
         foreach (var (key, value) in changes)
             await control.ExecuteAsync(new CommandDefinition(
-                "UPDATE ctl.Setting SET Value = @Value, UpdatedAtUtc = SYSUTCDATETIME(), UpdatedBy = @By WHERE SettingKey = @Key;",
+                "UPDATE ctl.Setting SET Value = @Value, UpdatedAtUtc = now() AT TIME ZONE 'utc', UpdatedBy = @By WHERE SettingKey = @Key;",
                 new { Key = key, Value = value, By = admin.Name }, cancellationToken: ct));
 
         return Results.Ok(await audit.ResultAsync("settings.update", "Changed platform setting", null, null,
@@ -672,7 +668,7 @@ public static partial class ConfigEndpoints
     {
         await using var control = catalog.Control();
         return Results.Ok(await control.QueryAsync(new CommandDefinition(
-            "SELECT RuleKey AS [key], Label AS label, Channel AS channel, IsOn AS [on] FROM ctl.NotificationRule ORDER BY SortOrder;",
+            "SELECT RuleKey AS \"key\", Label AS \"label\", Channel AS \"channel\", IsOn AS \"on\" FROM ctl.NotificationRule ORDER BY SortOrder;",
             cancellationToken: ct)));
     }
 
@@ -684,7 +680,7 @@ public static partial class ConfigEndpoints
         {
             changed += await control.ExecuteAsync(new CommandDefinition(
                 """
-                UPDATE ctl.NotificationRule SET IsOn = @On, Channel = ISNULL(@Channel, Channel)
+                UPDATE ctl.NotificationRule SET IsOn = @On, Channel = COALESCE(@Channel, Channel)
                 WHERE RuleKey = @Key AND (IsOn <> @On OR (@Channel IS NOT NULL AND Channel <> @Channel));
                 """, new { rule.Key, rule.On, rule.Channel }, cancellationToken: ct));
         }
@@ -698,9 +694,9 @@ public static partial class ConfigEndpoints
         await using var control = catalog.Control();
         return Results.Ok(await control.QueryAsync(new CommandDefinition(
             """
-            SELECT AdminId AS id, Name AS name, Mobile AS mobile, Email AS email, Role AS role,
-                   ISNULL(Permissions, N'Everything') AS permissions, LastLoginAtUtc AS lastLogin, Status AS status,
-                   MustChangePassword AS mustChangePassword
+            SELECT AdminId AS "id", Name AS "name", Mobile AS "mobile", Email AS "email", Role AS "role",
+                   COALESCE(Permissions, 'Everything') AS "permissions", LastLoginAtUtc AS "lastLogin", Status AS "status",
+                   MustChangePassword AS "mustChangePassword"
             FROM ctl.Admin ORDER BY CreatedAtUtc;
             """, cancellationToken: ct)));
     }
@@ -723,7 +719,7 @@ public static partial class ConfigEndpoints
         await control.ExecuteAsync(new CommandDefinition(
             """
             INSERT INTO ctl.Admin (AdminId, Name, Mobile, Email, Role, Permissions, PasswordHash, PasswordSalt, MustChangePassword)
-            VALUES (@Id, @Name, @Mobile, @Email, ISNULL(@Role, N'Operations'), @Permissions, @Hash, @Salt, 1);
+            VALUES (@Id, @Name, @Mobile, @Email, COALESCE(@Role, 'Operations'), @Permissions, @Hash, @Salt, true);
             """,
             new { Id = id, Name = request.Name.Trim(), Mobile = request.Mobile.Trim(), request.Email, request.Role, request.Permissions, Hash = hash, Salt = salt },
             cancellationToken: ct));
@@ -751,7 +747,7 @@ public static partial class ConfigEndpoints
         var affected = await control.ExecuteAsync(new CommandDefinition(
             """
             UPDATE ctl.Admin
-            SET PasswordHash = @Hash, PasswordSalt = @Salt, MustChangePassword = 1,
+            SET PasswordHash = @Hash, PasswordSalt = @Salt, MustChangePassword = true,
                 SessionVersion = SessionVersion + 1, FailedLogins = 0, LockedUntilUtc = NULL
             WHERE AdminId = @Id;
             """, new { Hash = hash, Salt = salt, Id = id }, cancellationToken: ct));

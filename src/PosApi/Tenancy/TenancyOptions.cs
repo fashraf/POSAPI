@@ -1,4 +1,4 @@
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using Microsoft.Extensions.Options;
 
 namespace PosApi.Tenancy;
@@ -16,18 +16,18 @@ public sealed class TenancyOptions
 {
     public const string SectionName = "Tenancy";
 
-    /// <summary>Catalog name of the control database.</summary>
-    public string ControlDatabase { get; init; } = "POSCONTROL";
+    /// <summary>Name of the control database.</summary>
+    public string ControlDatabase { get; init; } = "poscontrol";
 
-    /// <summary>New tenant databases are named prefix + tenant number, e.g. POS_CL00002.</summary>
-    public string TenantDatabasePrefix { get; init; } = "POS_";
+    /// <summary>New tenant databases are named prefix + tenant number, e.g. pos_cl00002.</summary>
+    public string TenantDatabasePrefix { get; init; } = "pos_";
 
     /// <summary>
-    /// An existing single-tenant database to register as the first tenant
-    /// when the control database has none — the POSMAIN that existed before
-    /// tenancy. Blank to skip.
+    /// A database built by apply-migrations to register as the first tenant
+    /// when the control database does not know it yet — posmain, the demo or
+    /// single-business install. Blank to skip.
     /// </summary>
-    public string AdoptDatabase { get; init; } = "POSMAIN";
+    public string AdoptDatabase { get; init; } = "posmain";
 
     /// <summary>Folder of tenant migrations; blank finds db-migrations/ beside the app.</summary>
     public string? TenantMigrationsPath { get; init; }
@@ -50,8 +50,17 @@ public sealed class TenancyOptions
 ///
 /// ConnectionStrings:Control and ConnectionStrings:TenantServer may be set
 /// explicitly. When they are not, both are derived from ConnectionStrings:PosMain
-/// — the same server with a different catalog — so an existing deployment
-/// keeps working without a configuration change.
+/// — the same server with a different database — so one setting is enough.
+///
+/// Database names are lower case throughout. PostgreSQL folds an unquoted name
+/// to lower case when it creates a database, but matches the name in a
+/// connection string exactly: POS_CL00002 would be created as pos_cl00002 and
+/// then not found.
+///
+/// Every connection asks for two things the code relies on: the session time
+/// zone is UTC, so a UTC DateTime parameter lands in a timestamp column
+/// unchanged; and error details are included, because a database function's
+/// refusal carries its number there (DbErrors).
 /// </summary>
 public sealed class TenancyConnections
 {
@@ -64,19 +73,16 @@ public sealed class TenancyConnections
         var baseline = configuration.GetConnectionString("TenantServer")
                        ?? configuration.GetConnectionString("PosMain")
                        ?? throw new InvalidOperationException(
-                           "Set ConnectionStrings:TenantServer (or PosMain): the SQL Server that holds the tenant databases.");
+                           "Set ConnectionStrings:TenantServer (or PosMain): the PostgreSQL server that holds the tenant databases.");
 
-        _server = new SqlConnectionStringBuilder(baseline) { InitialCatalog = "master" }.ConnectionString;
+        _server = Build(baseline, "postgres", "NazadPosApi");
 
-        Control = configuration.GetConnectionString("Control")
-                  ?? new SqlConnectionStringBuilder(baseline)
-                  {
-                      InitialCatalog = tenancy.ControlDatabase,
-                      ApplicationName = "NazadPosControl"
-                  }.ConnectionString;
+        Control = configuration.GetConnectionString("Control") is { } control
+            ? Build(control, new NpgsqlConnectionStringBuilder(control).Database ?? tenancy.ControlDatabase, "NazadPosControl")
+            : Build(baseline, tenancy.ControlDatabase, "NazadPosControl");
 
-        ControlDatabase = new SqlConnectionStringBuilder(Control).InitialCatalog;
-        ControlServer = new SqlConnectionStringBuilder(Control) { InitialCatalog = "master" }.ConnectionString;
+        ControlDatabase = new NpgsqlConnectionStringBuilder(Control).Database!;
+        ControlServer = Build(Control, "postgres", "NazadPosControl");
     }
 
     /// <summary>The control database.</summary>
@@ -84,17 +90,21 @@ public sealed class TenancyConnections
 
     public string ControlDatabase { get; }
 
-    /// <summary>The control database's server, connected to master (to create it).</summary>
+    /// <summary>The control database's server, connected to the postgres database (to create it).</summary>
     public string ControlServer { get; }
 
-    /// <summary>The tenant server, connected to master (to create tenant databases).</summary>
+    /// <summary>The tenant server, connected to the postgres database (to create tenant databases).</summary>
     public string TenantServer => _server;
 
     /// <summary>A tenant's own database.</summary>
-    public string ForTenant(string databaseName) =>
-        new SqlConnectionStringBuilder(_server)
+    public string ForTenant(string databaseName) => Build(_server, databaseName, "NazadPosApi");
+
+    private static string Build(string connection, string database, string application) =>
+        new NpgsqlConnectionStringBuilder(connection)
         {
-            InitialCatalog = databaseName,
-            ApplicationName = "NazadPosApi"
+            Database = database.ToLowerInvariant(),
+            ApplicationName = application,
+            Timezone = "UTC",
+            IncludeErrorDetail = true
         }.ConnectionString;
 }

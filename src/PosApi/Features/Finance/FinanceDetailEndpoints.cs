@@ -1,6 +1,5 @@
-using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -195,21 +194,21 @@ public static class FinanceDetailEndpoints
 
         var rows = await connection.QueryAsync<CommissionRow>(new CommandDefinition(
             """
-            SELECT TOP (2000)
-                   e.CommissionId, e.SaleId, e.InvoiceNumber, e.UserId, u.NameAr AS UserNameAr, u.NameEn AS UserNameEn,
+            SELECT e.CommissionId, e.SaleId, e.InvoiceNumber, e.UserId, u.NameAr AS UserNameAr, u.NameEn AS UserNameEn,
                    e.ItemId, e.ItemNameAr, e.ItemNameEn, e.LineGrossH, e.AmountH, e.Basis, e.RateAtSale,
-                   e.BranchId, e.EarnedAtUtc, CONVERT(CHAR(7), e.EarnedAtUtc, 126) AS PeriodMonth,
+                   e.BranchId, e.EarnedAtUtc, to_char(e.EarnedAtUtc, 'YYYY-MM') AS PeriodMonth,
                    e.PayrollRunId, s.Status AS SaleStatus
             FROM fin.CommissionEntry AS e
             JOIN core.AppUser AS u ON u.UserId = e.UserId
             JOIN sales.Sale AS s ON s.SaleId = e.SaleId
             WHERE (@UserId IS NULL OR e.UserId = @UserId)
-              AND (@Month IS NULL OR CONVERT(CHAR(7), e.EarnedAtUtc, 126) = @Month)
+              AND (@Month IS NULL OR to_char(e.EarnedAtUtc, 'YYYY-MM') = @Month)
               AND (@SaleId IS NULL OR e.SaleId = @SaleId)
               AND (@BranchId IS NULL OR e.BranchId = @BranchId)
-              AND (@Paid IS NULL OR (@Paid = 1 AND e.PayrollRunId IS NOT NULL)
-                                 OR (@Paid = 0 AND e.PayrollRunId IS NULL))
-            ORDER BY e.EarnedAtUtc DESC;
+              AND (@Paid::boolean IS NULL OR (@Paid::boolean AND e.PayrollRunId IS NOT NULL)
+                                          OR (NOT @Paid::boolean AND e.PayrollRunId IS NULL))
+            ORDER BY e.EarnedAtUtc DESC
+            LIMIT 2000;
             """,
             new
             {
@@ -262,34 +261,38 @@ public static class FinanceDetailEndpoints
         if (negative.Field is not null)
             return ProcErrors.Field(negative.Field, "Opening balances cannot be negative.", "لا يمكن أن تكون الأرصدة الافتتاحية سالبة.");
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@BranchId", branch);
-        parameters.Add("@AsOf", request.AsOf);
-        parameters.Add("@CashH", request.CashH);
-        parameters.Add("@BankH", request.BankH);
-        parameters.Add("@InventoryH", request.InventoryH);
-        parameters.Add("@ReceivablesH", request.ReceivablesH);
-        parameters.Add("@PayablesH", request.PayablesH);
-        parameters.Add("@VatH", request.VatH);
-        parameters.Add("@Note", ProcErrors.Blank(request.Note));
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@OpeningId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-        parameters.Add("@EntryId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string openingId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_PostOpeningBalances", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            (openingId, _) = await connection.QuerySingleAsync<(string OpeningId, string EntryId)>(new CommandDefinition(
+                """
+                SELECT OpeningId, EntryId FROM fin.usp_PostOpeningBalances(
+                    p_BranchId => @BranchId, p_AsOf => @AsOf::date, p_CashH => @CashH, p_BankH => @BankH,
+                    p_InventoryH => @InventoryH, p_ReceivablesH => @ReceivablesH, p_PayablesH => @PayablesH,
+                    p_VatH => @VatH, p_Note => @Note, p_Actor => @Actor);
+                """,
+                new
+                {
+                    BranchId = branch,
+                    request.AsOf,
+                    request.CashH,
+                    request.BankH,
+                    request.InventoryH,
+                    request.ReceivablesH,
+                    request.PayablesH,
+                    request.VatH,
+                    Note = ProcErrors.Blank(request.Note),
+                    Actor = current.Username
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapOpeningError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapOpeningError(ex) is { } mapped)
         {
             return mapped;
         }
-
-        var openingId = parameters.Get<string>("@OpeningId");
 
         logger.LogInformation("Opening balances {OpeningId} posted for {Scope} by {Actor}.",
             openingId, branch ?? "business", current.Username);
@@ -298,7 +301,7 @@ public static class FinanceDetailEndpoints
         return Results.Created("/api/finance/opening-balances", await LoadOpeningAsync(connection, branch, ct));
     }
 
-    private static IResult? MapOpeningError(SqlException ex) => ex.Number switch
+    private static IResult? MapOpeningError(PostgresException ex) => ex.ErrorNumber() switch
     {
         70000 => ProcErrors.Conflict("already_posted",
             "Opening balances have already been posted. Reverse the entry in the ledger to correct them.",
@@ -312,7 +315,7 @@ public static class FinanceDetailEndpoints
     };
 
     private static async Task<OpeningBalancesResponse> LoadOpeningAsync(
-        SqlConnection connection, string? branchId, CancellationToken ct)
+        NpgsqlConnection connection, string? branchId, CancellationToken ct)
     {
         var rows = (await connection.QueryAsync<OpeningRow>(new CommandDefinition(
             """
@@ -321,7 +324,7 @@ public static class FinanceDetailEndpoints
                    o.Note, o.PostedAtUtc, o.PostedBy
             FROM fin.OpeningBalance AS o
             JOIN fin.JournalEntry AS e ON e.EntryId = o.EntryId
-            WHERE ISNULL(o.BranchId, N'') = ISNULL(@BranchId, N'')
+            WHERE COALESCE(o.BranchId, '') = COALESCE(@BranchId, '')
             ORDER BY o.PostedAtUtc DESC;
             """,
             new { BranchId = branchId }, cancellationToken: ct))).ToList();

@@ -1,6 +1,6 @@
 using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using Microsoft.Extensions.Options;
@@ -459,7 +459,7 @@ public static class AuthEndpoints
             INSERT INTO core.RefreshToken (TokenHash, UserId, ExpiresAtUtc)
             VALUES (@TokenHash, @UserId, @ExpiresAtUtc);
 
-            UPDATE core.AppUser SET LastLoginAtUtc = SYSUTCDATETIME() WHERE UserId = @UserId;
+            UPDATE core.AppUser SET LastLoginAtUtc = now() AT TIME ZONE 'utc' WHERE UserId = @UserId;
             """,
             new
             {
@@ -521,7 +521,7 @@ public static class AuthEndpoints
             SELECT UserId FROM core.RefreshToken
             WHERE TokenHash = @Hash
               AND RevokedAtUtc IS NULL
-              AND ExpiresAtUtc > SYSUTCDATETIME();
+              AND ExpiresAtUtc > now() AT TIME ZONE 'utc';
             """,
             new { Hash = hash },
             cancellationToken: ct));
@@ -551,7 +551,7 @@ public static class AuthEndpoints
         // stolen refresh token is usable at most once before it stops working.
         await connection.ExecuteAsync(new CommandDefinition(
             """
-            UPDATE core.RefreshToken SET RevokedAtUtc = SYSUTCDATETIME() WHERE TokenHash = @OldHash;
+            UPDATE core.RefreshToken SET RevokedAtUtc = now() AT TIME ZONE 'utc' WHERE TokenHash = @OldHash;
 
             INSERT INTO core.RefreshToken (TokenHash, UserId, ExpiresAtUtc)
             VALUES (@NewHash, @UserId, @ExpiresAtUtc);
@@ -580,7 +580,7 @@ public static class AuthEndpoints
         await using var connection = db.Create();
 
         await connection.ExecuteAsync(new CommandDefinition(
-            "UPDATE core.RefreshToken SET RevokedAtUtc = SYSUTCDATETIME() WHERE TokenHash = @Hash;",
+            "UPDATE core.RefreshToken SET RevokedAtUtc = now() AT TIME ZONE 'utc' WHERE TokenHash = @Hash;",
             new { Hash = tokens.HashRefreshToken(request.RefreshToken) },
             cancellationToken: ct));
 

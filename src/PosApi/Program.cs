@@ -173,8 +173,8 @@ try
 
     /*-------------------------------------------------------------- services */
 
-    /* Dapper cannot pass DateOnly to SQL Server unaided — see the handlers.
-       Registered before anything can run a query. */
+    /* How DateTime, DateOnly and TimeOnly cross to PostgreSQL — see the
+       handlers. Set before anything can run a query. */
     DapperConfiguration.Configure();
 
     builder.Services.AddHttpContextAccessor();
@@ -379,6 +379,9 @@ try
 
     /* The control database before the first request: every sign-in needs it. */
     await app.Services.GetRequiredService<ControlDatabaseInitializer>().InitializeAsync(CancellationToken.None);
+
+    /* Column names as written, for untyped rows — see DbRows. */
+    PosApi.Data.DbRows.LearnFolder(app.Services.GetRequiredService<TenantProvisioner>().MigrationsFolder);
 
     /*------------------------------------------------------------- pipeline */
 

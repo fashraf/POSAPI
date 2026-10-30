@@ -1,6 +1,5 @@
-using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -87,27 +86,27 @@ public static class CustomerEndpoints
         await using var connection = db.Create();
 
         const string sql = """
-            SELECT COUNT(*) FROM core.Customer
+            SELECT COUNT(*)::int FROM core.Customer
             WHERE (@Search IS NULL
-                   OR NameAr LIKE N'%' + @Search + N'%'
-                   OR NameEn LIKE N'%' + @Search + N'%'
-                   OR Phone  LIKE N'%' + @Search + N'%')
-              AND (@OwingOnly = 0 OR BalanceH > 0);
+                   OR NameAr COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR NameEn COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR Phone  COLLATE "default" ILIKE '%' || @Search || '%')
+              AND (NOT @OwingOnly OR BalanceH > 0);
 
             SELECT CustomerId, NameAr, NameEn, Phone, Email, VatNumber,
                    CustomerType, CreditLimitH, BalanceH, IsActive,
                    CreatedAtUtc, UpdatedAtUtc
             FROM core.Customer
             WHERE (@Search IS NULL
-                   OR NameAr LIKE N'%' + @Search + N'%'
-                   OR NameEn LIKE N'%' + @Search + N'%'
-                   OR Phone  LIKE N'%' + @Search + N'%')
-              AND (@OwingOnly = 0 OR BalanceH > 0)
+                   OR NameAr COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR NameEn COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR Phone  COLLATE "default" ILIKE '%' || @Search || '%')
+              AND (NOT @OwingOnly OR BalanceH > 0)
             ORDER BY NameEn
             OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY;
             """;
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(sql,
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(sql,
             new
             {
                 Search = string.IsNullOrWhiteSpace(search) ? null : search.Trim(),
@@ -118,7 +117,7 @@ public static class CustomerEndpoints
             cancellationToken: ct));
 
         var total = await multi.ReadSingleAsync<int>();
-        var rows = (await multi.ReadAsync()).ToList();
+        var rows = (await multi.ReadRowsAsync()).ToList();
 
         return Results.Ok(new PagedResult<object>
         {
@@ -134,7 +133,7 @@ public static class CustomerEndpoints
     {
         await using var connection = db.Create();
 
-        var customer = await connection.QuerySingleOrDefaultAsync(new CommandDefinition(
+        var customer = await connection.QuerySingleRowOrDefaultAsync(new CommandDefinition(
             "SELECT * FROM core.Customer WHERE CustomerId = @CustomerId;",
             new { CustomerId = customerId }, cancellationToken: ct));
 
@@ -180,13 +179,13 @@ public static class CustomerEndpoints
                     e.EntryId       AS Id,
                     e.Reference     AS Reference,
                     e.PostedAtUtc   AS OccurredAtUtc,
-                    CASE WHEN e.ReversesEntryId IS NULL THEN N'opening_balance'
-                         ELSE N'opening_reversed' END AS Kind,
-                    SUM(l.DebitH - l.CreditH) AS AmountH,
+                    CASE WHEN e.ReversesEntryId IS NULL THEN 'opening_balance'
+                         ELSE 'opening_reversed' END AS Kind,
+                    SUM(l.DebitH - l.CreditH)::bigint AS AmountH,
                     0               AS SortOrder
                 FROM fin.JournalEntry AS e
-                JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId AND l.AccountCode = N'1400'
-                WHERE e.Kind = N'customer_opening' AND e.SourceReference = @CustomerId
+                JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId AND l.AccountCode = '1400'
+                WHERE e.Kind = 'customer_opening' AND e.SourceReference = @CustomerId
                 GROUP BY e.EntryId, e.Reference, e.PostedAtUtc, e.ReversesEntryId
 
                 UNION ALL
@@ -195,13 +194,13 @@ public static class CustomerEndpoints
                     s.SaleId        AS Id,
                     s.InvoiceNumber AS Reference,
                     s.SoldAtUtc     AS OccurredAtUtc,
-                    N'credit_sale'  AS Kind,
-                    SUM(p.AmountH)  AS AmountH,
+                    'credit_sale'   AS Kind,
+                    SUM(p.AmountH)::bigint AS AmountH,
                     1               AS SortOrder
                 FROM sales.Sale AS s
                 JOIN sales.SalePayment AS p
-                     ON p.SaleId = s.SaleId AND p.Method = N'credit'
-                WHERE s.CustomerId = @CustomerId AND s.Status <> N'voided'
+                     ON p.SaleId = s.SaleId AND p.Method = 'credit'
+                WHERE s.CustomerId = @CustomerId AND s.Status <> 'voided'
                 GROUP BY s.SaleId, s.InvoiceNumber, s.SoldAtUtc
 
                 UNION ALL
@@ -212,14 +211,14 @@ public static class CustomerEndpoints
                     e.EntryId       AS Id,
                     e.Reference     AS Reference,
                     e.PostedAtUtc   AS OccurredAtUtc,
-                    CASE WHEN e.ReversesEntryId IS NULL THEN N'collection'
-                         ELSE N'collection_reversed' END AS Kind,
-                    SUM(l.DebitH - l.CreditH) AS AmountH,
+                    CASE WHEN e.ReversesEntryId IS NULL THEN 'collection'
+                         ELSE 'collection_reversed' END AS Kind,
+                    SUM(l.DebitH - l.CreditH)::bigint AS AmountH,
                     3               AS SortOrder
                 FROM fin.JournalEntry AS e
                 JOIN fin.JournalLine  AS l
-                     ON l.EntryId = e.EntryId AND l.AccountCode = N'1400'
-                WHERE e.Kind = N'customer_collection'
+                     ON l.EntryId = e.EntryId AND l.AccountCode = '1400'
+                WHERE e.Kind = 'customer_collection'
                   AND e.SourceReference = @CustomerId
                 GROUP BY e.EntryId, e.Reference, e.PostedAtUtc, e.ReversesEntryId
 
@@ -230,11 +229,11 @@ public static class CustomerEndpoints
                     r.ReturnId      AS Id,
                     r.NoteNumber    AS Reference,
                     r.ReturnedAtUtc AS OccurredAtUtc,
-                    N'credit_note'  AS Kind,
+                    'credit_note'   AS Kind,
                     -r.RefundH      AS AmountH,
                     2               AS SortOrder
                 FROM sales.SaleReturn AS r
-                WHERE r.CustomerId = @CustomerId AND r.RefundMethod = N'credit' AND r.RefundH > 0
+                WHERE r.CustomerId = @CustomerId AND r.RefundMethod = 'credit' AND r.RefundH > 0
             ) AS m
             WHERE AmountH <> 0
             ORDER BY OccurredAtUtc, SortOrder, Reference;
@@ -322,38 +321,44 @@ public static class CustomerEndpoints
         var branchId = ProcErrors.Blank(input.BranchId);
         if (branchId is not null && !current.CanSeeBranch(branchId)) return Results.Forbid();
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@NameAr", input.NameAr.Trim());
-        parameters.Add("@NameEn", input.NameEn.Trim());
-        parameters.Add("@Phone", ProcErrors.Blank(input.Phone));
-        parameters.Add("@Email", ProcErrors.Blank(input.Email));
-        parameters.Add("@VatNumber", ProcErrors.Blank(input.VatNumber));
-        parameters.Add("@CustomerType", ProcErrors.Blank(input.CustomerType));
-        parameters.Add("@CreditLimitH", input.CreditLimitH);
-        parameters.Add("@OpeningBalanceH", input.OpeningBalanceH);
-        parameters.Add("@OpeningAsOf", input.OpeningAsOf);
-        parameters.Add("@BranchId", branchId);
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@CustomerId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-        parameters.Add("@EntryId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string customerId;
+        string? openingEntryId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_CreateCustomer", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            (customerId, openingEntryId) = await connection.QuerySingleAsync<(string, string?)>(new CommandDefinition(
+                """
+                SELECT CustomerId, EntryId FROM core.usp_CreateCustomer(
+                    p_NameAr => @NameAr, p_NameEn => @NameEn, p_Phone => @Phone, p_Email => @Email,
+                    p_VatNumber => @VatNumber, p_CustomerType => @CustomerType,
+                    p_CreditLimitH => @CreditLimitH, p_OpeningBalanceH => @OpeningBalanceH,
+                    p_OpeningAsOf => @OpeningAsOf::date, p_BranchId => @BranchId, p_Actor => @Actor);
+                """,
+                new
+                {
+                    NameAr = input.NameAr.Trim(),
+                    NameEn = input.NameEn.Trim(),
+                    Phone = ProcErrors.Blank(input.Phone),
+                    Email = ProcErrors.Blank(input.Email),
+                    VatNumber = ProcErrors.Blank(input.VatNumber),
+                    CustomerType = ProcErrors.Blank(input.CustomerType),
+                    input.CreditLimitH,
+                    input.OpeningBalanceH,
+                    input.OpeningAsOf,
+                    BranchId = branchId,
+                    Actor = current.Username
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapCustomerError(ex.Number, input.NameAr) is { } mapped)
+        catch (PostgresException ex) when (MapCustomerError(ex.ErrorNumber(), input.NameAr) is { } mapped)
         {
             return mapped;
         }
 
-        var customerId = parameters.Get<string>("@CustomerId");
-
         return Results.Created($"/api/customers/{customerId}",
-            new { customerId, openingEntryId = parameters.Get<string?>("@EntryId") });
+            new { customerId, openingEntryId });
     }
 
     /// <summary>
@@ -405,32 +410,36 @@ public static class CustomerEndpoints
         ICurrentUser current,
         CancellationToken ct)
     {
-        var parameters = new DynamicParameters();
-        parameters.Add("@CustomerId", customerId);
-        parameters.Add("@AmountH", request.AmountH);
-        parameters.Add("@Method", request.Method);
-        parameters.Add("@Reference", request.Reference);
-        parameters.Add("@BranchId", request.BranchId);
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@EntryId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string entryId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_RecordCustomerCollection",
-                parameters,
-                commandType: CommandType.StoredProcedure,
+            entryId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT EntryId FROM fin.usp_RecordCustomerCollection(
+                    p_CustomerId => @CustomerId, p_AmountH => @AmountH, p_Method => @Method,
+                    p_Reference => @Reference, p_BranchId => @BranchId, p_Actor => @Actor);
+                """,
+                new
+                {
+                    CustomerId = customerId,
+                    request.AmountH,
+                    request.Method,
+                    request.Reference,
+                    request.BranchId,
+                    Actor = current.Username
+                },
                 cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 52000 && ex.Number < 53000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 52000 && ex.ErrorNumber() < 53000)
         {
-            return Results.Json(SalesEndpoints.Translate(ex.Number, ex.Message),
+            return Results.Json(SalesEndpoints.Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 
-        return Results.Ok(new { entryId = parameters.Get<string>("@EntryId") });
+        return Results.Ok(new { entryId });
     }
 
     /// <summary>
@@ -443,16 +452,16 @@ public static class CustomerEndpoints
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             $"""
-            SELECT r.*, ISNULL(c.CollectedH, 0) AS CollectedH
+            SELECT r.*, COALESCE(c.CollectedH, 0) AS CollectedH
             FROM fin.vw_Receivables AS r
-            OUTER APPLY (
-                SELECT SUM(l.CreditH) AS CollectedH
+            LEFT JOIN LATERAL (
+                SELECT SUM(l.CreditH)::bigint AS CollectedH
                 FROM fin.JournalEntry AS e
-                JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId AND l.AccountCode = N'1400'
+                JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId AND l.AccountCode = '1400'
                 WHERE {CollectionFilter} AND e.SourceReference = r.CustomerId
-            ) AS c
+            ) AS c ON true
             ORDER BY r.AgeDays DESC;
             """,
             cancellationToken: ct));
@@ -462,7 +471,7 @@ public static class CustomerEndpoints
 
     /* A collection that stands: neither reversed nor itself a reversal. */
     private const string CollectionFilter =
-        "e.Kind = N'customer_collection' AND e.ReversesEntryId IS NULL AND e.ReversedByEntryId IS NULL";
+        "e.Kind = 'customer_collection' AND e.ReversesEntryId IS NULL AND e.ReversedByEntryId IS NULL";
 
     /// <summary>
     /// The receivables cards. <c>collectedH</c> covers <c>from</c>..<c>to</c>
@@ -473,22 +482,22 @@ public static class CustomerEndpoints
     {
         await using var connection = db.Create();
 
-        var row = await connection.QuerySingleAsync(new CommandDefinition(
+        var row = await connection.QuerySingleRowAsync(new CommandDefinition(
             $"""
             SELECT
-                ISNULL((SELECT SUM(BalanceH) FROM core.Customer WHERE BalanceH > 0), 0) AS OutstandingH,
-                (SELECT COUNT(*) FROM core.Customer WHERE BalanceH > 0) AS WithBalance,
-                (SELECT COUNT(*) FROM core.Customer WHERE BalanceH > 0 AND BalanceH > CreditLimitH) AS OverLimit,
-                ISNULL((SELECT SUM(l.CreditH)
-                        FROM fin.JournalEntry AS e
-                        JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId AND l.AccountCode = N'1400'
-                        WHERE {CollectionFilter}
-                          AND (@From IS NULL OR CAST(e.PostedAtUtc AS DATE) >= @From)
-                          AND (@To   IS NULL OR CAST(e.PostedAtUtc AS DATE) <= @To)), 0) AS CollectedH,
-                (SELECT COUNT(*) FROM fin.JournalEntry AS e
+                COALESCE((SELECT SUM(BalanceH) FROM core.Customer WHERE BalanceH > 0), 0)::bigint AS OutstandingH,
+                (SELECT COUNT(*)::int FROM core.Customer WHERE BalanceH > 0) AS WithBalance,
+                (SELECT COUNT(*)::int FROM core.Customer WHERE BalanceH > 0 AND BalanceH > CreditLimitH) AS OverLimit,
+                COALESCE((SELECT SUM(l.CreditH)
+                          FROM fin.JournalEntry AS e
+                          JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId AND l.AccountCode = '1400'
+                          WHERE {CollectionFilter}
+                            AND (@From IS NULL OR e.PostedAtUtc::date >= @From)
+                            AND (@To   IS NULL OR e.PostedAtUtc::date <= @To)), 0)::bigint AS CollectedH,
+                (SELECT COUNT(*)::int FROM fin.JournalEntry AS e
                  WHERE {CollectionFilter}
-                   AND (@From IS NULL OR CAST(e.PostedAtUtc AS DATE) >= @From)
-                   AND (@To   IS NULL OR CAST(e.PostedAtUtc AS DATE) <= @To)) AS CollectionCount;
+                   AND (@From IS NULL OR e.PostedAtUtc::date >= @From)
+                   AND (@To   IS NULL OR e.PostedAtUtc::date <= @To)) AS CollectionCount;
             """,
             new { From = from, To = to }, cancellationToken: ct));
 
@@ -525,7 +534,13 @@ public static class CustomerEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_UpdateCustomer",
+                """
+                SELECT core.usp_UpdateCustomer(
+                    p_CustomerId => @CustomerId, p_NameAr => @NameAr, p_NameEn => @NameEn,
+                    p_Phone => @Phone, p_Email => @Email, p_VatNumber => @VatNumber,
+                    p_CustomerType => @CustomerType, p_CreditLimitH => @CreditLimitH,
+                    p_IsActive => @IsActive, p_Actor => @Actor);
+                """,
                 new
                 {
                     CustomerId = customerId,
@@ -539,9 +554,9 @@ public static class CustomerEndpoints
                     IsActive = request.Status is null ? (bool?)null : request.Status == "active",
                     Actor = current.Username
                 },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapUpdateError(ex, request) is { } mapped)
+        catch (PostgresException ex) when (MapUpdateError(ex, request) is { } mapped)
         {
             return mapped;
         }
@@ -549,14 +564,14 @@ public static class CustomerEndpoints
         logger.LogInformation("Customer {CustomerId} updated by {Actor}.", customerId, current.Username);
         http.Items["AuditEntityId"] = customerId;
 
-        var customer = await connection.QuerySingleAsync(new CommandDefinition(
+        var customer = await connection.QuerySingleRowAsync(new CommandDefinition(
             "SELECT * FROM core.Customer WHERE CustomerId = @CustomerId;",
             new { CustomerId = customerId }, cancellationToken: ct));
 
         return Results.Ok(customer);
     }
 
-    private static IResult? MapUpdateError(SqlException ex, UpdateCustomerRequest request) => ex.Number switch
+    private static IResult? MapUpdateError(PostgresException ex, UpdateCustomerRequest request) => ex.ErrorNumber() switch
     {
         68000 => ProcErrors.Field(string.IsNullOrWhiteSpace(request.NameAr) ? "nameAr" : "nameEn",
             "Both the Arabic and English name are required.", "الاسم بالعربية والإنجليزية مطلوبان."),

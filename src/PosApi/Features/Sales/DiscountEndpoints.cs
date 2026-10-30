@@ -1,6 +1,5 @@
-using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -163,22 +162,33 @@ public static class DiscountEndpoints
         parameters.Add("@StartsOn", request.StartsAt is { } s ? DateOnly.FromDateTime(s) : (DateOnly?)null);
         parameters.Add("@EndsOn", request.EndsAt is { } e ? DateOnly.FromDateTime(e) : (DateOnly?)null);
         parameters.Add("@IsActive", request.Status != "inactive");
-        parameters.Add("@SavedId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
 
         await using var connection = db.Create();
 
+        string savedId;
+
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "sales.usp_SaveDiscount", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            /* The casts type the parameters that may be null, which reach
+               PostgreSQL without a type of their own. */
+            savedId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT SavedId FROM sales.usp_SaveDiscount(
+                    p_DiscountId => @DiscountId::text, p_NameAr => @NameAr::text, p_NameEn => @NameEn::text,
+                    p_Description => @Description::text, p_DiscountType => @DiscountType::text,
+                    p_Value => @Value, p_MaxDiscountH => @MaxDiscountH::bigint,
+                    p_MinSubtotalH => @MinSubtotalH, p_ApprovalAboveH => @ApprovalAboveH::bigint,
+                    p_AppliesTo => @AppliesTo, p_AppliesToIds => @AppliesToIds, p_BranchIds => @BranchIds,
+                    p_RoleIds => @RoleIds, p_IsAutomatic => @IsAutomatic, p_AllowStacking => @AllowStacking,
+                    p_ActiveDays => @ActiveDays, p_StartsOn => @StartsOn::date, p_EndsOn => @EndsOn::date,
+                    p_IsActive => @IsActive);
+                """,
+                parameters, cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapError(ex, request) is { } mapped)
+        catch (PostgresException ex) when (MapError(ex, request) is { } mapped)
         {
             return mapped;
         }
-
-        var savedId = parameters.Get<string>("@SavedId");
 
         logger.LogInformation("Discount {DiscountId} {Action} by {Actor}.",
             savedId, discountId is null ? "created" : "updated", current.Username);
@@ -205,10 +215,10 @@ public static class DiscountEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "sales.usp_DeleteDiscount", new { DiscountId = discountId },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                "SELECT sales.usp_DeleteDiscount(p_DiscountId => @DiscountId);", new { DiscountId = discountId },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapError(ex, null) is { } mapped)
+        catch (PostgresException ex) when (MapError(ex, null) is { } mapped)
         {
             return mapped;
         }
@@ -222,7 +232,7 @@ public static class DiscountEndpoints
     private static IResult NotFound() =>
         ProcErrors.NotFound("No such discount.", "لا يوجد خصم بهذا المعرف.");
 
-    private static IResult? MapError(SqlException ex, SaveDiscountRequest? request) => ex.Number switch
+    private static IResult? MapError(PostgresException ex, SaveDiscountRequest? request) => ex.ErrorNumber() switch
     {
         63015 => NotFound(),
         63016 => ProcErrors.Conflict("discount_in_use",
@@ -252,7 +262,7 @@ public static class DiscountEndpoints
     };
 
     private static async Task<List<DiscountDto>> LoadAsync(
-        SqlConnection connection, string? discountId, ILanguageContext language, CancellationToken ct)
+        NpgsqlConnection connection, string? discountId, ILanguageContext language, CancellationToken ct)
     {
         await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
             """

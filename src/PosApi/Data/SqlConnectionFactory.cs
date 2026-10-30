@@ -1,12 +1,12 @@
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Tenancy;
 
 namespace PosApi.Data;
 
 public interface ISqlConnectionFactory
 {
-    SqlConnection Create();
-    Task<SqlConnection> CreateOpenAsync(CancellationToken ct);
+    NpgsqlConnection Create();
+    Task<NpgsqlConnection> CreateOpenAsync(CancellationToken ct);
 }
 
 /// <summary>
@@ -18,8 +18,8 @@ public interface ISqlConnectionFactory
 /// tenant gets an exception rather than somebody else's data.
 ///
 /// Dapper rather than an ORM: the schema already enforces the rules that matter
-/// through constraints and stored procedures, and an ORM that generates its own
-/// SQL would route around them. Every query here is parameterised — string
+/// through constraints and database functions, and an ORM that generates its
+/// own SQL would route around them. Every query here is parameterised — string
 /// concatenation into SQL is how injection happens, and there is no case in
 /// this codebase where it is warranted.
 /// </summary>
@@ -29,11 +29,11 @@ public sealed class SqlConnectionFactory : ISqlConnectionFactory
 
     public SqlConnectionFactory(ITenantContext tenant) => _tenant = tenant;
 
-    public SqlConnection Create() => new(_tenant.ConnectionString);
+    public NpgsqlConnection Create() => new(_tenant.ConnectionString);
 
-    public async Task<SqlConnection> CreateOpenAsync(CancellationToken ct)
+    public async Task<NpgsqlConnection> CreateOpenAsync(CancellationToken ct)
     {
-        var connection = new SqlConnection(_tenant.ConnectionString);
+        var connection = new NpgsqlConnection(_tenant.ConnectionString);
         await connection.OpenAsync(ct);
         return connection;
     }

@@ -49,7 +49,7 @@ public static class BillingEndpoints
                    COALESCE(c.Branches, p.Branches) AS Branches
             FROM ctl.Subscription AS s
             JOIN ctl.Tenant AS t ON t.TenantId = s.TenantId
-            JOIN ctl.[Plan] AS p ON p.PlanKey = s.PlanKey
+            JOIN ctl.Plan AS p ON p.PlanKey = s.PlanKey
             LEFT JOIN ctl.PlanConfig AS c ON c.PlanKey = s.PlanKey AND c.BusinessType = t.BusinessType
             WHERE @TenantId IS NULL OR s.TenantId = @TenantId
             ORDER BY s.RenewsOn;
@@ -114,12 +114,14 @@ public static class BillingEndpoints
     public static async Task<IReadOnlyList<object>> PlanListAsync(DbConnection control, CancellationToken ct)
     {
         var trialDays = await control.ExecuteScalarAsync<string?>(new CommandDefinition(
-            "SELECT Value FROM ctl.Setting WHERE SettingKey = N'trialDays';", cancellationToken: ct));
+            "SELECT Value FROM ctl.Setting WHERE SettingKey = 'trialDays';", cancellationToken: ct));
 
         var plans = await control.QueryAsync(new CommandDefinition(
             """
-            SELECT PlanKey, Label, IsTrial, MonthlyH, AnnualH, Branches, Devices, Users, Transactions, StorageGb, Highlights, IsActive
-            FROM ctl.[Plan] ORDER BY SortOrder;
+            SELECT PlanKey AS "PlanKey", Label AS "Label", IsTrial AS "IsTrial", MonthlyH AS "MonthlyH", AnnualH AS "AnnualH",
+                   Branches AS "Branches", Devices AS "Devices", Users AS "Users", Transactions AS "Transactions",
+                   StorageGb AS "StorageGb", Highlights AS "Highlights", IsActive AS "IsActive"
+            FROM ctl.Plan ORDER BY SortOrder;
             """, cancellationToken: ct));
 
         return plans.Select(p => (object)new
@@ -188,7 +190,7 @@ public static class BillingEndpoints
             """
             SELECT s.SubscriptionId, s.TenantId, s.PlanKey, s.Cycle, s.IsTrial, s.RenewsOn, s.Status, s.CustomMonthlyH,
                    p.MonthlyH, p.AnnualH
-            FROM ctl.Subscription AS s JOIN ctl.[Plan] AS p ON p.PlanKey = s.PlanKey
+            FROM ctl.Subscription AS s JOIN ctl.Plan AS p ON p.PlanKey = s.PlanKey
             WHERE s.SubscriptionId = @Id;
             """, new { Id = id }, cancellationToken: ct));
         if (sub is null) return ClientEndpoints.NotFound("No such subscription.");
@@ -203,21 +205,21 @@ public static class BillingEndpoints
         await control.ExecuteAsync(new CommandDefinition(
             """
             UPDATE ctl.Subscription
-            SET RenewsOn = @End, Renewals = Renewals + 1, LastRenewedOn = CAST(SYSUTCDATETIME() AS DATE),
-                IsTrial = 0, Status = N'active', CancelledAtUtc = NULL, CancelReason = NULL,
-                PlanKey = CASE WHEN PlanKey = N'Trial' THEN N'Basic' ELSE PlanKey END,
-                UpdatedAtUtc = SYSUTCDATETIME()
+            SET RenewsOn = @End, Renewals = Renewals + 1, LastRenewedOn = (now() AT TIME ZONE 'utc')::date,
+                IsTrial = false, Status = 'active', CancelledAtUtc = NULL, CancelReason = NULL,
+                PlanKey = CASE WHEN PlanKey = 'Trial' THEN 'Basic' ELSE PlanKey END,
+                UpdatedAtUtc = now() AT TIME ZONE 'utc'
             WHERE SubscriptionId = @Id;
 
             INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail)
-            VALUES (N'subscription_renewed', N'Subscription renewed', @TenantId, @Detail);
+            VALUES ('subscription_renewed', 'Subscription renewed', @TenantId, @Detail);
             """, new { End = end, Id = id, sub.TenantId, Detail = $"{days} days, to {end:yyyy-MM-dd}" }, tx, cancellationToken: ct));
 
         /* Priced at the list price for the cycle: an annual plan renewed for
            360 days costs exactly its annual price, a monthly one 12 months. */
         var plan = sub.PlanKey == "Trial" ? "Basic" : sub.PlanKey;
         var prices = await control.QuerySingleAsync<(long? MonthlyH, long? AnnualH)>(new CommandDefinition(
-            "SELECT MonthlyH, AnnualH FROM ctl.[Plan] WHERE PlanKey = @Plan;", new { Plan = plan }, tx, cancellationToken: ct));
+            "SELECT MonthlyH, AnnualH FROM ctl.Plan WHERE PlanKey = @Plan;", new { Plan = plan }, tx, cancellationToken: ct));
 
         long? amount = sub.CustomMonthlyH is { } custom ? (long)Math.Round(custom * days / 30.0)
                      : sub.Cycle == "annual" && prices.AnnualH is { } annual ? (long)Math.Round(annual * days / 360.0)
@@ -249,9 +251,9 @@ public static class BillingEndpoints
         var tenantId = await control.ExecuteScalarAsync<string?>(new CommandDefinition(
             """
             UPDATE ctl.Subscription
-            SET Status = N'cancelled', CancelledAtUtc = SYSUTCDATETIME(), CancelReason = @Reason, UpdatedAtUtc = SYSUTCDATETIME()
-            OUTPUT INSERTED.TenantId
-            WHERE SubscriptionId = @Id AND Status = N'active';
+            SET Status = 'cancelled', CancelledAtUtc = now() AT TIME ZONE 'utc', CancelReason = @Reason, UpdatedAtUtc = now() AT TIME ZONE 'utc'
+            WHERE SubscriptionId = @Id AND Status = 'active'
+            RETURNING TenantId;
             """, new { Id = id, request.Reason }, cancellationToken: ct));
 
         if (tenantId is null) return ClientEndpoints.Conflict("That subscription is not active.");
@@ -274,18 +276,18 @@ public static class BillingEndpoints
         var cycle = request.Cycle is "monthly" or "annual" ? request.Cycle : sub.Cycle;
 
         if (await control.ExecuteScalarAsync<int?>(new CommandDefinition(
-                "SELECT 1 FROM ctl.[Plan] WHERE PlanKey = @Plan AND IsActive = 1;", new { Plan = plan }, cancellationToken: ct)) is null)
+                "SELECT 1 FROM ctl.Plan WHERE PlanKey = @Plan AND IsActive;", new { Plan = plan }, cancellationToken: ct)) is null)
             return Results.BadRequest(new { code = "unknown_plan", message = $"There is no active plan '{plan}'." });
 
         await control.ExecuteAsync(new CommandDefinition(
             """
             UPDATE ctl.Subscription
             SET PlanKey = @Plan, Cycle = @Cycle, CustomMonthlyH = @Custom,
-                IsTrial = CASE WHEN @Plan = N'Trial' THEN 1 ELSE IsTrial END, UpdatedAtUtc = SYSUTCDATETIME()
+                IsTrial = CASE WHEN @Plan = 'Trial' THEN true ELSE IsTrial END, UpdatedAtUtc = now() AT TIME ZONE 'utc'
             WHERE SubscriptionId = @Id;
 
             INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail)
-            VALUES (N'plan_upgraded', N'Plan changed', @TenantId, @Detail);
+            VALUES ('plan_upgraded', 'Plan changed', @TenantId, @Detail);
             """,
             new { Plan = plan, Cycle = cycle, Custom = request.CustomMonthlyH, Id = id, sub.TenantId, Detail = $"{sub.PlanKey} → {plan}" },
             cancellationToken: ct));
@@ -304,10 +306,10 @@ public static class BillingEndpoints
 
         var totals = await control.QuerySingleAsync(new CommandDefinition(
             """
-            SELECT ISNULL(SUM(CASE WHEN Status = N'paid' THEN AmountH END), 0) AS CollectedH,
-                   ISNULL(SUM(CASE WHEN Status = N'pending' THEN AmountH END), 0) AS OutstandingH,
-                   ISNULL(SUM(CASE WHEN Status = N'failed' THEN AmountH END), 0) AS OverdueH,
-                   ISNULL(SUM(CASE WHEN Status = N'refunded' THEN AmountH END), 0) AS RefundedH
+            SELECT COALESCE(SUM(CASE WHEN Status = 'paid' THEN AmountH END), 0)::bigint AS "CollectedH",
+                   COALESCE(SUM(CASE WHEN Status = 'pending' THEN AmountH END), 0)::bigint AS "OutstandingH",
+                   COALESCE(SUM(CASE WHEN Status = 'failed' THEN AmountH END), 0)::bigint AS "OverdueH",
+                   COALESCE(SUM(CASE WHEN Status = 'refunded' THEN AmountH END), 0)::bigint AS "RefundedH"
             FROM ctl.Invoice;
             """, cancellationToken: ct));
 
@@ -318,10 +320,10 @@ public static class BillingEndpoints
         var previous = await control.ExecuteScalarAsync<long?>(new CommandDefinition(
             """
             SELECT SUM(CASE WHEN s.CustomMonthlyH IS NOT NULL THEN s.CustomMonthlyH
-                            WHEN s.Cycle = N'monthly' THEN p.MonthlyH ELSE p.AnnualH / 12 END)
-            FROM ctl.Subscription AS s JOIN ctl.[Plan] AS p ON p.PlanKey = s.PlanKey
-            WHERE s.IsTrial = 0 AND s.CreatedAtUtc < DATEADD(MONTH, -1, SYSUTCDATETIME())
-              AND (s.CancelledAtUtc IS NULL OR s.CancelledAtUtc > DATEADD(MONTH, -1, SYSUTCDATETIME()));
+                            WHEN s.Cycle = 'monthly' THEN p.MonthlyH ELSE p.AnnualH / 12 END)::bigint
+            FROM ctl.Subscription AS s JOIN ctl.Plan AS p ON p.PlanKey = s.PlanKey
+            WHERE NOT s.IsTrial AND s.CreatedAtUtc < (now() AT TIME ZONE 'utc') - interval '1 month'
+              AND (s.CancelledAtUtc IS NULL OR s.CancelledAtUtc > (now() AT TIME ZONE 'utc') - interval '1 month');
             """, cancellationToken: ct)) ?? 0;
 
         return Results.Ok(new
@@ -348,12 +350,12 @@ public static class BillingEndpoints
     public static async Task<IEnumerable<dynamic>> InvoicesAsync(DbConnection control, string? tenantId, CancellationToken ct) =>
         await control.QueryAsync(new CommandDefinition(
             """
-            SELECT i.InvoiceId AS id, i.TenantId AS clientId, t.Name AS clientName, i.PlanKey AS [plan],
-                   i.AmountH AS amountH, i.Method AS method, i.Status AS status,
-                   CONVERT(CHAR(10), i.IssuedOn, 23) AS issuedOn, CONVERT(CHAR(10), i.PaidOn, 23) AS paidOn,
-                   CONVERT(CHAR(10), i.PeriodStart, 23) AS periodStart, CONVERT(CHAR(10), i.PeriodEnd, 23) AS periodEnd,
-                   i.Notes AS notes,
-                   i.SubscriptionId AS subscriptionId
+            SELECT i.InvoiceId AS "id", i.TenantId AS "clientId", t.Name AS "clientName", i.PlanKey AS "plan",
+                   i.AmountH AS "amountH", i.Method AS "method", i.Status AS "status",
+                   to_char(i.IssuedOn, 'YYYY-MM-DD') AS "issuedOn", to_char(i.PaidOn, 'YYYY-MM-DD') AS "paidOn",
+                   to_char(i.PeriodStart, 'YYYY-MM-DD') AS "periodStart", to_char(i.PeriodEnd, 'YYYY-MM-DD') AS "periodEnd",
+                   i.Notes AS "notes",
+                   i.SubscriptionId AS "subscriptionId"
             FROM ctl.Invoice AS i JOIN ctl.Tenant AS t ON t.TenantId = i.TenantId
             WHERE @TenantId IS NULL OR i.TenantId = @TenantId
             ORDER BY i.IssuedOn DESC, i.InvoiceId DESC;
@@ -375,12 +377,12 @@ public static class BillingEndpoints
             """
             UPDATE ctl.Invoice
             SET Status = @Status, Method = COALESCE(@Method, Method), Notes = COALESCE(@Notes, Notes),
-                PaidOn = CASE WHEN @Status = N'paid' THEN CAST(SYSUTCDATETIME() AS DATE) WHEN @Status = N'refunded' THEN PaidOn ELSE NULL END
+                PaidOn = CASE WHEN @Status = 'paid' THEN (now() AT TIME ZONE 'utc')::date WHEN @Status = 'refunded' THEN PaidOn ELSE NULL END
             WHERE InvoiceId = @Id;
 
-            IF @Status = N'failed'
-                INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail, Severity)
-                VALUES (N'payment_failed', N'Payment failed', @TenantId, @Id, N'warning');
+            INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail, Severity)
+            SELECT 'payment_failed', 'Payment failed', @TenantId, @Id, 'warning'
+            WHERE @Status = 'failed';
             """, new { request.Status, request.Method, request.Notes, Id = id, before.TenantId }, cancellationToken: ct));
 
         return Results.Ok(await audit.ResultAsync("invoice.status", $"Invoice marked {request.Status}", before.TenantId, id,
@@ -397,7 +399,7 @@ public static class BillingEndpoints
 
         var days = (await control.QueryAsync<(DateTime StatDate, long Transactions, long SalesH)>(new CommandDefinition(
             """
-            SELECT StatDate, SUM(CAST(Transactions AS BIGINT)), SUM(SalesH)
+            SELECT StatDate, SUM(Transactions::bigint)::bigint, SUM(SalesH)::bigint
             FROM ctl.TenantDailyStat WHERE StatDate >= @From AND StatDate < @To
             GROUP BY StatDate;
             """, new { From = window.From.Date, To = window.To.Date }, cancellationToken: ct))).ToList();
@@ -431,7 +433,7 @@ public static class BillingEndpoints
             """
             SELECT s.SubscriptionId, s.TenantId, s.PlanKey, s.Cycle, s.IsTrial, s.StartsOn, s.RenewsOn, s.Status,
                    s.CustomMonthlyH, s.CancelledAtUtc, s.CreatedAtUtc, p.MonthlyH, p.AnnualH
-            FROM ctl.Subscription AS s JOIN ctl.[Plan] AS p ON p.PlanKey = s.PlanKey;
+            FROM ctl.Subscription AS s JOIN ctl.Plan AS p ON p.PlanKey = s.PlanKey;
             """, cancellationToken: ct))).ToList();
 
         long MonthlyOf(SubRow s) => s.CustomMonthlyH ?? (s.Cycle == "monthly" ? s.MonthlyH : s.AnnualH / 12) ?? 0;

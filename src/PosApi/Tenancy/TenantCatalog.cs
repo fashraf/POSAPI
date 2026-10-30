@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using Microsoft.Extensions.Options;
 using PosApi.Common;
 
@@ -45,7 +45,7 @@ public sealed class TenantCatalog
         _ttl = TimeSpan.FromSeconds(Math.Max(1, options.Value.CatalogCacheSeconds));
     }
 
-    public SqlConnection Control() => new(_connections.Control);
+    public NpgsqlConnection Control() => new(_connections.Control);
 
     public async Task<TenantInfo?> GetAsync(string tenantId, CancellationToken ct)
     {
@@ -63,7 +63,7 @@ public sealed class TenantCatalog
                    COALESCE(c.Branches, p.Branches) AS MaxBranches
             FROM ctl.Tenant AS t
             LEFT JOIN ctl.Subscription AS s ON s.TenantId = t.TenantId
-            LEFT JOIN ctl.[Plan] AS p ON p.PlanKey = s.PlanKey
+            LEFT JOIN ctl.Plan AS p ON p.PlanKey = s.PlanKey
             LEFT JOIN ctl.PlanConfig AS c ON c.PlanKey = s.PlanKey AND c.BusinessType = t.BusinessType
             WHERE t.TenantId = @TenantId;
             """, new { TenantId = tenantId }, cancellationToken: ct));

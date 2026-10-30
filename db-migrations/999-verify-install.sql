@@ -1,107 +1,165 @@
 /*==============================================================================
   Nazad POS — 999 · Verify the install
 
-  Read-only. apply-migrations.cmd runs it after every apply; run it by hand
-  whenever something is not working and you want to know whether the database
-  is the cause. Each line prints PASS, FAIL or INFO.
+  Read-only. apply-migrations.sh / .cmd run it after every apply; run it by
+  hand whenever something is not working and you want to know whether the
+  database is the cause:
+
+      psql -d posmain -f db-migrations/999-verify-install.sql
+
+  Each line says PASS, FAIL or INFO.
 
   FAIL is something every install must have: the full schema from 001, the
-  reference data from 002, a balanced ledger, Arabic stored intact.
+  database functions from 010-019, the reference data from 002, a balanced
+  ledger, Arabic stored intact.
   INFO is business data, which a new install does not have until the first
   owner registers (or 900 loads the demo).
+
+  One statement, a SELECT: nothing here writes, so it is safe on a live
+  database at any time. (The scripts also run it in a read-only session.)
 ==============================================================================*/
 
-USE POSMAIN;
-GO
+WITH Checks (Ord, Result) AS (
 
-SET NOCOUNT ON;
+    SELECT 100, '--- Schema (001) ------------------------------------------------------'
 
-PRINT N'';
-PRINT N'--- Schema (001) ------------------------------------------------------';
+    UNION ALL
+    SELECT 110, CASE WHEN COUNT(*) >= 64 THEN 'PASS' ELSE 'FAIL' END
+                || '  Tables: ' || COUNT(*) || ' (expected 64)'
+    FROM pg_tables
+    WHERE schemaname IN ('audit', 'core', 'dbo', 'device', 'fin', 'inv', 'sales')
+      AND tablename <> 'schemamigration'
 
-SELECT CASE WHEN COUNT(*) >= 62 THEN N'PASS' ELSE N'FAIL' END
-       + N'  Tables: ' + CAST(COUNT(*) AS NVARCHAR(10)) + N' (expected 62)' AS Result
-FROM sys.tables WHERE is_ms_shipped = 0 AND name <> N'SchemaMigration';
+    /* Every SQL Server procedure became a function of the same name. */
+    UNION ALL
+    SELECT 120, CASE WHEN COUNT(*) >= 62 THEN 'PASS' ELSE 'FAIL' END
+                || '  Database functions: ' || COUNT(*) || ' (expected 62)'
+    FROM pg_proc AS p
+    JOIN pg_namespace AS n ON n.oid = p.pronamespace
+    WHERE n.nspname IN ('audit', 'core', 'dbo', 'device', 'fin', 'inv', 'sales')
+      AND p.proname LIKE 'usp\_%'
 
-SELECT CASE WHEN COUNT(*) >= 58 THEN N'PASS' ELSE N'FAIL' END
-       + N'  Procedures: ' + CAST(COUNT(*) AS NVARCHAR(10)) + N' (expected 58)' AS Result
-FROM sys.procedures WHERE is_ms_shipped = 0;
+    UNION ALL
+    SELECT 130, CASE WHEN COUNT(*) >= 9 THEN 'PASS' ELSE 'FAIL' END
+                || '  Views: ' || COUNT(*) || ' (expected 9)'
+    FROM pg_views
+    WHERE schemaname IN ('audit', 'core', 'dbo', 'device', 'fin', 'inv', 'sales')
 
-SELECT CASE WHEN COUNT(*) >= 9 THEN N'PASS' ELSE N'FAIL' END
-       + N'  Views: ' + CAST(COUNT(*) AS NVARCHAR(10)) + N' (expected 9)' AS Result
-FROM sys.views WHERE is_ms_shipped = 0;
+    /* The numbering sequences, not the ones behind identity columns. Invoice
+       numbers come from sales.InvoiceCounter, so there are 8, not 9. */
+    UNION ALL
+    SELECT 140, CASE WHEN COUNT(*) >= 8 THEN 'PASS' ELSE 'FAIL' END
+                || '  Sequences: ' || COUNT(*) || ' (expected 8)'
+    FROM pg_class AS c
+    JOIN pg_namespace AS n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'S'
+      AND n.nspname IN ('audit', 'core', 'dbo', 'device', 'fin', 'inv', 'sales')
+      AND NOT EXISTS (SELECT 1 FROM pg_depend AS d WHERE d.objid = c.oid AND d.deptype = 'i')
 
-SELECT CASE WHEN COUNT(*) >= 9 THEN N'PASS' ELSE N'FAIL' END
-       + N'  Sequences: ' + CAST(COUNT(*) AS NVARCHAR(10)) + N' (expected 9)' AS Result
-FROM sys.sequences;
+    /* The API cannot sign anyone in, or sell anything, without these. */
+    UNION ALL
+    SELECT 150, CASE WHEN COUNT(DISTINCT n.nspname || '.' || p.proname) = 4 THEN 'PASS' ELSE 'FAIL' END
+                || '  Core functions present (' || COUNT(DISTINCT n.nspname || '.' || p.proname) || '/4)'
+    FROM pg_proc AS p
+    JOIN pg_namespace AS n ON n.oid = p.pronamespace
+    WHERE n.nspname || '.' || p.proname IN
+          ('sales.usp_commitsale', 'core.usp_registerbusiness',
+           'fin.usp_postjournalentry', 'core.usp_saveuser')
 
-/* The API cannot sign anyone in, or sell anything, without these. */
-SELECT CASE WHEN COUNT(*) = 4 THEN N'PASS' ELSE N'FAIL' END
-       + N'  Core procedures present (' + CAST(COUNT(*) AS NVARCHAR(10)) + N'/4)' AS Result
-FROM sys.procedures
-WHERE SCHEMA_NAME(schema_id) + N'.' + name IN
-      (N'sales.usp_CommitSale', N'core.usp_RegisterBusiness',
-       N'fin.usp_PostJournalEntry', N'core.usp_SaveUser');
+    /* The latest sale commit balances cash and change (it declares v_CashDueH). */
+    UNION ALL
+    SELECT 160, CASE WHEN EXISTS (SELECT 1 FROM pg_proc AS p
+                                  JOIN pg_namespace AS n ON n.oid = p.pronamespace
+                                  WHERE n.nspname = 'sales' AND p.proname = 'usp_commitsale'
+                                    AND p.prosrc ILIKE '%v_CashDueH%')
+                     THEN 'PASS  Sale commit is the current version'
+                     ELSE 'FAIL  Sale commit is an old version — the schema is out of date' END
 
-/* The latest sale commit balances cash and change (it declares @CashDueH). */
-SELECT CASE WHEN OBJECT_DEFINITION(OBJECT_ID(N'sales.usp_CommitSale')) LIKE N'%@CashDueH%'
-            THEN N'PASS  Sale commit is the current version'
-            ELSE N'FAIL  Sale commit is an old version — the schema is out of date' END AS Result;
+    UNION ALL
+    SELECT 200, ''
+    UNION ALL
+    SELECT 201, '--- Reference data (002) ----------------------------------------------'
 
-PRINT N'';
-PRINT N'--- Reference data (002) ----------------------------------------------';
+    UNION ALL
+    SELECT 210, CASE WHEN COUNT(*) >= 23 THEN 'PASS' ELSE 'FAIL' END
+                || '  Chart of accounts: ' || COUNT(*)
+    FROM fin.Account
 
-SELECT CASE WHEN COUNT(*) >= 23 THEN N'PASS' ELSE N'FAIL' END
-       + N'  Chart of accounts: ' + CAST(COUNT(*) AS NVARCHAR(10)) AS Result
-FROM fin.Account;
+    UNION ALL
+    SELECT 220, CASE WHEN COUNT(*) >= 77 THEN 'PASS' ELSE 'FAIL' END
+                || '  Permission keys: ' || COUNT(*)
+    FROM core.Permission
 
-SELECT CASE WHEN COUNT(*) >= 77 THEN N'PASS' ELSE N'FAIL' END
-       + N'  Permission keys: ' + CAST(COUNT(*) AS NVARCHAR(10)) AS Result
-FROM core.Permission;
+    UNION ALL
+    SELECT 230, CASE WHEN COUNT(*) >= 6 THEN 'PASS' ELSE 'FAIL' END
+                || '  Built-in roles: ' || COUNT(*)
+    FROM core.Role WHERE IsBuiltIn
 
-SELECT CASE WHEN COUNT(*) >= 6 THEN N'PASS' ELSE N'FAIL' END
-       + N'  Built-in roles: ' + CAST(COUNT(*) AS NVARCHAR(10)) AS Result
-FROM core.Role WHERE IsBuiltIn = 1;
+    /* The owner role must hold every key, or the first owner is locked out of
+       whatever is missing. */
+    UNION ALL
+    SELECT 240, CASE WHEN NOT EXISTS (SELECT 1 FROM core.Permission AS p
+                                      WHERE NOT EXISTS (SELECT 1 FROM core.RolePermission AS rp
+                                                        WHERE rp.RoleId = 'rol_owner'
+                                                          AND rp.PermissionKey = p.PermissionKey))
+                     THEN 'PASS  Owner role holds every permission'
+                     ELSE 'FAIL  Owner role is missing permissions' END
 
-/* The owner role must hold every key, or the first owner is locked out of
-   whatever is missing. */
-SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM core.Permission AS p
-                             WHERE NOT EXISTS (SELECT 1 FROM core.RolePermission AS rp
-                                               WHERE rp.RoleId = N'rol_owner'
-                                                 AND rp.PermissionKey = p.PermissionKey))
-            THEN N'PASS  Owner role holds every permission'
-            ELSE N'FAIL  Owner role is missing permissions' END AS Result;
+    UNION ALL
+    SELECT 250, CASE WHEN EXISTS (SELECT 1 FROM core.BillTemplate
+                                  WHERE Audience = 'customer' AND IsDefault AND IsActive)
+                     THEN 'PASS  Default customer bill present'
+                     ELSE 'FAIL  No default customer bill — the till cannot print a receipt' END
 
-SELECT CASE WHEN EXISTS (SELECT 1 FROM core.BillTemplate
-                         WHERE Audience = N'customer' AND IsDefault = 1 AND IsActive = 1)
-            THEN N'PASS  Default customer bill present'
-            ELSE N'FAIL  No default customer bill — the till cannot print a receipt' END AS Result;
+    UNION ALL
+    SELECT 260, CASE WHEN EXISTS (SELECT 1 FROM sales.InvoiceCounter WHERE CounterKey = 'invoice')
+                     THEN 'PASS  Invoice counter present'
+                     ELSE 'FAIL  No invoice counter — the till cannot number a sale' END
 
-PRINT N'';
-PRINT N'--- Integrity --------------------------------------------------------';
+    UNION ALL
+    SELECT 300, ''
+    UNION ALL
+    SELECT 301, '--- Integrity --------------------------------------------------------'
 
-/* If the ledger does not balance, something bypassed the posting procedure. */
-SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM fin.vw_TrialBalanceCheck)
-            THEN N'PASS  Ledger balances'
-            ELSE N'FAIL  LEDGER DOES NOT BALANCE — investigate before trading' END AS Result;
+    /* If the ledger does not balance, something bypassed the posting function. */
+    UNION ALL
+    SELECT 310, CASE WHEN NOT EXISTS (SELECT 1 FROM fin.vw_TrialBalanceCheck)
+                     THEN 'PASS  Ledger balances'
+                     ELSE 'FAIL  LEDGER DOES NOT BALANCE — investigate before trading' END
 
-/* Arabic must survive the round trip. Compared under a binary collation:
-   under Arabic_CI_AS a [؀-ۿ] range follows dictionary order, not code points,
-   and reported intact text as damaged. */
-SELECT CASE WHEN EXISTS (SELECT 1 FROM core.Language
-                         WHERE Code = N'ar'
-                           AND NameNative COLLATE Latin1_General_BIN2 LIKE N'%[؀-ۿ]%')
-            THEN N'PASS  Arabic text stored correctly'
-            ELSE N'FAIL  Arabic text is damaged — the script was not read as UTF-8 (sqlcmd -f 65001)' END AS Result;
+    /* Arabic must survive the round trip. Compared under the C collation, so
+       the range is code points (U+0600 to U+06FF), not dictionary order, and
+       because a regular expression refuses the ci collation. */
+    UNION ALL
+    SELECT 320, CASE WHEN EXISTS (SELECT 1 FROM core.Language
+                                  WHERE Code = 'ar'
+                                    AND NameNative COLLATE "C" ~ '[؀-ۿ]')
+                     THEN 'PASS  Arabic text stored correctly'
+                     ELSE 'FAIL  Arabic text is damaged — the script was not read as UTF-8 (PGCLIENTENCODING=UTF8)' END
 
-PRINT N'';
-PRINT N'--- Business data (INFO: none until the first owner registers) -------';
+    UNION ALL
+    SELECT 330, CASE WHEN pg_encoding_to_char(encoding) = 'UTF8'
+                     THEN 'PASS  Database encoding is UTF8'
+                     ELSE 'FAIL  Database encoding is ' || pg_encoding_to_char(encoding)
+                          || ' — Arabic cannot be stored; recreate it with ENCODING ''UTF8'' TEMPLATE template0' END
+    FROM pg_database WHERE datname = current_database()
 
-SELECT N'INFO  Companies: ' + CAST(COUNT(*) AS NVARCHAR(10)) AS Result FROM core.Company;
-SELECT N'INFO  Active branches: ' + CAST(COUNT(*) AS NVARCHAR(10)) AS Result FROM core.Branch WHERE IsActive = 1;
-SELECT N'INFO  Active owners: ' + CAST(COUNT(*) AS NVARCHAR(10)) AS Result
-FROM core.AppUser WHERE RoleId = N'rol_owner' AND Status = N'active';
-SELECT N'INFO  Owners able to sign in with a password: ' + CAST(COUNT(*) AS NVARCHAR(10)) AS Result
-FROM core.AppUser WHERE RoleId = N'rol_owner' AND Status = N'active' AND PasswordHash IS NOT NULL;
-SELECT N'INFO  Active catalog items: ' + CAST(COUNT(*) AS NVARCHAR(10)) AS Result FROM core.CatalogItem WHERE IsActive = 1;
-GO
+    UNION ALL
+    SELECT 400, ''
+    UNION ALL
+    SELECT 401, '--- Business data (INFO: none until the first owner registers) -------'
+
+    UNION ALL
+    SELECT 410, 'INFO  Companies: ' || COUNT(*) FROM core.Company
+    UNION ALL
+    SELECT 420, 'INFO  Active branches: ' || COUNT(*) FROM core.Branch WHERE IsActive
+    UNION ALL
+    SELECT 430, 'INFO  Active owners: ' || COUNT(*)
+    FROM core.AppUser WHERE RoleId = 'rol_owner' AND Status = 'active'
+    UNION ALL
+    SELECT 440, 'INFO  Owners able to sign in with a password: ' || COUNT(*)
+    FROM core.AppUser WHERE RoleId = 'rol_owner' AND Status = 'active' AND PasswordHash IS NOT NULL
+    UNION ALL
+    SELECT 450, 'INFO  Active catalog items: ' || COUNT(*) FROM core.CatalogItem WHERE IsActive
+)
+SELECT Result FROM Checks ORDER BY Ord;

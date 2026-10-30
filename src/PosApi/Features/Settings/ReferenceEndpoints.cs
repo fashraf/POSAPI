@@ -1,6 +1,5 @@
-using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -83,12 +82,12 @@ public static class ReferenceEndpoints
 
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             """
             SELECT b.BranchId, b.Code, b.NameAr, b.NameEn, b.Phone, b.IsActive, b.AddressAr, b.AddressEn
             FROM core.Branch AS b
-            WHERE b.IsActive = 1
-              AND (@All = 1 OR EXISTS (SELECT 1 FROM core.UserBranch AS ub
+            WHERE b.IsActive
+              AND (@All OR EXISTS (SELECT 1 FROM core.UserBranch AS ub
                                        WHERE ub.BranchId = b.BranchId AND ub.UserId = @UserId))
             ORDER BY b.Code;
             """,
@@ -132,7 +131,15 @@ public static class ReferenceEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_SaveBranchSettings",
+                """
+                SELECT core.usp_SaveBranchSettings(
+                    p_BranchId => @BranchId, p_DefaultCustomerMode => @DefaultCustomerMode,
+                    p_ServedByRequirement => @ServedByRequirement,
+                    p_AllowNegativeStock => @AllowNegativeStock, p_DefaultBillId => @DefaultBillId,
+                    p_AutoPrintCustomer => @AutoPrintCustomer, p_AutoPrintGroups => @AutoPrintGroups,
+                    p_VatRatePercent => @VatRatePercent, p_PricesIncludeVat => @PricesIncludeVat,
+                    p_Actor => @Actor);
+                """,
                 new
                 {
                     BranchId = branchId,
@@ -147,9 +154,9 @@ public static class ReferenceEndpoints
                     request.PricesIncludeVat,
                     Actor = current.Username
                 },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapSettingsError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapSettingsError(ex) is { } mapped)
         {
             return mapped;
         }
@@ -181,11 +188,15 @@ public static class ReferenceEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_CopyBranchSettings",
+                """
+                SELECT core.usp_CopyBranchSettings(
+                    p_SourceBranchId => @SourceBranchId, p_TargetBranchId => @TargetBranchId,
+                    p_Actor => @Actor);
+                """,
                 new { request.SourceBranchId, TargetBranchId = branchId, Actor = current.Username },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapSettingsError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapSettingsError(ex) is { } mapped)
         {
             return mapped;
         }
@@ -201,7 +212,7 @@ public static class ReferenceEndpoints
     private static IResult BranchNotFound() =>
         ProcErrors.NotFound("No such branch.", "لا يوجد فرع بهذا المعرف.");
 
-    private static IResult? MapSettingsError(SqlException ex) => ex.Number switch
+    private static IResult? MapSettingsError(PostgresException ex) => ex.ErrorNumber() switch
     {
         62050 => BranchNotFound(),
         62051 => ProcErrors.Field("defaultCustomerMode",
@@ -218,20 +229,20 @@ public static class ReferenceEndpoints
     };
 
     private static async Task<BranchSettingsDto?> LoadSettingsAsync(
-        SqlConnection connection, string branchId, CancellationToken ct)
+        NpgsqlConnection connection, string branchId, CancellationToken ct)
     {
         var row = await connection.QuerySingleOrDefaultAsync<SettingsRow>(new CommandDefinition(
             """
             SELECT b.BranchId, b.CreatedAtUtc AS BranchCreatedAtUtc,
-                   CAST(CASE WHEN s.BranchId IS NULL THEN 0 ELSE 1 END AS BIT) AS Configured,
-                   ISNULL(s.DefaultCustomerMode, N'walkin')   AS DefaultCustomerMode,
-                   ISNULL(s.ServedByRequirement, N'optional') AS ServedByRequirement,
-                   ISNULL(s.AllowNegativeStock, 0)            AS AllowNegativeStock,
+                   (s.BranchId IS NOT NULL)                     AS Configured,
+                   COALESCE(s.DefaultCustomerMode, 'walkin')   AS DefaultCustomerMode,
+                   COALESCE(s.ServedByRequirement, 'optional') AS ServedByRequirement,
+                   COALESCE(s.AllowNegativeStock, false)       AS AllowNegativeStock,
                    s.DefaultBillId,
-                   ISNULL(s.AutoPrintCustomer, 1)             AS AutoPrintCustomer,
-                   ISNULL(s.AutoPrintGroups, 1)               AS AutoPrintGroups,
-                   ISNULL(s.VatRatePercent, 15.00)            AS VatRatePercent,
-                   ISNULL(s.PricesIncludeVat, 1)              AS PricesIncludeVat,
+                   COALESCE(s.AutoPrintCustomer, true)         AS AutoPrintCustomer,
+                   COALESCE(s.AutoPrintGroups, true)           AS AutoPrintGroups,
+                   COALESCE(s.VatRatePercent, 15.00)           AS VatRatePercent,
+                   COALESCE(s.PricesIncludeVat, true)          AS PricesIncludeVat,
                    s.UpdatedAtUtc, s.UpdatedBy
             FROM core.Branch AS b
             LEFT JOIN core.BranchSettings AS s ON s.BranchId = b.BranchId
@@ -274,8 +285,8 @@ public static class ReferenceEndpoints
 
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
-            "SELECT Code, NameNative, NameEn, IsRtl FROM core.Language WHERE IsActive = 1 ORDER BY SortOrder;",
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
+            "SELECT Code, NameNative, NameEn, IsRtl FROM core.Language WHERE IsActive ORDER BY SortOrder;",
             cancellationToken: ct));
 
         return Results.Ok(rows);

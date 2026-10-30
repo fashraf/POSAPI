@@ -37,27 +37,29 @@ public static class KitchenEndpoints
     {
         await using var connection = db.Create();
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(
             """
             SELECT o.PreparationId, o.OrderNumber, o.SaleId, o.BranchId, o.PrintGroupId,
                    o.CustomerName, o.TotalH, o.Status, o.OrderType, o.CreatedAtUtc, o.UpdatedAtUtc,
-                   DATEDIFF(SECOND, o.CreatedAtUtc, SYSUTCDATETIME()) AS ElapsedSeconds
+                   /* Second boundaries crossed, as DATEDIFF(SECOND, ...) counted them. */
+                   (extract(epoch FROM date_trunc('second', now() AT TIME ZONE 'utc'))
+                    - extract(epoch FROM date_trunc('second', o.CreatedAtUtc)))::int AS ElapsedSeconds
             FROM sales.PreparationOrder AS o
             WHERE (@BranchId IS NULL OR o.BranchId = @BranchId OR o.BranchId IS NULL)
-              AND (@IncludeCompleted = 1 OR o.Status <> N'completed')
+              AND (@IncludeCompleted OR o.Status <> 'completed')
             ORDER BY o.CreatedAtUtc;
 
             SELECT i.*
             FROM sales.PreparationItem AS i
             JOIN sales.PreparationOrder AS o ON o.PreparationId = i.PreparationId
             WHERE (@BranchId IS NULL OR o.BranchId = @BranchId OR o.BranchId IS NULL)
-              AND (@IncludeCompleted = 1 OR o.Status <> N'completed');
+              AND (@IncludeCompleted OR o.Status <> 'completed');
             """,
             new { BranchId = branchId, IncludeCompleted = includeCompleted ?? false },
             cancellationToken: ct));
 
-        var orders = (await multi.ReadAsync()).ToList();
-        var items = (await multi.ReadAsync()).ToList();
+        var orders = (await multi.ReadRowsAsync()).ToList();
+        var items = (await multi.ReadRowsAsync()).ToList();
 
         return Results.Ok(new { orders, items });
     }
@@ -81,28 +83,28 @@ public static class KitchenEndpoints
         await using var connection = db.Create();
 
         /* Ready and completed mean every line is done, so the lines are brought
-           up in the same batch. The board used to send one request per line
+           up in the same statement. The board used to send one request per line
            first and the status last; one failure in between left an order
            marked ready with lines still open, and "Mark ready" depended on
-           the browser finishing a chain of calls. */
+           the browser finishing a chain of calls. One statement is one
+           transaction: both updates happen or neither does. */
         var affected = await connection.ExecuteScalarAsync<int>(new CommandDefinition(
             """
-            SET XACT_ABORT ON;
-            BEGIN TRAN;
-
-            UPDATE sales.PreparationOrder
-            SET Status = @Status, UpdatedAtUtc = SYSUTCDATETIME()
-            WHERE PreparationId = @PreparationId;
-
-            DECLARE @Affected INT = @@ROWCOUNT;
-
-            IF @Affected > 0 AND @Status IN (N'ready', N'completed')
-                UPDATE sales.PreparationItem
-                SET CompletedQty = Quantity
-                WHERE PreparationId = @PreparationId AND CompletedQty < Quantity;
-
-            COMMIT;
-            SELECT @Affected;
+            WITH Updated AS (
+                UPDATE sales.PreparationOrder
+                SET Status = @Status, UpdatedAtUtc = now() AT TIME ZONE 'utc'
+                WHERE PreparationId = @PreparationId
+                RETURNING PreparationId
+            ),
+            Lines AS (
+                UPDATE sales.PreparationItem AS i
+                SET CompletedQty = i.Quantity
+                FROM Updated AS u
+                WHERE i.PreparationId = u.PreparationId
+                  AND @Status IN ('ready', 'completed')
+                  AND i.CompletedQty < i.Quantity
+            )
+            SELECT COUNT(*)::int FROM Updated;
             """,
             new { PreparationId = preparationId, Status = status },
             cancellationToken: ct));

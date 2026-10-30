@@ -1,6 +1,5 @@
-using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -172,35 +171,35 @@ public static class CatalogEndpoints
         // Parameterised throughout. The search term reaches SQL as a value, so
         // a customer named O'Brien is a name and not a syntax error.
         const string sql = """
-            SELECT COUNT(*)
+            SELECT COUNT(*)::int
             FROM core.CatalogItem AS i
             WHERE (@Search IS NULL
-                   OR i.NameAr  LIKE N'%' + @Search + N'%'
-                   OR i.NameEn  LIKE N'%' + @Search + N'%'
+                   OR i.NameAr  COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR i.NameEn  COLLATE "default" ILIKE '%' || @Search || '%'
                    OR i.Sku     = @Search
                    OR i.Barcode = @Search)
               AND (@CategoryId IS NULL OR i.CategoryId = @CategoryId)
               AND (@Kind IS NULL OR i.Kind = @Kind)
-              AND (@Status IS NOT NULL OR @ActiveOnly = 0 OR i.IsActive = 1)
-              AND (@Status IS NULL OR i.IsActive = CASE WHEN @Status = N'active' THEN 1 ELSE 0 END);
+              AND (@Status IS NOT NULL OR NOT @ActiveOnly OR i.IsActive)
+              AND (@Status IS NULL OR i.IsActive = (@Status = 'active'));
 
             SELECT
                 i.ItemId, i.Kind, i.NameAr, i.NameEn, i.DescriptionAr, i.DescriptionEn,
                 i.Sku, i.Barcode, i.CategoryId, i.VendorId, i.PrintGroupId, i.PriceH, i.CostH,
                 i.TracksStock, i.ReorderLevel, i.RequiresPreparation, i.IsActive,
-                ISNULL(s.Quantity, 0) AS Quantity
+                COALESCE(s.Quantity, 0) AS Quantity
             FROM core.CatalogItem AS i
             LEFT JOIN inv.StockLevel AS s
                    ON s.ItemId = i.ItemId AND s.BranchId = @BranchId
             WHERE (@Search IS NULL
-                   OR i.NameAr  LIKE N'%' + @Search + N'%'
-                   OR i.NameEn  LIKE N'%' + @Search + N'%'
+                   OR i.NameAr  COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR i.NameEn  COLLATE "default" ILIKE '%' || @Search || '%'
                    OR i.Sku     = @Search
                    OR i.Barcode = @Search)
               AND (@CategoryId IS NULL OR i.CategoryId = @CategoryId)
               AND (@Kind IS NULL OR i.Kind = @Kind)
-              AND (@Status IS NOT NULL OR @ActiveOnly = 0 OR i.IsActive = 1)
-              AND (@Status IS NULL OR i.IsActive = CASE WHEN @Status = N'active' THEN 1 ELSE 0 END)
+              AND (@Status IS NOT NULL OR NOT @ActiveOnly OR i.IsActive)
+              AND (@Status IS NULL OR i.IsActive = (@Status = 'active'))
             ORDER BY i.Kind, i.NameEn
             OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY;
             """;
@@ -313,46 +312,56 @@ public static class CatalogEndpoints
             return ProcErrors.Field("sku", "A product needs a SKU.", "المنتج يحتاج إلى رمز SKU.");
         }
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@ItemId", itemId);
-        parameters.Add("@Kind", request.Kind);
-        parameters.Add("@NameAr", request.NameAr?.Trim());
-        parameters.Add("@NameEn", request.NameEn?.Trim());
-        parameters.Add("@DescriptionAr", Blank(request.DescriptionAr));
-        parameters.Add("@DescriptionEn", Blank(request.DescriptionEn));
-        // An empty barcode or SKU is "none", not a value. Sent as '' it would
-        // collide with every other item that has none and fail the uniqueness check.
-        parameters.Add("@Sku", Blank(request.Sku));
-        parameters.Add("@Barcode", Blank(request.Barcode));
-        parameters.Add("@CategoryId", Blank(request.CategoryId));
-        parameters.Add("@VendorId", Blank(request.VendorId));
-        parameters.Add("@PrintGroupId", Blank(request.PrintGroupId));
-        parameters.Add("@PriceH", request.PriceH);
-        parameters.Add("@CostH", request.CostH);
-        parameters.Add("@TracksStock", request.TracksStock);
-        parameters.Add("@ReorderLevel", (decimal)request.ReorderLevel);
-        parameters.Add("@RequiresPreparation", request.RequiresPreparation);
-        parameters.Add("@IsActive", request.IsActive);
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@SavedItemId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string savedId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_SaveCatalogItem",
-                parameters,
-                commandType: CommandType.StoredProcedure,
+            savedId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT SavedItemId FROM core.usp_SaveCatalogItem(
+                    p_ItemId => @ItemId, p_Kind => @Kind,
+                    p_NameAr => @NameAr, p_NameEn => @NameEn,
+                    p_DescriptionAr => @DescriptionAr, p_DescriptionEn => @DescriptionEn,
+                    p_Sku => @Sku, p_Barcode => @Barcode,
+                    p_CategoryId => @CategoryId, p_VendorId => @VendorId, p_PrintGroupId => @PrintGroupId,
+                    p_PriceH => @PriceH, p_CostH => @CostH, p_TracksStock => @TracksStock,
+                    p_ReorderLevel => @ReorderLevel, p_RequiresPreparation => @RequiresPreparation,
+                    p_IsActive => @IsActive, p_Actor => @Actor);
+                """,
+                new
+                {
+                    ItemId = itemId,
+                    request.Kind,
+                    NameAr = request.NameAr?.Trim(),
+                    NameEn = request.NameEn?.Trim(),
+                    DescriptionAr = Blank(request.DescriptionAr),
+                    DescriptionEn = Blank(request.DescriptionEn),
+                    // An empty barcode or SKU is "none", not a value. Sent as '' it would
+                    // collide with every other item that has none and fail the uniqueness check.
+                    Sku = Blank(request.Sku),
+                    Barcode = Blank(request.Barcode),
+                    CategoryId = Blank(request.CategoryId),
+                    VendorId = Blank(request.VendorId),
+                    PrintGroupId = Blank(request.PrintGroupId),
+                    request.PriceH,
+                    request.CostH,
+                    request.TracksStock,
+                    ReorderLevel = (decimal)request.ReorderLevel,
+                    request.RequiresPreparation,
+                    request.IsActive,
+                    Actor = current.Username
+                },
                 cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number == 59005)
+        catch (PostgresException ex) when (ex.ErrorNumber() == 59005)
         {
             return Results.NotFound(ApiError.Create("not_found", "No such item.", "لا يوجد صنف بهذا المعرف."));
         }
-        catch (SqlException ex) when (ex.Number is >= 59000 and < 59005 or 59006)
+        catch (PostgresException ex) when (ex.ErrorNumber() is >= 59000 and < 59005 or 59006)
         {
-            var (field, messageEn, messageAr) = ex.Number switch
+            var (field, messageEn, messageAr) = ex.ErrorNumber() switch
             {
                 59006 => ("sku", "A product needs a SKU.", "المنتج يحتاج إلى رمز SKU."),
                 59000 => ("nameEn", "Both names are required.", "الاسمان العربي والإنجليزي مطلوبان."),
@@ -366,8 +375,6 @@ public static class CatalogEndpoints
                 "validation_failed", messageEn, messageAr,
                 new Dictionary<string, string[]> { [field] = [messageEn] }));
         }
-
-        var savedId = parameters.Get<string>("@SavedItemId");
 
         logger.LogInformation("Catalog item {ItemId} {Action} by {User}.",
             savedId, itemId is null ? "created" : "updated", current.Username);
@@ -383,14 +390,14 @@ public static class CatalogEndpoints
     }
 
     private static Task<ItemRow?> LoadAsync(
-        SqlConnection connection, string itemId, string? branchId, CancellationToken ct) =>
+        NpgsqlConnection connection, string itemId, string? branchId, CancellationToken ct) =>
         connection.QuerySingleOrDefaultAsync<ItemRow>(new CommandDefinition(
             """
             SELECT
                 i.ItemId, i.Kind, i.NameAr, i.NameEn, i.DescriptionAr, i.DescriptionEn,
                 i.Sku, i.Barcode, i.CategoryId, i.VendorId, i.PrintGroupId, i.PriceH, i.CostH,
                 i.TracksStock, i.ReorderLevel, i.RequiresPreparation, i.IsActive,
-                ISNULL(s.Quantity, 0) AS Quantity
+                COALESCE(s.Quantity, 0) AS Quantity
             FROM core.CatalogItem AS i
             LEFT JOIN inv.StockLevel AS s
                    ON s.ItemId = i.ItemId AND s.BranchId = @BranchId
@@ -433,7 +440,7 @@ public static class CatalogEndpoints
         await using var connection = db.Create();
 
         var rows = await connection.QueryAsync<(string CategoryId, int Count)>(new CommandDefinition(
-            "SELECT CategoryId, COUNT(*) FROM core.CatalogItem WHERE CategoryId IS NOT NULL GROUP BY CategoryId;",
+            "SELECT CategoryId, COUNT(*)::int FROM core.CatalogItem WHERE CategoryId IS NOT NULL GROUP BY CategoryId;",
             cancellationToken: ct));
 
         return Results.Ok(rows.ToDictionary(r => r.CategoryId, r => r.Count));
@@ -466,30 +473,36 @@ public static class CatalogEndpoints
         if (request.Status is not (null or "active" or "inactive"))
             return ProcErrors.Field("status", "Status must be active or inactive.", "الحالة إما نشط أو غير نشط.");
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@CategoryId", categoryId);
-        parameters.Add("@NameAr", request.NameAr?.Trim());
-        parameters.Add("@NameEn", request.NameEn?.Trim());
-        parameters.Add("@AppliesTo", request.AppliesTo ?? "both");
-        parameters.Add("@SortOrder", request.SortOrder);
-        parameters.Add("@IsActive", request.Status != "inactive");
-        parameters.Add("@SavedId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string savedId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_SaveCategory", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            savedId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT SavedId FROM core.usp_SaveCategory(
+                    p_CategoryId => @CategoryId, p_NameAr => @NameAr, p_NameEn => @NameEn,
+                    p_AppliesTo => @AppliesTo, p_SortOrder => @SortOrder, p_IsActive => @IsActive);
+                """,
+                new
+                {
+                    CategoryId = categoryId,
+                    NameAr = request.NameAr?.Trim(),
+                    NameEn = request.NameEn?.Trim(),
+                    AppliesTo = request.AppliesTo ?? "both",
+                    request.SortOrder,
+                    IsActive = request.Status != "inactive"
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number is >= 65000 and < 65010)
+        catch (PostgresException ex) when (ex.ErrorNumber() is >= 65000 and < 65010)
         {
-            return ex.Number switch
+            return ex.ErrorNumber() switch
             {
                 65002 => ProcErrors.NotFound("No such category.", "لا يوجد تصنيف بهذا المعرف."),
                 /* The message carries the item count, so it is passed through. */
-                65003 => ProcErrors.Conflict("deactivation_blocked", ex.Message,
+                65003 => ProcErrors.Conflict("deactivation_blocked", ex.MessageText,
                     "ما زال هذا التصنيف يحتوي على أصناف نشطة. انقلها أو عطّلها أولًا."),
                 65001 => ProcErrors.Field("appliesTo",
                     "A category holds products, services or both.", "التصنيف يضم منتجات أو خدمات أو كليهما."),
@@ -501,8 +514,6 @@ public static class CatalogEndpoints
                     "Both names are required.", "الاسمان العربي والإنجليزي مطلوبان.")
             };
         }
-
-        var savedId = parameters.Get<string>("@SavedId");
 
         logger.LogInformation("Category {CategoryId} {Action} by {User}.",
             savedId, categoryId is null ? "created" : "updated", current.Username);
@@ -516,15 +527,15 @@ public static class CatalogEndpoints
     }
 
     private static async Task<List<CategoryRow>> LoadCategoriesAsync(
-        SqlConnection connection, string? categoryId, bool includeInactive, CancellationToken ct) =>
+        NpgsqlConnection connection, string? categoryId, bool includeInactive, CancellationToken ct) =>
         (await connection.QueryAsync<CategoryRow>(new CommandDefinition(
             """
             SELECT c.CategoryId, c.NameAr, c.NameEn, c.AppliesTo, c.SortOrder, c.IsActive,
                    c.CreatedAtUtc, c.UpdatedAtUtc,
-                   (SELECT COUNT(*) FROM core.CatalogItem AS i WHERE i.CategoryId = c.CategoryId) AS ItemCount
+                   (SELECT COUNT(*)::int FROM core.CatalogItem AS i WHERE i.CategoryId = c.CategoryId) AS ItemCount
             FROM core.Category AS c
             WHERE (@CategoryId IS NULL OR c.CategoryId = @CategoryId)
-              AND (@IncludeInactive = 1 OR c.IsActive = 1)
+              AND (@IncludeInactive OR c.IsActive)
             ORDER BY c.SortOrder, c.NameEn;
             """,
             new { CategoryId = categoryId, IncludeInactive = includeInactive },
@@ -572,26 +583,32 @@ public static class CatalogEndpoints
         if (request.Status is not (null or "active" or "inactive"))
             return ProcErrors.Field("status", "Status must be active or inactive.", "الحالة إما نشط أو غير نشط.");
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@PrintGroupId", printGroupId);
-        parameters.Add("@NameAr", request.NameAr?.Trim());
-        parameters.Add("@NameEn", request.NameEn?.Trim());
-        parameters.Add("@TicketTitle", Blank(request.TicketTitle));
-        parameters.Add("@SortOrder", request.SortOrder);
-        parameters.Add("@IsActive", request.Status != "inactive");
-        parameters.Add("@SavedId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string savedId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_SavePrintGroup", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            savedId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT SavedId FROM core.usp_SavePrintGroup(
+                    p_PrintGroupId => @PrintGroupId, p_NameAr => @NameAr, p_NameEn => @NameEn,
+                    p_TicketTitle => @TicketTitle, p_SortOrder => @SortOrder, p_IsActive => @IsActive);
+                """,
+                new
+                {
+                    PrintGroupId = printGroupId,
+                    NameAr = request.NameAr?.Trim(),
+                    NameEn = request.NameEn?.Trim(),
+                    TicketTitle = Blank(request.TicketTitle),
+                    request.SortOrder,
+                    IsActive = request.Status != "inactive"
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number is >= 65010 and < 65020)
+        catch (PostgresException ex) when (ex.ErrorNumber() is >= 65010 and < 65020)
         {
-            return ex.Number switch
+            return ex.ErrorNumber() switch
             {
                 65011 => ProcErrors.NotFound("No such print group.", "لا توجد مجموعة طباعة بهذا المعرف."),
                 65012 => ProcErrors.Conflict("deactivation_blocked",
@@ -606,8 +623,6 @@ public static class CatalogEndpoints
             };
         }
 
-        var savedId = parameters.Get<string>("@SavedId");
-
         logger.LogInformation("Print group {PrintGroupId} {Action} by {User}.",
             savedId, printGroupId is null ? "created" : "updated", current.Username);
         http.Items["AuditEntityId"] = savedId;
@@ -620,15 +635,15 @@ public static class CatalogEndpoints
     }
 
     private static async Task<List<PrintGroupRow>> LoadPrintGroupsAsync(
-        SqlConnection connection, string? printGroupId, bool includeInactive, CancellationToken ct) =>
+        NpgsqlConnection connection, string? printGroupId, bool includeInactive, CancellationToken ct) =>
         (await connection.QueryAsync<PrintGroupRow>(new CommandDefinition(
             """
             SELECT g.PrintGroupId, g.NameAr, g.NameEn, g.TicketTitle, g.SortOrder, g.IsActive,
                    g.CreatedAtUtc, g.UpdatedAtUtc,
-                   (SELECT COUNT(*) FROM core.CatalogItem AS i WHERE i.PrintGroupId = g.PrintGroupId) AS ItemCount
+                   (SELECT COUNT(*)::int FROM core.CatalogItem AS i WHERE i.PrintGroupId = g.PrintGroupId) AS ItemCount
             FROM core.PrintGroup AS g
             WHERE (@PrintGroupId IS NULL OR g.PrintGroupId = @PrintGroupId)
-              AND (@IncludeInactive = 1 OR g.IsActive = 1)
+              AND (@IncludeInactive OR g.IsActive)
             ORDER BY g.SortOrder, g.NameEn;
             """,
             new { PrintGroupId = printGroupId, IncludeInactive = includeInactive },

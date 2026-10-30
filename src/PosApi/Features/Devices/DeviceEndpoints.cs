@@ -5,6 +5,7 @@ using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
 using PosApi.Tenancy;
+using Npgsql;
 
 namespace PosApi.Features.Devices;
 
@@ -70,17 +71,17 @@ public static class DeviceEndpoints
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             """
             SELECT * FROM device.vw_DeviceStatus
             WHERE (@BranchId   IS NULL OR BranchId = @BranchId)
               AND (@Status     IS NULL OR ConnectionStatus = @Status)
               AND (@DeviceType IS NULL OR DeviceType = @DeviceType)
               AND (@Search     IS NULL
-                   OR DeviceName   LIKE N'%' + @Search + N'%'
-                   OR DeviceId     LIKE N'%' + @Search + N'%'
-                   OR SerialNumber LIKE N'%' + @Search + N'%'
-                   OR Location     LIKE N'%' + @Search + N'%')
+                   OR DeviceName   COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR DeviceId     COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR SerialNumber COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR Location     COLLATE "default" ILIKE '%' || @Search || '%')
             ORDER BY BranchId, DeviceName;
             """,
             new
@@ -98,7 +99,7 @@ public static class DeviceEndpoints
     {
         await using var connection = db.Create();
 
-        var device = await connection.QuerySingleOrDefaultAsync(new CommandDefinition(
+        var device = await connection.QuerySingleRowOrDefaultAsync(new CommandDefinition(
             "SELECT * FROM device.vw_DeviceStatus WHERE DeviceId = @DeviceId;",
             new { DeviceId = deviceId }, cancellationToken: ct));
 
@@ -110,12 +111,13 @@ public static class DeviceEndpoints
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             """
-            SELECT TOP (@Take) EventId, EventType, Severity, MessageEn, MessageAr, OccurredAtUtc
+            SELECT EventId, EventType, Severity, MessageEn, MessageAr, OccurredAtUtc
             FROM device.DeviceEvent
             WHERE DeviceId = @DeviceId
-            ORDER BY OccurredAtUtc DESC;
+            ORDER BY OccurredAtUtc DESC
+            LIMIT @Take;
             """,
             new { DeviceId = deviceId, Take = take <= 0 ? 50 : Math.Min(take, 200) },
             cancellationToken: ct));
@@ -138,7 +140,7 @@ public static class DeviceEndpoints
         await using var connection = db.Create();
 
         if (await connection.ExecuteScalarAsync<int>(new CommandDefinition(
-                "SELECT COUNT(*) FROM device.PosDevice WHERE DeviceId = @DeviceId;",
+                "SELECT COUNT(*)::int FROM device.PosDevice WHERE DeviceId = @DeviceId;",
                 new { request.DeviceId }, cancellationToken: ct)) > 0)
         {
             return Results.Conflict(ApiError.Create(
@@ -149,7 +151,7 @@ public static class DeviceEndpoints
         /* The plan's device limit, counted on active terminals. */
         if (tenant.Tenant!.MaxDevices is { } maxDevices &&
             await connection.ExecuteScalarAsync<int>(new CommandDefinition(
-                "SELECT COUNT(*) FROM device.PosDevice WHERE IsActive = 1;", cancellationToken: ct)) >= maxDevices)
+                "SELECT COUNT(*)::int FROM device.PosDevice WHERE IsActive;", cancellationToken: ct)) >= maxDevices)
         {
             return Results.Conflict(ApiError.Create(
                 "plan_limit_devices",
@@ -168,10 +170,10 @@ public static class DeviceEndpoints
             VALUES
                 (@DeviceId, @DeviceName, @DeviceType, @DeviceModel, @BranchId, @Location,
                  @Description, @PaperWidth, @PrinterKind, @Code,
-                 DATEADD(HOUR, 24, SYSUTCDATETIME()), @IsActive, @Actor);
+                 (now() AT TIME ZONE 'utc') + interval '24 hours', @IsActive, @Actor);
 
             INSERT INTO device.DeviceEvent (DeviceId, EventType, Severity, MessageEn, MessageAr)
-            VALUES (@DeviceId, N'created', N'info', N'Device record created', N'تم إنشاء سجل الجهاز');
+            VALUES (@DeviceId, 'created', 'info', 'Device record created', 'تم إنشاء سجل الجهاز');
             """,
             new
             {
@@ -203,14 +205,14 @@ public static class DeviceEndpoints
         var affected = await connection.ExecuteAsync(new CommandDefinition(
             """
             UPDATE device.PosDevice
-            SET DeviceName  = ISNULL(@DeviceName, DeviceName),
-                DeviceModel = ISNULL(@DeviceModel, DeviceModel),
-                BranchId    = ISNULL(@BranchId, BranchId),
-                Location    = ISNULL(@Location, Location),
-                Description = ISNULL(@Description, Description),
-                PaperWidth  = ISNULL(@PaperWidth, PaperWidth),
-                IsActive    = ISNULL(@IsActive, IsActive),
-                UpdatedAtUtc = SYSUTCDATETIME(),
+            SET DeviceName  = COALESCE(@DeviceName, DeviceName),
+                DeviceModel = COALESCE(@DeviceModel, DeviceModel),
+                BranchId    = COALESCE(@BranchId, BranchId),
+                Location    = COALESCE(@Location, Location),
+                Description = COALESCE(@Description, Description),
+                PaperWidth  = COALESCE(@PaperWidth, PaperWidth),
+                IsActive    = COALESCE(@IsActive, IsActive),
+                UpdatedAtUtc = now() AT TIME ZONE 'utc',
                 UpdatedBy    = @Actor
             WHERE DeviceId = @DeviceId;
             """,
@@ -244,8 +246,8 @@ public static class DeviceEndpoints
             """
             UPDATE device.PosDevice
             SET RegistrationCode = @Code,
-                CodeExpiresAtUtc = DATEADD(HOUR, 24, SYSUTCDATETIME()),
-                UpdatedAtUtc = SYSUTCDATETIME()
+                CodeExpiresAtUtc = (now() AT TIME ZONE 'utc') + interval '24 hours',
+                UpdatedAtUtc = now() AT TIME ZONE 'utc'
             WHERE DeviceId = @DeviceId;
             """,
             new { DeviceId = deviceId, Code = code }, cancellationToken: ct));
@@ -262,7 +264,7 @@ public static class DeviceEndpoints
         await using var connection = db.Create();
 
         var registered = await connection.ExecuteScalarAsync<int>(new CommandDefinition(
-            "SELECT COUNT(*) FROM device.PosDevice WHERE DeviceId = @DeviceId AND RegisteredAtUtc IS NOT NULL;",
+            "SELECT COUNT(*)::int FROM device.PosDevice WHERE DeviceId = @DeviceId AND RegisteredAtUtc IS NOT NULL;",
             new { DeviceId = deviceId }, cancellationToken: ct));
 
         if (registered == 0)
@@ -281,7 +283,7 @@ public static class DeviceEndpoints
                 (CommandId, DeviceId, CommandType, Payload, ExpiresAtUtc, RequestedBy)
             VALUES
                 (@CommandId, @DeviceId, @CommandType, @Payload,
-                 DATEADD(SECOND, @TtlSeconds, SYSUTCDATETIME()), @Actor);
+                 (now() AT TIME ZONE 'utc') + make_interval(secs => @TtlSeconds), @Actor);
             """,
             new
             {
@@ -305,7 +307,7 @@ public static class DeviceEndpoints
     {
         await using var connection = db.Create();
 
-        var row = await connection.QuerySingleOrDefaultAsync(new CommandDefinition(
+        var row = await connection.QuerySingleRowOrDefaultAsync(new CommandDefinition(
             """
             SELECT CommandId, CommandType, Status, Succeeded, ResultMessage, ResultData,
                    RoundTripMs, QueuedAtUtc, SentAtUtc, CompletedAtUtc, ExpiresAtUtc
@@ -356,29 +358,31 @@ public static class DeviceEndpoints
         parameters.Add("@DeviceModel", request.DeviceModel);
         parameters.Add("@AppVersion", request.AppVersion);
         parameters.Add("@TokenHash", HashToken(token));
-        parameters.Add("@DeviceId", dbType: System.Data.DbType.String,
-                       direction: System.Data.ParameterDirection.Output, size: 40);
 
         await using var connection = db.Create();
 
+        string deviceId;
+
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "device.usp_RegisterDevice", parameters,
-                commandType: System.Data.CommandType.StoredProcedure,
-                cancellationToken: ct));
+            deviceId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT DeviceId FROM device.usp_RegisterDevice(
+                    p_RegistrationCode => @RegistrationCode, p_SerialNumber => @SerialNumber,
+                    p_AndroidId => @AndroidId, p_DeviceModel => @DeviceModel,
+                    p_AppVersion => @AppVersion, p_TokenHash => @TokenHash);
+                """,
+                parameters, cancellationToken: ct));
         }
-        catch (Microsoft.Data.SqlClient.SqlException ex) when (ex.Number is >= 58000 and <= 58004)
+        catch (PostgresException ex) when (ex.ErrorNumber() is >= 58000 and <= 58004)
         {
-            logger.LogWarning("Device registration refused: {Message}", ex.Message);
+            logger.LogWarning("Device registration refused: {Message}", ex.MessageText);
 
             return Results.BadRequest(ApiError.Create(
-                "registration_refused", ex.Message, ex.Message));
+                "registration_refused", ex.MessageText, ex.MessageText));
         }
 
-        var deviceId = parameters.Get<string>("@DeviceId");
-
-        var device = await connection.QuerySingleAsync(new CommandDefinition(
+        var device = await connection.QuerySingleRowAsync(new CommandDefinition(
             "SELECT * FROM device.vw_DeviceStatus WHERE DeviceId = @DeviceId;",
             new { DeviceId = deviceId }, cancellationToken: ct));
 
@@ -405,22 +409,39 @@ public static class DeviceEndpoints
         parameters.Add("@PrinterStatus", request.PrinterStatus ?? "unknown");
         parameters.Add("@PaperStatus", request.PaperStatus ?? "unknown");
         parameters.Add("@PrinterError", request.PrinterError);
-        parameters.Add("@BatteryPercent", request.BatteryPercent);
+        /* Typed, so a missing reading still matches the integer parameter. */
+        parameters.Add("@BatteryPercent", request.BatteryPercent, System.Data.DbType.Int32);
         parameters.Add("@NetworkType", request.NetworkType);
         parameters.Add("@AppVersion", request.AppVersion);
-        parameters.Add("@NextIntervalMs", dbType: System.Data.DbType.Int32,
-                       direction: System.Data.ParameterDirection.Output);
 
-        var commands = (await connection.QueryAsync(new CommandDefinition(
-            "device.usp_RecordHeartbeat", parameters,
-            commandType: System.Data.CommandType.StoredProcedure,
-            cancellationToken: ct))).ToList();
+        /* One row per command to run, each carrying the interval; with nothing
+           to run, one row whose command columns are null. */
+        var rows = (await connection.QueryAsync<HeartbeatRow>(new CommandDefinition(
+            """
+            SELECT NextIntervalMs, CommandId, CommandType, Payload
+            FROM device.usp_RecordHeartbeat(
+                p_DeviceId => @DeviceId, p_PrinterStatus => @PrinterStatus,
+                p_PaperStatus => @PaperStatus, p_PrinterError => @PrinterError,
+                p_BatteryPercent => @BatteryPercent, p_NetworkType => @NetworkType,
+                p_AppVersion => @AppVersion);
+            """,
+            parameters, cancellationToken: ct))).ToList();
+
+        var commands = rows
+            .Where(r => r.CommandId is not null)
+            .Select(r => new Dictionary<string, object?>
+            {
+                ["CommandId"] = r.CommandId,
+                ["CommandType"] = r.CommandType,
+                ["Payload"] = r.Payload
+            })
+            .ToList();
 
         return Results.Ok(new
         {
             acknowledged = true,
             /* The server sets the pace: sooner while work is outstanding. */
-            nextIntervalMs = parameters.Get<int>("@NextIntervalMs"),
+            nextIntervalMs = rows[0].NextIntervalMs,
             commands
         });
     }
@@ -437,13 +458,16 @@ public static class DeviceEndpoints
         if (deviceId is null) return Results.Unauthorized();
 
         await connection.ExecuteAsync(new CommandDefinition(
-            "device.usp_CompleteCommand",
+            """
+            SELECT device.usp_CompleteCommand(
+                p_CommandId => @CommandId, p_DeviceId => @DeviceId, p_Succeeded => @Succeeded,
+                p_ResultMessage => @ResultMessage, p_ResultData => @ResultData);
+            """,
             new
             {
                 CommandId = commandId, DeviceId = deviceId,
                 request.Succeeded, request.ResultMessage, request.ResultData
             },
-            commandType: System.Data.CommandType.StoredProcedure,
             cancellationToken: ct));
 
         return Results.Ok(new { commandId, recorded = true });
@@ -465,7 +489,7 @@ public static class DeviceEndpoints
         return await connection.QuerySingleOrDefaultAsync<string?>(new CommandDefinition(
             """
             SELECT DeviceId FROM device.PosDevice
-            WHERE TokenHash = @TokenHash AND IsActive = 1 AND RegisteredAtUtc IS NOT NULL;
+            WHERE TokenHash = @TokenHash AND IsActive AND RegisteredAtUtc IS NOT NULL;
             """,
             new { TokenHash = HashToken(token) }, cancellationToken: ct));
     }
@@ -504,6 +528,14 @@ public static class DeviceEndpoints
         }
 
         return $"{new string(chars, 0, 4)}-{new string(chars, 4, 4)}";
+    }
+
+    private sealed record HeartbeatRow
+    {
+        public int NextIntervalMs { get; init; }
+        public string? CommandId { get; init; }
+        public string? CommandType { get; init; }
+        public string? Payload { get; init; }
     }
 }
 

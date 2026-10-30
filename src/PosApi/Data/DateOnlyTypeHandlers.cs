@@ -4,17 +4,16 @@ using Dapper;
 namespace PosApi.Data;
 
 /// <summary>
-/// Teach Dapper to pass DateOnly and TimeOnly to SQL Server.
+/// Teach Dapper to pass and read DateOnly and TimeOnly.
 ///
-/// Microsoft.Data.SqlClient has no conversion for these types. Handing one to a
-/// parameter throws "Failed to convert parameter value from a DateOnly to a
-/// DateTime" — which surfaces as a 500 on any endpoint that takes a date filter,
+/// Dapper does not know these types on its own. Without a handler a DateOnly
+/// parameter fails to convert — a 500 on any endpoint that takes a date filter,
 /// with nothing in the message connecting it to the date.
 ///
-/// Reading has the same gap in reverse: a DATE column comes back as DateTime,
-/// and Dapper cannot map it onto a DateOnly property without being told how.
-/// That one hides until a row has a non-null date — so it passes every test
-/// against seed data where the column happens to be empty.
+/// Reading has the same gap in reverse: Npgsql returns a date column as
+/// DateTime, and Dapper cannot map it onto a DateOnly property without being
+/// told how. That one hides until a row has a non-null date — so it passes
+/// every test against seed data where the column happens to be empty.
 /// </summary>
 public sealed class DateOnlyTypeHandler : SqlMapper.TypeHandler<DateOnly>
 {
@@ -56,7 +55,7 @@ public sealed class TimeOnlyTypeHandler : SqlMapper.TypeHandler<TimeOnly>
 public static class DapperConfiguration
 {
     /// <summary>
-    /// Register the handlers. Call once, before any query runs.
+    /// Register the handlers and the timestamp mode. Call once, before any query runs.
     ///
     /// The nullable variants are registered explicitly: Dapper resolves
     /// DateOnly? separately from DateOnly, and a filter left blank arrives as
@@ -64,6 +63,12 @@ public static class DapperConfiguration
     /// </summary>
     public static void Configure()
     {
+        /* Every DateTime is a UTC wall-clock value in a timestamp column, as it
+           was in DATETIME2. Npgsql would otherwise send a UTC DateTime as
+           timestamptz, which does not convert implicitly to a function's
+           timestamp parameter — the call fails as "function does not exist". */
+        AppContext.SetSwitch("Npgsql.EnableLegacyTimestampBehavior", true);
+
         SqlMapper.AddTypeHandler(new DateOnlyTypeHandler());
         SqlMapper.AddTypeHandler(new TimeOnlyTypeHandler());
 

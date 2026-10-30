@@ -1,7 +1,6 @@
-using System.Data;
 using System.Text.RegularExpressions;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -127,29 +126,33 @@ public static partial class ExpenseSetupEndpoints
         if (request.Status is not (null or "active" or "inactive"))
             return ProcErrors.Field("status", "Status must be active or inactive.", "الحالة إما نشط أو غير نشط.");
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@CategoryId", categoryId);
-        parameters.Add("@NameAr", request.NameAr?.Trim());
-        parameters.Add("@NameEn", request.NameEn?.Trim());
-        parameters.Add("@AccountCode", request.AccountCode?.Trim());
-        parameters.Add("@IsActive", request.Status is null ? (bool?)null : request.Status == "active");
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@SavedId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string savedId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_SaveExpenseCategory", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            savedId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT SavedId FROM fin.usp_SaveExpenseCategory(
+                    p_CategoryId => @CategoryId, p_NameAr => @NameAr, p_NameEn => @NameEn,
+                    p_AccountCode => @AccountCode, p_IsActive => @IsActive::boolean, p_Actor => @Actor);
+                """,
+                new
+                {
+                    CategoryId = categoryId,
+                    NameAr = request.NameAr?.Trim(),
+                    NameEn = request.NameEn?.Trim(),
+                    AccountCode = request.AccountCode?.Trim(),
+                    IsActive = request.Status is null ? (bool?)null : request.Status == "active",
+                    Actor = current.Username
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapError(ex, request.NameAr) is { } mapped)
+        catch (PostgresException ex) when (MapError(ex, request.NameAr) is { } mapped)
         {
             return mapped;
         }
-
-        var savedId = parameters.Get<string>("@SavedId");
 
         logger.LogInformation("Expense category {CategoryId} {Action} by {Actor}.",
             savedId, categoryId is null ? "created" : "updated", current.Username);
@@ -163,7 +166,7 @@ public static partial class ExpenseSetupEndpoints
     }
 
     private static async Task<List<ExpenseCategoryDto>> LoadCategoriesAsync(
-        SqlConnection connection, string? categoryId, bool includeInactive,
+        NpgsqlConnection connection, string? categoryId, bool includeInactive,
         ILanguageContext language, CancellationToken ct)
     {
         var rows = await connection.QueryAsync<CategoryRow>(new CommandDefinition(
@@ -171,12 +174,12 @@ public static partial class ExpenseSetupEndpoints
             SELECT c.CategoryId, c.NameAr, c.NameEn, c.AccountCode,
                    a.NameAr AS AccountNameAr, a.NameEn AS AccountNameEn,
                    c.IsActive, c.CreatedAtUtc, c.UpdatedAtUtc,
-                   (SELECT COUNT(*) FROM fin.Expense AS e WHERE e.CategoryId = c.CategoryId) AS ExpenseCount,
-                   (SELECT COUNT(*) FROM fin.RecurringPayment AS r WHERE r.CategoryId = c.CategoryId) AS RecurringCount
+                   (SELECT COUNT(*)::int FROM fin.Expense AS e WHERE e.CategoryId = c.CategoryId) AS ExpenseCount,
+                   (SELECT COUNT(*)::int FROM fin.RecurringPayment AS r WHERE r.CategoryId = c.CategoryId) AS RecurringCount
             FROM fin.ExpenseCategory AS c
             JOIN fin.Account AS a ON a.AccountCode = c.AccountCode
             WHERE (@CategoryId IS NULL OR c.CategoryId = @CategoryId)
-              AND (@IncludeInactive = 1 OR c.IsActive = 1)
+              AND (@IncludeInactive OR c.IsActive)
             ORDER BY c.NameEn;
             """,
             new { CategoryId = categoryId, IncludeInactive = includeInactive }, cancellationToken: ct));
@@ -195,12 +198,12 @@ public static partial class ExpenseSetupEndpoints
     /// </summary>
     private const string RecurringSelect = """
         SELECT r.*, c.NameAr AS CategoryNameAr, c.NameEn AS CategoryNameEn,
-               DATEDIFF(DAY, CAST(SYSUTCDATETIME() AS DATE), r.NextDueOn) AS DaysUntilDue,
+               r.NextDueOn - (now() AT TIME ZONE 'utc')::date AS DaysUntilDue,
                CASE
-                   WHEN r.NextDueOn <  CAST(SYSUTCDATETIME() AS DATE) THEN N'overdue'
-                   WHEN r.NextDueOn =  CAST(SYSUTCDATETIME() AS DATE) THEN N'today'
-                   WHEN DATEDIFF(DAY, CAST(SYSUTCDATETIME() AS DATE), r.NextDueOn) <= 5 THEN N'soon'
-                   ELSE N'normal'
+                   WHEN r.NextDueOn <  (now() AT TIME ZONE 'utc')::date THEN 'overdue'
+                   WHEN r.NextDueOn =  (now() AT TIME ZONE 'utc')::date THEN 'today'
+                   WHEN r.NextDueOn - (now() AT TIME ZONE 'utc')::date <= 5 THEN 'soon'
+                   ELSE 'normal'
                END AS Urgency
         FROM fin.RecurringPayment AS r
         JOIN fin.ExpenseCategory AS c ON c.CategoryId = r.CategoryId
@@ -213,7 +216,7 @@ public static partial class ExpenseSetupEndpoints
 
         // Urgency is derived here rather than stored, so a payment that becomes
         // overdue overnight reads as overdue with nothing to refresh.
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             $"""
             {RecurringSelect}
             WHERE (@BranchId IS NULL OR r.BranchId = @BranchId OR r.BranchId IS NULL)
@@ -232,8 +235,8 @@ public static partial class ExpenseSetupEndpoints
         return row is null ? RecurringNotFound() : Results.Ok(row);
     }
 
-    private static Task<dynamic?> LoadRecurringAsync(SqlConnection connection, string recurringId, CancellationToken ct) =>
-        connection.QuerySingleOrDefaultAsync(new CommandDefinition(
+    private static Task<dynamic?> LoadRecurringAsync(NpgsqlConnection connection, string recurringId, CancellationToken ct) =>
+        connection.QuerySingleRowOrDefaultAsync(new CommandDefinition(
             $"{RecurringSelect} WHERE r.RecurringId = @RecurringId;",
             new { RecurringId = recurringId }, cancellationToken: ct));
 
@@ -260,34 +263,41 @@ public static partial class ExpenseSetupEndpoints
         var branchId = ProcErrors.Blank(request.BranchId);
         if (!current.CanSeeBranch(branchId)) return Results.Forbid();
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@RecurringId", recurringId);
-        parameters.Add("@DescriptionEn", ProcErrors.Blank(request.DescriptionEn) ?? ProcErrors.Blank(request.Description));
-        parameters.Add("@DescriptionAr", ProcErrors.Blank(request.DescriptionAr));
-        parameters.Add("@CategoryId", request.CategoryId);
-        parameters.Add("@BranchId", branchId);
-        parameters.Add("@AmountH", request.AmountH);
-        parameters.Add("@Frequency", request.Frequency?.Trim().ToLowerInvariant());
-        parameters.Add("@NextDueOn", request.NextDueOn);
-        parameters.Add("@PaymentMethod", ProcErrors.Blank(request.PaymentMethod)?.ToLowerInvariant() ?? "bank");
-        parameters.Add("@Note", ProcErrors.Blank(request.Note));
-        parameters.Add("@Status", ProcErrors.Blank(request.Status));
-        parameters.Add("@SavedId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string savedId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_SaveRecurringPayment", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            savedId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT SavedId FROM fin.usp_SaveRecurringPayment(
+                    p_RecurringId => @RecurringId, p_DescriptionEn => @DescriptionEn,
+                    p_DescriptionAr => @DescriptionAr, p_CategoryId => @CategoryId,
+                    p_BranchId => @BranchId, p_AmountH => @AmountH, p_Frequency => @Frequency,
+                    p_NextDueOn => @NextDueOn::date, p_PaymentMethod => @PaymentMethod,
+                    p_Note => @Note, p_Status => @Status);
+                """,
+                new
+                {
+                    RecurringId = recurringId,
+                    DescriptionEn = ProcErrors.Blank(request.DescriptionEn) ?? ProcErrors.Blank(request.Description),
+                    DescriptionAr = ProcErrors.Blank(request.DescriptionAr),
+                    request.CategoryId,
+                    BranchId = branchId,
+                    request.AmountH,
+                    Frequency = request.Frequency?.Trim().ToLowerInvariant(),
+                    request.NextDueOn,
+                    PaymentMethod = ProcErrors.Blank(request.PaymentMethod)?.ToLowerInvariant() ?? "bank",
+                    Note = ProcErrors.Blank(request.Note),
+                    Status = ProcErrors.Blank(request.Status)
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapError(ex, null) is { } mapped)
+        catch (PostgresException ex) when (MapError(ex, null) is { } mapped)
         {
             return mapped;
         }
-
-        var savedId = parameters.Get<string>("@SavedId");
 
         logger.LogInformation("Recurring payment {RecurringId} {Action} by {Actor}.",
             savedId, recurringId is null ? "created" : "updated", current.Username);
@@ -310,11 +320,11 @@ public static partial class ExpenseSetupEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_SetRecurringStatus",
+                "SELECT fin.usp_SetRecurringStatus(p_RecurringId => @RecurringId, p_Status => @Status);",
                 new { RecurringId = recurringId, Status = request.Status?.Trim().ToLowerInvariant() },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapError(ex, null) is { } mapped)
+        catch (PostgresException ex) when (MapError(ex, null) is { } mapped)
         {
             return mapped;
         }
@@ -365,7 +375,7 @@ public static partial class ExpenseSetupEndpoints
             FROM fin.ExpenseRecognition AS r
             JOIN fin.Expense AS e ON e.ExpenseId = r.ExpenseId
             JOIN fin.ExpenseCategory AS c ON c.CategoryId = e.CategoryId
-            WHERE e.Status = N'posted'
+            WHERE e.Status = 'posted'
               AND r.PeriodMonth >= @Start AND r.PeriodMonth <= @End
               AND (@BranchId IS NULL OR e.BranchId = @BranchId OR e.BranchId IS NULL)
               AND (@CategoryId IS NULL OR e.CategoryId = @CategoryId)
@@ -428,7 +438,7 @@ public static partial class ExpenseSetupEndpoints
     private static IResult RecurringNotFound() =>
         ProcErrors.NotFound("Recurring payment not found.", "الدفعة المتكرّرة غير موجودة.");
 
-    private static IResult? MapError(SqlException ex, string? nameAr) => ex.Number switch
+    private static IResult? MapError(PostgresException ex, string? nameAr) => ex.ErrorNumber() switch
     {
         69000 => ProcErrors.Field(string.IsNullOrWhiteSpace(nameAr) ? "nameAr" : "nameEn",
             "Both names are required.", "الاسمان العربي والإنجليزي مطلوبان."),

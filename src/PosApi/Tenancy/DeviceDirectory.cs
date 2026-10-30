@@ -52,7 +52,7 @@ public sealed class DeviceDirectory
         return await control.QuerySingleOrDefaultAsync<string>(new CommandDefinition(
             """
             SELECT TenantId FROM ctl.HardwareDevice
-            WHERE Serial = @Serial AND Status IN (N'assigned', N'active', N'suspended');
+            WHERE Serial = @Serial AND Status IN ('assigned', 'active', 'suspended');
             """,
             new { Serial = serial.Trim() }, cancellationToken: ct));
     }
@@ -70,18 +70,18 @@ public sealed class DeviceDirectory
             DELETE FROM ctl.DeviceCode WHERE RegistrationCode = @Code;
 
             UPDATE ctl.HardwareDevice
-            SET TerminalId = @DeviceId, LastOnlineAtUtc = SYSUTCDATETIME(),
-                Status = CASE WHEN Status = N'assigned' THEN N'active' ELSE Status END,
-                InstalledOn = COALESCE(InstalledOn, CAST(SYSUTCDATETIME() AS DATE)),
-                UpdatedAtUtc = SYSUTCDATETIME()
+            SET TerminalId = @DeviceId, LastOnlineAtUtc = now() AT TIME ZONE 'utc',
+                Status = CASE WHEN Status = 'assigned' THEN 'active' ELSE Status END,
+                InstalledOn = COALESCE(InstalledOn, (now() AT TIME ZONE 'utc')::date),
+                UpdatedAtUtc = now() AT TIME ZONE 'utc'
             WHERE Serial = @Serial AND TenantId = @TenantId;
 
             INSERT INTO ctl.HardwareDeviceEvent (DeviceId, Event, ByName, Detail)
-            SELECT DeviceId, N'Paired with terminal', N'device', @DeviceId
+            SELECT DeviceId, 'Paired with terminal', 'device', @DeviceId
             FROM ctl.HardwareDevice WHERE Serial = @Serial AND TenantId = @TenantId;
 
             INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail)
-            VALUES (N'pos_registered', N'POS registered', @TenantId, @Detail);
+            VALUES ('pos_registered', 'POS registered', @TenantId, @Detail);
             """,
             new
             {

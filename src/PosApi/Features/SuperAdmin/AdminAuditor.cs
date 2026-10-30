@@ -66,10 +66,10 @@ public sealed class AdminAuditor
             INSERT INTO ctl.AdminAudit
                 (AdminId, AdminName, Action, Label, TenantId, EntityId, BeforeValue, AfterValue, Reason,
                  Method, Endpoint, TableName, Operation, DurationMs, RowsAffected, IpAddress, Result, ErrorMessage)
-            OUTPUT INSERTED.AuditId
             VALUES
                 (@AdminId, @AdminName, @Action, @Label, @TenantId, @EntityId, @Before, @After, @Reason,
-                 @Method, @Endpoint, @Table, @Operation, @DurationMs, @RowsAffected, @Ip, @Result, @Error);
+                 @Method, @Endpoint, @Table, @Operation, @DurationMs, @RowsAffected, @Ip, @Result, @Error)
+            RETURNING AuditId;
             """,
             new
             {
@@ -101,17 +101,17 @@ public sealed class AdminAuditor
     {
         var rows = await control.QueryAsync<AuditRowDto>(new CommandDefinition(
             """
-            SELECT TOP (@Take)
-                   CONCAT(N'AUD-', a.AuditId) AS Id, a.AtUtc AS [At], a.AdminName AS Admin, a.Action, a.Label,
-                   LEFT(a.Action, CHARINDEX(N'.', a.Action + N'.') - 1) AS Entity,
-                   a.TenantId AS ClientId, t.Name AS ClientName, a.BeforeValue AS [Before], a.AfterValue AS [After],
-                   a.Reason, a.Method, a.Endpoint, a.TableName AS [Table], a.Operation, a.DurationMs,
+            SELECT 'AUD-' || a.AuditId AS Id, a.AtUtc AS At, a.AdminName AS Admin, a.Action, a.Label,
+                   split_part(a.Action COLLATE "default", '.', 1) AS Entity,
+                   a.TenantId AS ClientId, t.Name AS ClientName, a.BeforeValue AS Before, a.AfterValue AS After,
+                   a.Reason, a.Method, a.Endpoint, a.TableName AS "Table", a.Operation, a.DurationMs,
                    a.RowsAffected, a.IpAddress AS Ip, a.Result, a.ErrorMessage AS Error
             FROM ctl.AdminAudit AS a
             LEFT JOIN ctl.Tenant AS t ON t.TenantId = a.TenantId
             WHERE (@TenantId IS NULL OR a.TenantId = @TenantId)
               AND (@AuditId IS NULL OR a.AuditId = @AuditId)
-            ORDER BY a.AuditId DESC;
+            ORDER BY a.AuditId DESC
+            LIMIT @Take;
             """, new { Take = take, TenantId = tenantId, AuditId = auditId }, cancellationToken: ct));
 
         return rows.ToList();

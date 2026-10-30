@@ -177,7 +177,7 @@ public static class AdminAuthEndpoints
                 UPDATE ctl.Admin
                 SET FailedLogins = FailedLogins + 1,
                     LockedUntilUtc = CASE WHEN FailedLogins + 1 >= @Max
-                                          THEN DATEADD(MINUTE, @Minutes, SYSUTCDATETIME()) ELSE LockedUntilUtc END
+                                          THEN (now() AT TIME ZONE 'utc') + make_interval(mins => @Minutes) ELSE LockedUntilUtc END
                 WHERE AdminId = @AdminId;
                 """,
                 new { admin.AdminId, Max = options.MaxFailedLogins, Minutes = options.LockoutMinutes },
@@ -253,8 +253,8 @@ public static class AdminAuthEndpoints
 
         var admin = await control.QuerySingleAsync<AdminRow>(new CommandDefinition(
             """
-            UPDATE ctl.AdminOtp SET ConsumedAtUtc = SYSUTCDATETIME() WHERE ChallengeId = @ChallengeId;
-            UPDATE ctl.Admin SET LastLoginAtUtc = SYSUTCDATETIME() WHERE AdminId = @AdminId;
+            UPDATE ctl.AdminOtp SET ConsumedAtUtc = now() AT TIME ZONE 'utc' WHERE ChallengeId = @ChallengeId;
+            UPDATE ctl.Admin SET LastLoginAtUtc = now() AT TIME ZONE 'utc' WHERE AdminId = @AdminId;
 
             SELECT AdminId, Name, Mobile, Role, Permissions, PasswordHash, PasswordSalt, Status,
                    FailedLogins, LockedUntilUtc, SessionVersion, MustChangePassword
@@ -262,7 +262,7 @@ public static class AdminAuthEndpoints
             """, new { request.ChallengeId, otp.AdminId }, cancellationToken: ct));
 
         var minutes = int.TryParse(await control.ExecuteScalarAsync<string?>(new CommandDefinition(
-            "SELECT Value FROM ctl.Setting WHERE SettingKey = N'sessionMinutes';", cancellationToken: ct)), out var m) ? m : 60;
+            "SELECT Value FROM ctl.Setting WHERE SettingKey = 'sessionMinutes';", cancellationToken: ct)), out var m) ? m : 60;
 
         var expires = DateTime.UtcNow.AddMinutes(minutes);
         var claims = new List<Claim>
@@ -283,7 +283,7 @@ public static class AdminAuthEndpoints
         await control.ExecuteAsync(new CommandDefinition(
             """
             INSERT INTO ctl.AdminAudit (AdminId, AdminName, Action, Label, Method, Endpoint, TableName, Operation, IpAddress)
-            VALUES (@AdminId, @Name, N'admin.login', N'Signed in to the console', N'POST', N'/api/superadmin/auth/verify', N'ctl.Admin', N'VIEW', @Ip);
+            VALUES (@AdminId, @Name, 'admin.login', 'Signed in to the console', 'POST', '/api/superadmin/auth/verify', 'ctl.Admin', 'VIEW', @Ip);
             """, new { admin.AdminId, admin.Name, Ip = http.Connection.RemoteIpAddress?.ToString() }, cancellationToken: ct));
 
         return Results.Ok(new
@@ -336,7 +336,7 @@ public static class AdminAuthEndpoints
         await control.ExecuteAsync(new CommandDefinition(
             """
             UPDATE ctl.Admin
-            SET PasswordHash = @Hash, PasswordSalt = @Salt, MustChangePassword = 0, SessionVersion = SessionVersion + 1
+            SET PasswordHash = @Hash, PasswordSalt = @Salt, MustChangePassword = false, SessionVersion = SessionVersion + 1
             WHERE AdminId = @AdminId;
             """, new { Hash = hash, Salt = salt, current.AdminId }, cancellationToken: ct));
 

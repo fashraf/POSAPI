@@ -51,20 +51,20 @@ public static class AuditEndpoints
         await using var connection = db.Create();
 
         const string sql = """
-            SELECT COUNT(*)
+            SELECT COUNT(*)::int
             FROM audit.AuditEntry AS a
             WHERE (@UserId   IS NULL OR a.UserId = @UserId)
               AND (@Action   IS NULL OR a.Action = @Action)
               AND (@Module   IS NULL OR a.Module = @Module)
               AND (@EntityId IS NULL OR a.EntityId = @EntityId)
               AND (@Result   IS NULL OR a.Result = @Result)
-              AND (@From IS NULL OR CAST(a.OccurredAtUtc AS DATE) >= @From)
-              AND (@To   IS NULL OR CAST(a.OccurredAtUtc AS DATE) <= @To)
+              AND (@From::date IS NULL OR a.OccurredAtUtc::date >= @From::date)
+              AND (@To::date   IS NULL OR a.OccurredAtUtc::date <= @To::date)
               AND (@Search IS NULL
-                   OR a.Username    LIKE N'%' + @Search + N'%'
-                   OR a.ApiPath     LIKE N'%' + @Search + N'%'
-                   OR a.EntityId    LIKE N'%' + @Search + N'%'
-                   OR a.CurrentPage LIKE N'%' + @Search + N'%');
+                   OR a.Username    COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR a.ApiPath     COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR a.EntityId    COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR a.CurrentPage COLLATE "default" ILIKE '%' || @Search || '%');
 
             SELECT a.AuditId, a.UserId, a.Username, a.RoleId, a.Action, a.Module,
                    a.EntityType, a.EntityId, a.ApiPath, a.HttpMethod,
@@ -81,18 +81,18 @@ public static class AuditEndpoints
               AND (@Module   IS NULL OR a.Module = @Module)
               AND (@EntityId IS NULL OR a.EntityId = @EntityId)
               AND (@Result   IS NULL OR a.Result = @Result)
-              AND (@From IS NULL OR CAST(a.OccurredAtUtc AS DATE) >= @From)
-              AND (@To   IS NULL OR CAST(a.OccurredAtUtc AS DATE) <= @To)
+              AND (@From::date IS NULL OR a.OccurredAtUtc::date >= @From::date)
+              AND (@To::date   IS NULL OR a.OccurredAtUtc::date <= @To::date)
               AND (@Search IS NULL
-                   OR a.Username    LIKE N'%' + @Search + N'%'
-                   OR a.ApiPath     LIKE N'%' + @Search + N'%'
-                   OR a.EntityId    LIKE N'%' + @Search + N'%'
-                   OR a.CurrentPage LIKE N'%' + @Search + N'%')
+                   OR a.Username    COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR a.ApiPath     COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR a.EntityId    COLLATE "default" ILIKE '%' || @Search || '%'
+                   OR a.CurrentPage COLLATE "default" ILIKE '%' || @Search || '%')
             ORDER BY a.OccurredAtUtc DESC
             OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY;
             """;
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(sql,
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(sql,
             new
             {
                 UserId = userId, Action = action, Module = module, EntityId = entityId,
@@ -103,7 +103,7 @@ public static class AuditEndpoints
             cancellationToken: ct));
 
         var total = await multi.ReadSingleAsync<int>();
-        var rows = (await multi.ReadAsync()).ToList();
+        var rows = (await multi.ReadRowsAsync()).ToList();
 
         return Results.Ok(new PagedResult<object>
         {
@@ -119,7 +119,7 @@ public static class AuditEndpoints
     {
         await using var connection = db.Create();
 
-        var entry = await connection.QuerySingleOrDefaultAsync(new CommandDefinition(
+        var entry = await connection.QuerySingleRowOrDefaultAsync(new CommandDefinition(
             "SELECT * FROM audit.AuditEntry WHERE AuditId = @AuditId;",
             new { AuditId = auditId }, cancellationToken: ct));
 
@@ -131,7 +131,7 @@ public static class AuditEndpoints
     {
         await using var connection = db.Create();
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(
             """
             SELECT DISTINCT Action FROM audit.AuditEntry ORDER BY Action;
             SELECT DISTINCT Module FROM audit.AuditEntry ORDER BY Module;
@@ -143,7 +143,7 @@ public static class AuditEndpoints
         {
             actions = (await multi.ReadAsync<string>()).ToList(),
             modules = (await multi.ReadAsync<string>()).ToList(),
-            users = (await multi.ReadAsync()).ToList()
+            users = (await multi.ReadRowsAsync()).ToList()
         });
     }
 
@@ -152,25 +152,25 @@ public static class AuditEndpoints
     {
         await using var connection = db.Create();
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(
             """
             SELECT * FROM audit.vw_EndpointPerformance ORDER BY AvgMs DESC;
 
             SELECT
-                COUNT(*)      AS TotalCalls,
-                AVG(TotalMs)  AS AvgMs,
-                MAX(TotalMs)  AS WorstMs,
-                SUM(CASE WHEN Succeeded = 0 THEN 1 ELSE 0 END) AS Failures,
-                SUM(CASE WHEN TotalMs >= 2000 THEN 1 ELSE 0 END) AS CriticalCalls,
-                SUM(CASE WHEN TotalMs >= 1000 AND TotalMs < 2000 THEN 1 ELSE 0 END) AS SlowCalls
+                COUNT(*)::int                AS TotalCalls,
+                trunc(AVG(TotalMs))::int     AS AvgMs,
+                MAX(TotalMs)                 AS WorstMs,
+                SUM(CASE WHEN NOT Succeeded THEN 1 ELSE 0 END)::int AS Failures,
+                SUM(CASE WHEN TotalMs >= 2000 THEN 1 ELSE 0 END)::int AS CriticalCalls,
+                SUM(CASE WHEN TotalMs >= 1000 AND TotalMs < 2000 THEN 1 ELSE 0 END)::int AS SlowCalls
             FROM audit.RequestTiming
-            WHERE (@From IS NULL OR CAST(OccurredAtUtc AS DATE) >= @From)
-              AND (@To   IS NULL OR CAST(OccurredAtUtc AS DATE) <= @To);
+            WHERE (@From::date IS NULL OR OccurredAtUtc::date >= @From::date)
+              AND (@To::date   IS NULL OR OccurredAtUtc::date <= @To::date);
             """,
             new { From = from, To = to }, cancellationToken: ct));
 
-        var endpoints = (await multi.ReadAsync()).ToList();
-        var summary = await multi.ReadSingleAsync();
+        var endpoints = (await multi.ReadRowsAsync()).ToList();
+        var summary = await multi.ReadSingleRowAsync();
 
         return Results.Ok(new { endpoints, summary });
     }
@@ -181,28 +181,30 @@ public static class AuditEndpoints
     {
         await using var connection = db.Create();
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(
             """
-            SELECT TOP (@Take)
+            SELECT
                 r.CorrelationId, r.Username, r.ApiPath, r.HttpMethod,
                 r.CurrentPage, r.PreviousPage,
                 r.TotalMs, r.DatabaseMs, r.QueryCount,
                 /* Seconds are derived, never stored — two columns holding the
                    same measurement drift apart. */
-                CAST(r.TotalMs    / 1000.0 AS DECIMAL(10,3)) AS TotalSeconds,
-                CAST(r.DatabaseMs / 1000.0 AS DECIMAL(10,3)) AS DatabaseSeconds,
+                CAST(r.TotalMs    / 1000.0 AS numeric(10,3)) AS TotalSeconds,
+                CAST(r.DatabaseMs / 1000.0 AS numeric(10,3)) AS DatabaseSeconds,
                 r.StatusCode, r.Succeeded, r.ErrorMessage, r.OccurredAtUtc
             FROM audit.RequestTiming AS r
             WHERE r.TotalMs >= @Threshold
-            ORDER BY r.TotalMs DESC;
+            ORDER BY r.TotalMs DESC
+            LIMIT @Take;
 
-            SELECT TOP (@Take)
+            SELECT
                 q.CorrelationId, q.QueryType, q.CommandText, q.ParameterNames,
                 q.DurationMs,
-                CAST(q.DurationMs / 1000.0 AS DECIMAL(10,3)) AS DurationSeconds,
+                CAST(q.DurationMs / 1000.0 AS numeric(10,3)) AS DurationSeconds,
                 q.RowsAffected, q.OccurredAtUtc
             FROM audit.QueryTiming AS q
-            ORDER BY q.DurationMs DESC;
+            ORDER BY q.DurationMs DESC
+            LIMIT @Take;
             """,
             new
             {
@@ -211,8 +213,8 @@ public static class AuditEndpoints
             },
             cancellationToken: ct));
 
-        var requests = (await multi.ReadAsync()).ToList();
-        var queries = (await multi.ReadAsync()).ToList();
+        var requests = (await multi.ReadRowsAsync()).ToList();
+        var queries = (await multi.ReadRowsAsync()).ToList();
 
         return Results.Ok(new { requests, queries });
     }
@@ -221,8 +223,8 @@ public static class AuditEndpoints
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
-            "SELECT TOP (100) * FROM audit.vw_SuspectedNPlusOne ORDER BY Executions DESC;",
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
+            "SELECT * FROM audit.vw_SuspectedNPlusOne ORDER BY Executions DESC LIMIT 100;",
             cancellationToken: ct));
 
         return Results.Ok(rows);

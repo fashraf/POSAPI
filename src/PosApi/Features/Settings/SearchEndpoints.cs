@@ -53,8 +53,9 @@ public static class SearchEndpoints
         if (term.Length < MinLength)
             return Results.Ok(new SearchResults(term, [], [], [], []));
 
-        /* LIKE wildcards in what the user typed are literal characters. */
-        var like = "%" + term.Replace("[", "[[]").Replace("%", "[%]").Replace("_", "[_]") + "%";
+        /* LIKE wildcards in what the user typed are literal characters
+           (backslash is ILIKE's default escape). */
+        var like = "%" + term.Replace(@"\", @"\\").Replace("%", @"\%").Replace("_", @"\_") + "%";
         var limit = Math.Clamp(take ?? DefaultTake, 1, 20);
 
         await using var connection = db.Create();
@@ -65,14 +66,15 @@ public static class SearchEndpoints
         {
             var rows = await connection.QueryAsync<NamedRow>(new CommandDefinition(
                 """
-                SELECT TOP (@Take) ItemId AS Id, NameAr, NameEn,
+                SELECT ItemId AS Id, NameAr, NameEn,
                        COALESCE(Sku, Barcode) AS Detail,
-                       CASE WHEN IsActive = 1 THEN N'active' ELSE N'inactive' END AS Status
+                       CASE WHEN IsActive THEN 'active' ELSE 'inactive' END AS Status
                 FROM core.CatalogItem
-                WHERE NameAr LIKE @Like OR NameEn LIKE @Like
-                   OR Sku LIKE @Like OR Barcode = @Term
+                WHERE NameAr COLLATE "default" ILIKE @Like OR NameEn COLLATE "default" ILIKE @Like
+                   OR Sku COLLATE "default" ILIKE @Like OR Barcode = @Term
                 ORDER BY CASE WHEN Sku = @Term OR Barcode = @Term THEN 0 ELSE 1 END,
-                         IsActive DESC, NameEn;
+                         IsActive DESC, NameEn
+                LIMIT @Take;
                 """,
                 new { Take = limit, Like = like, Term = term }, cancellationToken: ct));
             items = rows.Select(r => r.ToHit(language)).ToList();
@@ -82,11 +84,13 @@ public static class SearchEndpoints
         {
             var rows = await connection.QueryAsync<NamedRow>(new CommandDefinition(
                 """
-                SELECT TOP (@Take) CustomerId AS Id, NameAr, NameEn, Phone AS Detail,
-                       CASE WHEN IsActive = 1 THEN N'active' ELSE N'inactive' END AS Status
+                SELECT CustomerId AS Id, NameAr, NameEn, Phone AS Detail,
+                       CASE WHEN IsActive THEN 'active' ELSE 'inactive' END AS Status
                 FROM core.Customer
-                WHERE NameAr LIKE @Like OR NameEn LIKE @Like OR Phone LIKE @Like
-                ORDER BY IsActive DESC, NameEn;
+                WHERE NameAr COLLATE "default" ILIKE @Like OR NameEn COLLATE "default" ILIKE @Like
+                   OR Phone COLLATE "default" ILIKE @Like
+                ORDER BY IsActive DESC, NameEn
+                LIMIT @Take;
                 """,
                 new { Take = limit, Like = like }, cancellationToken: ct));
             customers = rows.Select(r => r.ToHit(language)).ToList();
@@ -96,13 +100,14 @@ public static class SearchEndpoints
         {
             var rows = await connection.QueryAsync<NamedRow>(new CommandDefinition(
                 """
-                SELECT TOP (@Take) VendorId AS Id, NameAr, NameEn,
+                SELECT VendorId AS Id, NameAr, NameEn,
                        COALESCE(Phone, VatNumber) AS Detail,
-                       CASE WHEN IsActive = 1 THEN N'active' ELSE N'inactive' END AS Status
+                       CASE WHEN IsActive THEN 'active' ELSE 'inactive' END AS Status
                 FROM core.Vendor
-                WHERE NameAr LIKE @Like OR NameEn LIKE @Like
-                   OR Phone LIKE @Like OR VatNumber LIKE @Like
-                ORDER BY IsActive DESC, NameEn;
+                WHERE NameAr COLLATE "default" ILIKE @Like OR NameEn COLLATE "default" ILIKE @Like
+                   OR Phone COLLATE "default" ILIKE @Like OR VatNumber COLLATE "default" ILIKE @Like
+                ORDER BY IsActive DESC, NameEn
+                LIMIT @Take;
                 """,
                 new { Take = limit, Like = like }, cancellationToken: ct));
             vendors = rows.Select(r => r.ToHit(language)).ToList();
@@ -112,14 +117,15 @@ public static class SearchEndpoints
         {
             var rows = await connection.QueryAsync<InvoiceRow>(new CommandDefinition(
                 """
-                SELECT TOP (@Take) s.SaleId, s.InvoiceNumber, s.TotalH, s.Status, s.SoldAtUtc,
+                SELECT s.SaleId, s.InvoiceNumber, s.TotalH, s.Status, s.SoldAtUtc,
                        c.NameAr AS CustomerNameAr, c.NameEn AS CustomerNameEn
                 FROM sales.Sale AS s
                 LEFT JOIN core.Customer AS c ON c.CustomerId = s.CustomerId
-                WHERE s.InvoiceNumber LIKE @Like
-                  AND (@AllBranches = 1 OR s.BranchId IS NULL
-                       OR s.BranchId IN (SELECT value FROM STRING_SPLIT(@Branches, N',')))
-                ORDER BY CASE WHEN s.InvoiceNumber = @Term THEN 0 ELSE 1 END, s.SoldAtUtc DESC;
+                WHERE s.InvoiceNumber COLLATE "default" ILIKE @Like
+                  AND (@AllBranches OR s.BranchId IS NULL
+                       OR s.BranchId = ANY(string_to_array(@Branches, ',')))
+                ORDER BY CASE WHEN s.InvoiceNumber = @Term THEN 0 ELSE 1 END, s.SoldAtUtc DESC
+                LIMIT @Take;
                 """,
                 new
                 {

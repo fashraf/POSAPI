@@ -1,7 +1,6 @@
-using System.Data;
 using System.Text.RegularExpressions;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -294,7 +293,7 @@ public static partial class UserEndpoints
         if (userId is null && tenant.Tenant.MaxUsers is { } maxUsers)
         {
             var activeUsers = await connection.ExecuteScalarAsync<int>(new CommandDefinition(
-                "SELECT COUNT(*) FROM core.AppUser WHERE Status = N'active';", cancellationToken: ct));
+                "SELECT COUNT(*)::int FROM core.AppUser WHERE Status = 'active';", cancellationToken: ct));
 
             if (activeUsers >= maxUsers)
             {
@@ -384,20 +383,32 @@ public static partial class UserEndpoints
         parameters.Add("@PasswordHash", hash);
         parameters.Add("@PasswordSalt", salt);
         parameters.Add("@Actor", current.Username);
-        parameters.Add("@SavedId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
 
+        string savedId;
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_SaveUser", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            savedId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT SavedId FROM core.usp_SaveUser(
+                    p_UserId => @UserId, p_Username => @Username,
+                    p_FirstName => @FirstName, p_LastName => @LastName,
+                    p_NameAr => @NameAr, p_NameEn => @NameEn,
+                    p_Email => @Email, p_Phone => @Phone,
+                    p_Address => @Address, p_EmployeeId => @EmployeeId,
+                    p_RoleId => @RoleId, p_Status => @Status,
+                    p_AccessExpiresOn => @AccessExpiresOn::date, p_TicketReference => @TicketReference,
+                    p_BaseSalaryH => @BaseSalaryH::bigint,
+                    p_BranchIds => @BranchIds, p_DefaultBranchId => @DefaultBranchId,
+                    p_Grants => @Grants, p_Denies => @Denies,
+                    p_PasswordHash => @PasswordHash, p_PasswordSalt => @PasswordSalt,
+                    p_Actor => @Actor);
+                """,
+                parameters, cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapUserError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapUserError(ex) is { } mapped)
         {
             return mapped;
         }
-
-        var savedId = parameters.Get<string>("@SavedId");
 
         await directory.SyncUserAsync(tenantId, connection, savedId, ct);
 
@@ -459,11 +470,15 @@ public static partial class UserEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_SetUserStatus",
+                """
+                SELECT core.usp_SetUserStatus(
+                    p_UserId => @UserId, p_Status => @Status,
+                    p_RevokeAccess => @RevokeAccess, p_Actor => @Actor);
+                """,
                 new { UserId = userId, Status = status, RevokeAccess = revoke, Actor = current.Username },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapUserError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapUserError(ex) is { } mapped)
         {
             return mapped;
         }
@@ -475,7 +490,7 @@ public static partial class UserEndpoints
         return Results.Ok(user);
     }
 
-    private static IResult? MapUserError(SqlException ex) => ex.Number switch
+    private static IResult? MapUserError(PostgresException ex) => ex.ErrorNumber() switch
     {
         61010 => ProcErrors.NotFound("No such user.", "لا يوجد مستخدم بهذا المعرف."),
         61009 => ProcErrors.Conflict("last_owner",
@@ -503,7 +518,7 @@ public static partial class UserEndpoints
         61016 => ProcErrors.Field("deniedPermissions",
             "An owner cannot be denied user management.", "لا يمكن منع المالك من إدارة المستخدمين."),
         61017 => ProcErrors.Field("nameEn", "Both names are required.", "الاسمان العربي والإنجليزي مطلوبان."),
-        61018 => ProcErrors.Field("branchIds", ex.Message, ex.Message),
+        61018 => ProcErrors.Field("branchIds", ex.MessageText, ex.MessageText),
         61019 => ProcErrors.Field("status", "Status must be active or suspended.", "الحالة إما نشط أو موقوف."),
         _ => null
     };
@@ -526,7 +541,7 @@ public static partial class UserEndpoints
     /// what the token would actually carry.
     /// </summary>
     private static async Task<bool> OutranksCallerAsync(
-        SqlConnection connection, string userId, ICurrentUser current, CancellationToken ct)
+        NpgsqlConnection connection, string userId, ICurrentUser current, CancellationToken ct)
     {
         var theirs = await connection.QueryAsync<string>(new CommandDefinition(
             "SELECT PermissionKey FROM core.vw_EffectivePermission WHERE UserId = @UserId;",
@@ -536,25 +551,25 @@ public static partial class UserEndpoints
     }
 
     private static async Task<List<UserDto>> LoadUsersAsync(
-        SqlConnection connection, string? userId, string? search, bool activeOnly, CancellationToken ct)
+        NpgsqlConnection connection, string? userId, string? search, bool activeOnly, CancellationToken ct)
     {
         const string filter = """
             WHERE (@UserId IS NULL OR u.UserId = @UserId)
-              AND (@Search IS NULL OR u.NameAr LIKE N'%' + @Search + N'%'
-                                   OR u.NameEn LIKE N'%' + @Search + N'%'
-                                   OR u.Username LIKE N'%' + @Search + N'%'
-                                   OR u.Email  LIKE N'%' + @Search + N'%')
-              AND (@ActiveOnly = 0 OR u.Status = N'active')
+              AND (@Search IS NULL OR u.NameAr COLLATE "default" ILIKE '%' || @Search || '%'
+                                   OR u.NameEn COLLATE "default" ILIKE '%' || @Search || '%'
+                                   OR u.Username COLLATE "default" ILIKE '%' || @Search || '%'
+                                   OR u.Email  COLLATE "default" ILIKE '%' || @Search || '%')
+              AND (NOT @ActiveOnly OR u.Status = 'active')
             """;
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(
             $"""
             SELECT u.UserId, u.Username, u.FirstName, u.LastName, u.NameAr, u.NameEn,
                    u.Email, u.Phone, u.Address, u.EmployeeId, u.AvatarUrl,
                    u.RoleId, r.NameAr AS RoleNameAr, r.NameEn AS RoleNameEn,
                    u.DefaultBranchId, u.Status, u.IsExternal, u.AccessExpiresOn,
                    u.TicketReference, u.BaseSalaryH, u.LastLoginAtUtc,
-                   CAST(CASE WHEN u.PasswordHash IS NULL THEN 0 ELSE 1 END AS BIT) AS HasPassword,
+                   (u.PasswordHash IS NOT NULL) AS HasPassword,
                    u.CreatedAtUtc, u.UpdatedAtUtc
             FROM core.AppUser AS u
             JOIN core.Role AS r ON r.RoleId = u.RoleId
@@ -631,7 +646,7 @@ public static partial class UserEndpoints
         await using var connection = db.Create();
 
         var rows = await connection.QueryAsync<(string RoleId, int Count)>(new CommandDefinition(
-            "SELECT RoleId, COUNT(*) FROM core.AppUser GROUP BY RoleId;", cancellationToken: ct));
+            "SELECT RoleId, COUNT(*)::int FROM core.AppUser GROUP BY RoleId;", cancellationToken: ct));
 
         return Results.Ok(rows.ToDictionary(r => r.RoleId, r => r.Count));
     }
@@ -684,22 +699,26 @@ public static partial class UserEndpoints
         parameters.Add("@IsExternal", request.External);
         parameters.Add("@IsActive", request.Status != "inactive");
         parameters.Add("@Permissions", ProcErrors.Csv(permissions));
-        parameters.Add("@SavedId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
 
         await using var connection = db.Create();
 
+        string savedId;
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_SaveRole", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            savedId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT SavedId FROM core.usp_SaveRole(
+                    p_RoleId => @RoleId, p_NameAr => @NameAr, p_NameEn => @NameEn,
+                    p_DescriptionAr => @DescriptionAr, p_DescriptionEn => @DescriptionEn,
+                    p_IsExternal => @IsExternal, p_IsActive => @IsActive,
+                    p_Permissions => @Permissions);
+                """,
+                parameters, cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapRoleError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapRoleError(ex) is { } mapped)
         {
             return mapped;
         }
-
-        var savedId = parameters.Get<string>("@SavedId");
 
         logger.LogInformation("Role {RoleId} {Action} by {Actor}.",
             savedId, roleId is null ? "created" : "updated", current.Username);
@@ -727,10 +746,10 @@ public static partial class UserEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_DeleteRole", new { RoleId = roleId },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                "SELECT core.usp_DeleteRole(p_RoleId => @RoleId);", new { RoleId = roleId },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapRoleError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapRoleError(ex) is { } mapped)
         {
             return mapped;
         }
@@ -741,7 +760,7 @@ public static partial class UserEndpoints
         return Results.NoContent();
     }
 
-    private static IResult? MapRoleError(SqlException ex) => ex.Number switch
+    private static IResult? MapRoleError(PostgresException ex) => ex.ErrorNumber() switch
     {
         61056 => ProcErrors.NotFound("No such role.", "لا يوجد دور بهذا المعرف."),
         61055 => ProcErrors.Conflict("owner_role_immutable",
@@ -750,7 +769,7 @@ public static partial class UserEndpoints
         61057 => ProcErrors.Conflict("builtin_role",
             "Built-in roles cannot be deleted.", "لا يمكن حذف الأدوار الأساسية."),
         /* The message carries the count, so it is passed through. */
-        61058 => ProcErrors.Conflict("role_in_use", ex.Message,
+        61058 => ProcErrors.Conflict("role_in_use", ex.MessageText,
             "ما زال هناك مستخدمون بهذا الدور. انقلهم إلى دور آخر أولًا."),
         61059 => ProcErrors.Conflict("role_in_use",
             "Users still hold this role. Move them to another role first.",
@@ -769,13 +788,13 @@ public static partial class UserEndpoints
     };
 
     private static async Task<List<RoleDto>> LoadRolesAsync(
-        SqlConnection connection, string? roleId, ILanguageContext language, CancellationToken ct)
+        NpgsqlConnection connection, string? roleId, ILanguageContext language, CancellationToken ct)
     {
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(
             """
             SELECT r.RoleId, r.NameAr, r.NameEn, r.DescriptionAr, r.DescriptionEn,
                    r.IsBuiltIn, r.IsExternal, r.IsActive, r.CreatedAtUtc, r.UpdatedAtUtc,
-                   (SELECT COUNT(*) FROM core.AppUser AS u WHERE u.RoleId = r.RoleId) AS UserCount
+                   (SELECT COUNT(*)::int FROM core.AppUser AS u WHERE u.RoleId = r.RoleId) AS UserCount
             FROM core.Role AS r
             WHERE @RoleId IS NULL OR r.RoleId = @RoleId
             ORDER BY r.NameEn;
@@ -820,7 +839,7 @@ public static partial class UserEndpoints
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             "SELECT PermissionKey, Module, Action, Sensitivity FROM core.Permission ORDER BY Module, Action;",
             cancellationToken: ct));
 

@@ -1,6 +1,5 @@
-using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -60,13 +59,13 @@ public static class StocktakeEndpoints
 
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             """
             SELECT i.ItemId, i.NameAr, i.NameEn, i.Sku, i.Barcode, i.CategoryId, i.CostH,
-                   ISNULL(s.Quantity, 0) AS SystemQuantity
+                   COALESCE(s.Quantity, 0) AS SystemQuantity
             FROM core.CatalogItem AS i
             LEFT JOIN inv.StockLevel AS s ON s.ItemId = i.ItemId AND s.BranchId = @BranchId
-            WHERE i.TracksStock = 1 AND i.IsActive = 1
+            WHERE i.TracksStock AND i.IsActive
             ORDER BY i.NameEn;
             """,
             new { BranchId = branchId }, cancellationToken: ct));
@@ -93,41 +92,47 @@ public static class StocktakeEndpoints
 
         if (!current.CanSeeBranch(request.BranchId)) return Results.Forbid();
 
-        var lines = new DataTable();
-        lines.Columns.Add("ItemId", typeof(string));
-        lines.Columns.Add("CountedQuantity", typeof(decimal));
+        var lines = new List<StocktakeLineInput>();
 
         foreach (var line in request.Lines ?? [])
         {
             /* An id that cannot exist is the same answer as an unknown item,
-               not a truncation error from the table parameter. */
+               not a truncation error from the list parameter. */
             if (string.IsNullOrWhiteSpace(line.ItemId) || line.ItemId.Length > 40)
                 return ProcErrors.Field("lines",
                     "Only items that track stock can be counted.", "يمكن جرد الأصناف التي تتتبّع المخزون فقط.");
 
-            lines.Rows.Add(line.ItemId, line.CountedQuantity);
+            lines.Add(line);
         }
-
-        var parameters = new DynamicParameters();
-        parameters.Add("@BranchId", request.BranchId);
-        parameters.Add("@Lines", lines.AsTableValuedParameter("inv.StocktakeLineTable"));
-        parameters.Add("@Note", ProcErrors.Blank(request.Note));
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@Reference", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
 
         await using var connection = db.Create();
 
-        List<StocktakeLineResult> changed;
+        List<StocktakeRow> rows;
 
         try
         {
-            changed = (await connection.QueryAsync<StocktakeLineResult>(new CommandDefinition(
-                "inv.usp_PostStocktake", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct))).ToList();
+            /* Every row carries the stocktake's reference; a posted count always
+               changes at least one line (54033 otherwise). */
+            rows = (await connection.QueryAsync<StocktakeRow>(new CommandDefinition(
+                """
+                SELECT Reference, ItemId, NameAr, NameEn, Sku, SystemQuantity,
+                       CountedQuantity, Difference, ValueH
+                FROM inv.usp_PostStocktake(
+                    p_BranchId => @BranchId, p_Lines => @Lines::jsonb,
+                    p_Note => @Note, p_Actor => @Actor);
+                """,
+                new
+                {
+                    request.BranchId,
+                    Lines = DbList.Json(lines),
+                    Note = ProcErrors.Blank(request.Note),
+                    Actor = current.Username
+                },
+                cancellationToken: ct))).ToList();
         }
-        catch (SqlException ex) when (ex.Number is >= 54030 and <= 54034)
+        catch (PostgresException ex) when (ex.ErrorNumber() is >= 54030 and <= 54034)
         {
-            return ex.Number switch
+            return ex.ErrorNumber() switch
             {
                 54030 => ProcErrors.Field("lines",
                     "Enter at least one counted quantity.", "أدخل كمية معدودة واحدة على الأقل."),
@@ -144,7 +149,10 @@ public static class StocktakeEndpoints
             };
         }
 
-        var reference = parameters.Get<string>("@Reference");
+        var reference = rows[0].Reference;
+        var changed = rows.Select(r => new StocktakeLineResult(
+            r.ItemId, r.NameAr, r.NameEn, r.Sku, r.SystemQuantity,
+            r.CountedQuantity, r.Difference, r.ValueH)).ToList();
 
         logger.LogInformation("Stocktake {Reference} posted for {BranchId} by {User}: {Lines} lines changed.",
             reference, request.BranchId, current.Username, changed.Count);
@@ -153,5 +161,18 @@ public static class StocktakeEndpoints
 
         return Results.Ok(new StocktakeResult(
             reference, request.BranchId, changed.Count, changed.Sum(l => l.ValueH), changed));
+    }
+
+    private sealed record StocktakeRow
+    {
+        public string Reference { get; init; } = string.Empty;
+        public string ItemId { get; init; } = string.Empty;
+        public string NameAr { get; init; } = string.Empty;
+        public string NameEn { get; init; } = string.Empty;
+        public string? Sku { get; init; }
+        public decimal SystemQuantity { get; init; }
+        public decimal CountedQuantity { get; init; }
+        public decimal Difference { get; init; }
+        public long ValueH { get; init; }
     }
 }

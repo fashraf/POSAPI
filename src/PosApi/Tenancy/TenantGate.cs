@@ -55,9 +55,10 @@ public sealed class TenantGate
         await using var control = _catalog.Control();
         _legacyTenantId = await control.QueryFirstOrDefaultAsync<string>(new CommandDefinition(
             """
-            SELECT TOP (1) TenantId FROM ctl.Tenant
-            WHERE Status = N'active'
-            ORDER BY CASE WHEN Source = N'adopted' THEN 0 ELSE 1 END, CreatedAtUtc;
+            SELECT TenantId FROM ctl.Tenant
+            WHERE Status = 'active'
+            ORDER BY CASE WHEN Source = 'adopted' THEN 0 ELSE 1 END, CreatedAtUtc
+            LIMIT 1;
             """,
             cancellationToken: ct));
 

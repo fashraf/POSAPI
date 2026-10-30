@@ -1,6 +1,6 @@
-using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
+using PosApi.Data;
 using Microsoft.Extensions.Options;
 
 namespace PosApi.Tenancy;
@@ -113,7 +113,7 @@ public sealed class TenantProvisioner
         if (SqlScriptRunner.Files(MigrationsFolder).Count == 0)
             throw new InvalidOperationException($"No tenant migrations found in {MigrationsFolder}.");
 
-        await using var control = new SqlConnection(_connections.Control);
+        await using var control = new NpgsqlConnection(_connections.Control);
         await control.OpenAsync(ct);
 
         var (tenantId, database) = await AllocateAsync(control, ct);
@@ -130,7 +130,7 @@ public sealed class TenantProvisioner
                      BranchAddress, Latitude, Longitude, RegisteredBy)
                 VALUES
                     (@TenantId, @Name, @NameAr, @BusinessType, @City, @Country, @CrNumber, @VatNumber, @Email, @Phone,
-                     @Database, N'provisioning', @Source, @OwnerName, @OwnerUsername, @OwnerPhone, @OwnerEmail,
+                     @Database, 'provisioning', @Source, @OwnerName, @OwnerUsername, @OwnerPhone, @OwnerEmail,
                      @PaymentMethods, @DefaultVat, @PricesIncludeVat, @Certificate, @CertificateExpiry,
                      @BranchAddress, @Latitude, @Longitude, @RegisteredBy);
                 """,
@@ -149,7 +149,7 @@ public sealed class TenantProvisioner
 
             created = true;
             var applied = await _runner.ApplyAsync(
-                _connections.TenantServer, database, "POSMAIN", SqlScriptRunner.Files(MigrationsFolder), ct);
+                _connections.TenantServer, database, SqlScriptRunner.Files(MigrationsFolder), ct);
 
             var tenantConnection = _connections.ForTenant(database);
             var (userId, branchId) = await RegisterBusinessAsync(tenantConnection, request, ownerEmail, ownerUsername, ownerPhone, ct);
@@ -163,13 +163,13 @@ public sealed class TenantProvisioner
             await control.ExecuteAsync(new CommandDefinition(
                 """
                 UPDATE ctl.Tenant
-                SET Status = N'active', PocUserId = @UserId, SchemaVersion = @Version,
-                    MigratedAtUtc = SYSUTCDATETIME(), ActivatedAtUtc = SYSUTCDATETIME(),
-                    ActivatedBy = @ActivatedBy, UpdatedAtUtc = SYSUTCDATETIME()
+                SET Status = 'active', PocUserId = @UserId, SchemaVersion = @Version,
+                    MigratedAtUtc = now() AT TIME ZONE 'utc', ActivatedAtUtc = now() AT TIME ZONE 'utc',
+                    ActivatedBy = @ActivatedBy, UpdatedAtUtc = now() AT TIME ZONE 'utc'
                 WHERE TenantId = @TenantId;
 
                 INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail)
-                VALUES (N'client_created', N'Client created', @TenantId, @Detail);
+                VALUES ('client_created', 'Client created', @TenantId, @Detail);
                 """,
                 new
                 {
@@ -191,27 +191,23 @@ public sealed class TenantProvisioner
     }
 
     /// <summary>The next tenant number whose database name is free.</summary>
-    private async Task<(string TenantId, string Database)> AllocateAsync(SqlConnection control, CancellationToken ct)
+    private async Task<(string TenantId, string Database)> AllocateAsync(NpgsqlConnection control, CancellationToken ct)
     {
-        await using var server = new SqlConnection(_connections.TenantServer);
-        await server.OpenAsync(ct);
-
         for (var attempt = 0; attempt < 50; attempt++)
         {
             var number = await control.ExecuteScalarAsync<int>(new CommandDefinition(
-                "SELECT NEXT VALUE FOR ctl.TenantNumber;", cancellationToken: ct));
+                "SELECT nextval('ctl.TenantNumber')::int;", cancellationToken: ct));
 
             var tenantId = $"CL-{number:00000}";
-            var database = $"{_options.TenantDatabasePrefix}CL{number:00000}";
+            var database = $"{_options.TenantDatabasePrefix}cl{number:00000}".ToLowerInvariant();
 
-            var exists = await server.ExecuteScalarAsync<int?>(new CommandDefinition(
-                "SELECT 1 WHERE DB_ID(@Database) IS NOT NULL;", new { Database = database }, cancellationToken: ct));
+            var exists = await SqlScriptRunner.ExistsAsync(_connections.TenantServer, database, ct);
 
             var known = await control.ExecuteScalarAsync<int?>(new CommandDefinition(
                 "SELECT 1 FROM ctl.Tenant WHERE TenantId = @TenantId OR DatabaseName = @Database;",
                 new { TenantId = tenantId, Database = database }, cancellationToken: ct));
 
-            if (exists is null && known is null) return (tenantId, database);
+            if (!exists && known is null) return (tenantId, database);
         }
 
         throw new InvalidOperationException("Could not find a free tenant number.");
@@ -221,34 +217,42 @@ public sealed class TenantProvisioner
         string tenantConnection, ProvisionRequest request, string ownerEmail, string ownerUsername,
         string? ownerPhone, CancellationToken ct)
     {
-        await using var tenant = new SqlConnection(tenantConnection);
+        await using var tenant = new NpgsqlConnection(tenantConnection);
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@CompanyNameAr", string.IsNullOrWhiteSpace(request.NameAr) ? request.Name : request.NameAr);
-        parameters.Add("@CompanyNameEn", request.Name);
-        parameters.Add("@CrNumber", request.CrNumber);
-        parameters.Add("@VatNumber", request.VatNumber);
-        parameters.Add("@City", request.City);
-        parameters.Add("@BranchNameAr", request.BranchName);
-        parameters.Add("@BranchNameEn", request.BranchName);
-        parameters.Add("@OwnerNameAr", request.OwnerName);
-        parameters.Add("@OwnerNameEn", request.OwnerName);
-        parameters.Add("@OwnerEmail", ownerEmail);
-        parameters.Add("@OwnerPhone", ownerPhone);
-        parameters.Add("@PasswordHash", request.OwnerPasswordHash);
-        parameters.Add("@PasswordSalt", request.OwnerPasswordSalt);
-        parameters.Add("@UserId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-        parameters.Add("@BranchId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
+        string userId, branchId;
 
         try
         {
-            await tenant.ExecuteAsync(new CommandDefinition(
-                "core.usp_RegisterBusiness", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            (userId, branchId) = await tenant.QuerySingleAsync<(string UserId, string BranchId)>(new CommandDefinition(
+                """
+                SELECT UserId, BranchId FROM core.usp_RegisterBusiness(
+                    p_CompanyNameAr => @CompanyNameAr, p_CompanyNameEn => @CompanyNameEn,
+                    p_CrNumber => @CrNumber, p_VatNumber => @VatNumber, p_City => @City,
+                    p_BranchNameAr => @BranchNameAr, p_BranchNameEn => @BranchNameEn,
+                    p_OwnerNameAr => @OwnerNameAr, p_OwnerNameEn => @OwnerNameEn,
+                    p_OwnerEmail => @OwnerEmail, p_OwnerPhone => @OwnerPhone,
+                    p_PasswordHash => @PasswordHash, p_PasswordSalt => @PasswordSalt);
+                """,
+                new
+                {
+                    CompanyNameAr = string.IsNullOrWhiteSpace(request.NameAr) ? request.Name : request.NameAr,
+                    CompanyNameEn = request.Name,
+                    request.CrNumber,
+                    request.VatNumber,
+                    request.City,
+                    BranchNameAr = request.BranchName,
+                    BranchNameEn = request.BranchName,
+                    OwnerNameAr = request.OwnerName,
+                    OwnerNameEn = request.OwnerName,
+                    OwnerEmail = ownerEmail,
+                    OwnerPhone = ownerPhone,
+                    PasswordHash = request.OwnerPasswordHash,
+                    PasswordSalt = request.OwnerPasswordSalt
+                }, cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number is >= 53000 and < 54000)
+        catch (PostgresException ex) when (ex.ErrorNumber() is >= 53000 and < 54000)
         {
-            throw ex.Number switch
+            throw ex.ErrorNumber() switch
             {
                 53000 => new ProvisionException("name_required",
                     "The business needs a name.", "المنشأة تحتاج اسمًا.", "companyName"),
@@ -262,12 +266,9 @@ public sealed class TenantProvisioner
             };
         }
 
-        var userId = parameters.Get<string>("@UserId");
-        var branchId = parameters.Get<string>("@BranchId");
-
         await tenant.ExecuteAsync(new CommandDefinition(
             """
-            UPDATE core.AppUser SET Username = @Username, UpdatedAtUtc = SYSUTCDATETIME() WHERE UserId = @UserId;
+            UPDATE core.AppUser SET Username = @Username, UpdatedAtUtc = now() AT TIME ZONE 'utc' WHERE UserId = @UserId;
             UPDATE core.Company SET Email = COALESCE(@Email, Email), Phone = COALESCE(@Phone, Phone);
             UPDATE core.Branch SET AddressEn = @Address, AddressAr = @Address WHERE BranchId = @BranchId AND @Address IS NOT NULL;
             """,
@@ -285,10 +286,10 @@ public sealed class TenantProvisioner
     /// nothing; a paid plan runs a month or a year and raises its first invoice.
     /// </summary>
     private static async Task<string> OpenSubscriptionAsync(
-        SqlConnection control, string tenantId, ProvisionRequest request, CancellationToken ct)
+        NpgsqlConnection control, string tenantId, ProvisionRequest request, CancellationToken ct)
     {
         var plan = await control.QuerySingleOrDefaultAsync<(string PlanKey, long? MonthlyH, long? AnnualH)>(
-            new CommandDefinition("SELECT PlanKey, MonthlyH, AnnualH FROM ctl.[Plan] WHERE PlanKey = @PlanKey;",
+            new CommandDefinition("SELECT PlanKey, MonthlyH, AnnualH FROM ctl.Plan WHERE PlanKey = @PlanKey;",
                 new { request.PlanKey }, cancellationToken: ct));
 
         if (plan.PlanKey is null)
@@ -296,7 +297,7 @@ public sealed class TenantProvisioner
                 "الباقة غير موجودة.", "plan");
 
         var trialDays = int.TryParse(await control.ExecuteScalarAsync<string?>(new CommandDefinition(
-            "SELECT Value FROM ctl.Setting WHERE SettingKey = N'trialDays';", cancellationToken: ct)), out var d) ? d : 15;
+            "SELECT Value FROM ctl.Setting WHERE SettingKey = 'trialDays';", cancellationToken: ct)), out var d) ? d : 15;
 
         var isTrial = request.Trial || request.PlanKey == "Trial";
         var cycle = request.Cycle == "monthly" ? "monthly" : "annual";
@@ -305,7 +306,7 @@ public sealed class TenantProvisioner
                    : cycle == "monthly" ? starts.AddMonths(1) : starts.AddYears(1);
 
         var number = await control.ExecuteScalarAsync<int>(new CommandDefinition(
-            "SELECT NEXT VALUE FOR ctl.SubscriptionNumber;", cancellationToken: ct));
+            "SELECT nextval('ctl.SubscriptionNumber')::int;", cancellationToken: ct));
         var subscriptionId = $"SUB-{number:00000}";
 
         await control.ExecuteAsync(new CommandDefinition(
@@ -333,7 +334,7 @@ public sealed class TenantProvisioner
     {
         try
         {
-            await using var control = new SqlConnection(_connections.Control);
+            await using var control = new NpgsqlConnection(_connections.Control);
             await control.ExecuteAsync(
                 """
                 DELETE FROM ctl.LoginDirectory WHERE TenantId = @TenantId;
@@ -351,15 +352,7 @@ public sealed class TenantProvisioner
 
         try
         {
-            await using var server = new SqlConnection(_connections.TenantServer);
-            await server.ExecuteAsync(
-                $"""
-                IF DB_ID(N'{database}') IS NOT NULL
-                BEGIN
-                    ALTER DATABASE [{database}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
-                    DROP DATABASE [{database}];
-                END
-                """);
+            await SqlScriptRunner.DropAsync(_connections.TenantServer, database, CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -372,17 +365,17 @@ public sealed class TenantProvisioner
 public static class Billing
 {
     public static async Task<string> RaiseInvoiceAsync(
-        SqlConnection control, IDbTransaction? tx, string tenantId, string? subscriptionId, string planKey,
+        NpgsqlConnection control, NpgsqlTransaction? tx, string tenantId, string? subscriptionId, string planKey,
         long amountH, DateOnly periodStart, DateOnly periodEnd, string? notes, CancellationToken ct)
     {
         var number = await control.ExecuteScalarAsync<int>(new CommandDefinition(
-            "SELECT NEXT VALUE FOR ctl.InvoiceNumber;", transaction: tx, cancellationToken: ct));
+            "SELECT nextval('ctl.InvoiceNumber')::int;", transaction: tx, cancellationToken: ct));
         var invoiceId = $"INV-{number}";
 
         await control.ExecuteAsync(new CommandDefinition(
             """
             INSERT INTO ctl.Invoice (InvoiceId, TenantId, SubscriptionId, PlanKey, AmountH, Status, IssuedOn, PeriodStart, PeriodEnd, Notes)
-            VALUES (@InvoiceId, @TenantId, @SubscriptionId, @PlanKey, @AmountH, N'pending', CAST(SYSUTCDATETIME() AS DATE), @PeriodStart, @PeriodEnd, @Notes);
+            VALUES (@InvoiceId, @TenantId, @SubscriptionId, @PlanKey, @AmountH, 'pending', (now() AT TIME ZONE 'utc')::date, @PeriodStart, @PeriodEnd, @Notes);
             """,
             new
             {

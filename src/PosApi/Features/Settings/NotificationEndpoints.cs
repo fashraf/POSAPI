@@ -1,7 +1,7 @@
-using System.Data;
 using Dapper;
 using PosApi.Auth;
 using PosApi.Data;
+using Npgsql;
 
 namespace PosApi.Features.Settings;
 
@@ -59,9 +59,9 @@ public static class NotificationEndpoints
           AND (n.UserId = @UserId
                OR (n.UserId IS NULL
                    AND (n.PermissionKey IS NULL
-                        OR n.PermissionKey IN (SELECT value FROM STRING_SPLIT(@Permissions, N',')))
-                   AND (n.BranchId IS NULL OR @AllBranches = 1
-                        OR n.BranchId IN (SELECT value FROM STRING_SPLIT(@Branches, N',')))))
+                        OR n.PermissionKey = ANY(string_to_array(@Permissions, ',')))
+                   AND (n.BranchId IS NULL OR @AllBranches
+                        OR n.BranchId = ANY(string_to_array(@Branches, ',')))))
         """;
 
     private static object Scope(ICurrentUser current) => new
@@ -88,15 +88,16 @@ public static class NotificationEndpoints
 
         var rows = await connection.QueryAsync<NotificationDto>(new CommandDefinition(
             $"""
-            SELECT TOP (50)
+            SELECT
                 n.NotificationId, n.Kind, n.Severity, n.BranchId, n.TitleAr, n.TitleEn,
                 n.BodyAr, n.BodyEn, n.LinkPath,
                 CASE WHEN n.UserId IS NULL THEN r.ReadAtUtc ELSE n.ReadAtUtc END AS ReadAtUtc,
                 n.CreatedAtUtc
             {VisibleRows}
-              AND (@UnreadOnly = 0
+              AND (NOT @UnreadOnly
                    OR (CASE WHEN n.UserId IS NULL THEN r.ReadAtUtc ELSE n.ReadAtUtc END) IS NULL)
-            ORDER BY n.CreatedAtUtc DESC;
+            ORDER BY n.CreatedAtUtc DESC
+            LIMIT 50;
             """,
             new DynamicParameters(Scope(current)).With("UnreadOnly", unreadOnly ?? false),
             cancellationToken: ct));
@@ -109,7 +110,7 @@ public static class NotificationEndpoints
      * are still worth showing. It is logged and the list goes ahead.
      */
     private static async Task RefreshIfDueAsync(
-        Microsoft.Data.SqlClient.SqlConnection connection, ILogger logger, CancellationToken ct)
+        Npgsql.NpgsqlConnection connection, ILogger logger, CancellationToken ct)
     {
         var now = DateTime.UtcNow.Ticks;
         var last = Interlocked.Read(ref _lastRefreshTicks);
@@ -120,8 +121,7 @@ public static class NotificationEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_RefreshNotifications",
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                "SELECT core.usp_RefreshNotifications();", cancellationToken: ct));
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -138,7 +138,7 @@ public static class NotificationEndpoints
             $"""
             /* Addressed to the caller: the row's own ReadAtUtc. */
             UPDATE core.Notification
-            SET ReadAtUtc = SYSUTCDATETIME()
+            SET ReadAtUtc = now() AT TIME ZONE 'utc'
             WHERE NotificationId = @NotificationId AND UserId = @UserId AND ReadAtUtc IS NULL;
 
             /* Broadcast: a read mark for this user only. */
@@ -163,7 +163,7 @@ public static class NotificationEndpoints
         await connection.ExecuteAsync(new CommandDefinition(
             $"""
             UPDATE core.Notification
-            SET ReadAtUtc = SYSUTCDATETIME()
+            SET ReadAtUtc = now() AT TIME ZONE 'utc'
             WHERE UserId = @UserId AND ReadAtUtc IS NULL;
 
             INSERT INTO core.NotificationRead (NotificationId, UserId)

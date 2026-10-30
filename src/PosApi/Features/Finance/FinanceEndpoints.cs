@@ -41,15 +41,15 @@ public static class FinanceEndpoints
         // A null BranchId on an entry means "not branch-specific", so it stays
         // visible from every branch — the same rule the frontend applies.
         const string sql = """
-            SELECT COUNT(*)
+            SELECT COUNT(*)::int
             FROM fin.JournalEntry AS e
             WHERE (@BranchId IS NULL OR e.BranchId = @BranchId OR e.BranchId IS NULL)
               AND (@Kind IS NULL OR e.Kind = @Kind)
-              AND (@From IS NULL OR CAST(e.PostedAtUtc AS DATE) >= @From)
-              AND (@To   IS NULL OR CAST(e.PostedAtUtc AS DATE) <= @To)
-              AND (@Search IS NULL OR e.Reference LIKE N'%' + @Search + N'%'
-                                   OR e.SourceReference LIKE N'%' + @Search + N'%'
-                                   OR e.DescriptionEn LIKE N'%' + @Search + N'%')
+              AND (@From::date IS NULL OR e.PostedAtUtc::date >= @From::date)
+              AND (@To::date   IS NULL OR e.PostedAtUtc::date <= @To::date)
+              AND (@Search IS NULL OR e.Reference COLLATE "default" ILIKE '%' || @Search || '%'
+                                   OR e.SourceReference COLLATE "default" ILIKE '%' || @Search || '%'
+                                   OR e.DescriptionEn COLLATE "default" ILIKE '%' || @Search || '%')
               AND (@AccountCode IS NULL OR EXISTS (
                     SELECT 1 FROM fin.JournalLine AS l
                     WHERE l.EntryId = e.EntryId AND l.AccountCode = @AccountCode));
@@ -61,11 +61,11 @@ public static class FinanceEndpoints
             FROM fin.JournalEntry AS e
             WHERE (@BranchId IS NULL OR e.BranchId = @BranchId OR e.BranchId IS NULL)
               AND (@Kind IS NULL OR e.Kind = @Kind)
-              AND (@From IS NULL OR CAST(e.PostedAtUtc AS DATE) >= @From)
-              AND (@To   IS NULL OR CAST(e.PostedAtUtc AS DATE) <= @To)
-              AND (@Search IS NULL OR e.Reference LIKE N'%' + @Search + N'%'
-                                   OR e.SourceReference LIKE N'%' + @Search + N'%'
-                                   OR e.DescriptionEn LIKE N'%' + @Search + N'%')
+              AND (@From::date IS NULL OR e.PostedAtUtc::date >= @From::date)
+              AND (@To::date   IS NULL OR e.PostedAtUtc::date <= @To::date)
+              AND (@Search IS NULL OR e.Reference COLLATE "default" ILIKE '%' || @Search || '%'
+                                   OR e.SourceReference COLLATE "default" ILIKE '%' || @Search || '%'
+                                   OR e.DescriptionEn COLLATE "default" ILIKE '%' || @Search || '%')
               AND (@AccountCode IS NULL OR EXISTS (
                     SELECT 1 FROM fin.JournalLine AS l
                     WHERE l.EntryId = e.EntryId AND l.AccountCode = @AccountCode))
@@ -73,7 +73,7 @@ public static class FinanceEndpoints
             OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY;
             """;
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(sql,
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(sql,
             new
             {
                 BranchId = branchId,
@@ -88,7 +88,7 @@ public static class FinanceEndpoints
             cancellationToken: ct));
 
         var total = await multi.ReadSingleAsync<int>();
-        var rows = (await multi.ReadAsync()).ToList();
+        var rows = (await multi.ReadRowsAsync()).ToList();
 
         return Results.Ok(new PagedResult<object>
         {
@@ -103,7 +103,7 @@ public static class FinanceEndpoints
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             "SELECT * FROM fin.vw_AccountBalance ORDER BY AccountCode;",
             cancellationToken: ct));
 
@@ -132,7 +132,7 @@ public static class FinanceEndpoints
             ? DateTime.UtcNow.ToString("yyyy-MM")
             : month.Trim();
 
-        if (!DateOnly.TryParseExact(period + "-01", "yyyy-MM-dd", out _))
+        if (!DateOnly.TryParseExact(period + "-01", "yyyy-MM-dd", out var periodStart))
             return ProcErrors.Field("month", "Months are YYYY-MM.", "الشهر بصيغة YYYY-MM.");
 
         var branch = ProcErrors.Blank(branchId);
@@ -140,87 +140,91 @@ public static class FinanceEndpoints
 
         await using var connection = db.Create();
 
+        // @Start is the first of the month and @Next the first of the next.
         const string sql = """
-            DECLARE @Start DATE = CAST(@Period + '-01' AS DATE);
-            DECLARE @Next  DATE = DATEADD(MONTH, 1, @Start);
-
             -- 1. Per account, per scope: the month's movement and the all-time balance.
             SELECT
-                CASE WHEN e.BranchId IS NULL THEN N'business' ELSE N'branch' END AS Scope,
+                CASE WHEN e.BranchId IS NULL THEN 'business' ELSE 'branch' END AS Scope,
                 l.AccountCode,
-                SUM(CASE WHEN e.PostedAtUtc >= @Start AND e.PostedAtUtc < @Next THEN l.DebitH  ELSE 0 END) AS PeriodDebitH,
-                SUM(CASE WHEN e.PostedAtUtc >= @Start AND e.PostedAtUtc < @Next THEN l.CreditH ELSE 0 END) AS PeriodCreditH,
-                SUM(CASE WHEN e.PostedAtUtc >= @Start AND e.PostedAtUtc < @Next AND e.Kind = N'return'
-                         THEN l.DebitH - l.CreditH ELSE 0 END) AS PeriodReturnNetH,
-                SUM(l.DebitH)  AS TotalDebitH,
-                SUM(l.CreditH) AS TotalCreditH
+                SUM(CASE WHEN e.PostedAtUtc >= @Start AND e.PostedAtUtc < @Next THEN l.DebitH  ELSE 0 END)::bigint AS PeriodDebitH,
+                SUM(CASE WHEN e.PostedAtUtc >= @Start AND e.PostedAtUtc < @Next THEN l.CreditH ELSE 0 END)::bigint AS PeriodCreditH,
+                SUM(CASE WHEN e.PostedAtUtc >= @Start AND e.PostedAtUtc < @Next AND e.Kind = 'return'
+                         THEN l.DebitH - l.CreditH ELSE 0 END)::bigint AS PeriodReturnNetH,
+                SUM(l.DebitH)::bigint  AS TotalDebitH,
+                SUM(l.CreditH)::bigint AS TotalCreditH
             FROM fin.JournalEntry AS e
             JOIN fin.JournalLine  AS l ON l.EntryId = e.EntryId
             WHERE (@BranchId IS NULL OR e.BranchId = @BranchId OR e.BranchId IS NULL)
-            GROUP BY CASE WHEN e.BranchId IS NULL THEN N'business' ELSE N'branch' END, l.AccountCode;
+            GROUP BY CASE WHEN e.BranchId IS NULL THEN 'business' ELSE 'branch' END, l.AccountCode;
 
             -- 2. Operating expense accounts, for the per-account split.
             SELECT AccountCode, NameAr, NameEn FROM fin.Account
-            WHERE AccountType = N'expense' AND AccountCode <> N'5100'
+            WHERE AccountType = 'expense' AND AccountCode <> '5100'
             ORDER BY AccountCode;
 
             -- 3. How the month's sales were tendered (voided sales excluded).
-            SELECT p.Method, SUM(p.AmountH) AS AmountH
+            SELECT p.Method, SUM(p.AmountH)::bigint AS AmountH
             FROM sales.SalePayment AS p
             JOIN sales.Sale AS s ON s.SaleId = p.SaleId
-            WHERE s.Status <> N'voided' AND s.SoldAtUtc >= @Start AND s.SoldAtUtc < @Next
+            WHERE s.Status <> 'voided' AND s.SoldAtUtc >= @Start AND s.SoldAtUtc < @Next
               AND (@BranchId IS NULL OR s.BranchId = @BranchId)
             GROUP BY p.Method;
 
-            SELECT ISNULL(SUM(s.ChangeH), 0) AS ChangeH, COUNT(*) AS SaleCount
+            SELECT COALESCE(SUM(s.ChangeH), 0)::bigint AS ChangeH, COUNT(*)::int AS SaleCount
             FROM sales.Sale AS s
-            WHERE s.Status <> N'voided' AND s.SoldAtUtc >= @Start AND s.SoldAtUtc < @Next
+            WHERE s.Status <> 'voided' AND s.SoldAtUtc >= @Start AND s.SoldAtUtc < @Next
               AND (@BranchId IS NULL OR s.BranchId = @BranchId);
 
             -- 4. Refunds on credit notes issued in the month.
-            SELECT ISNULL(r.RefundMethod, N'cash') AS Method, SUM(r.RefundH) AS AmountH, COUNT(*) AS NoteCount
+            SELECT COALESCE(r.RefundMethod, 'cash') AS Method, SUM(r.RefundH)::bigint AS AmountH, COUNT(*)::int AS NoteCount
             FROM sales.SaleReturn AS r
             WHERE r.ReturnedAtUtc >= @Start AND r.ReturnedAtUtc < @Next
               AND (@BranchId IS NULL OR r.BranchId = @BranchId)
-            GROUP BY ISNULL(r.RefundMethod, N'cash');
+            GROUP BY COALESCE(r.RefundMethod, 'cash');
 
             -- 5. Cost sold that the ledger does not carry, per scope: each
             --    sale's (and credit note's) line cost less what its own entry
             --    put through 5100. Today that is services and untracked items,
             --    whose cost never moves stock and so is never posted.
-            SELECT Scope, SUM(CostH) AS CostH
+            SELECT Scope, SUM(CostH)::bigint AS CostH
             FROM (
-                SELECT CASE WHEN s.BranchId IS NULL THEN N'business' ELSE N'branch' END AS Scope,
-                       ISNULL(lc.CostH, 0) - ISNULL(gl.PostedH, 0) AS CostH
+                SELECT CASE WHEN s.BranchId IS NULL THEN 'business' ELSE 'branch' END AS Scope,
+                       COALESCE(lc.CostH, 0) - COALESCE(gl.PostedH, 0) AS CostH
                 FROM sales.Sale AS s
-                OUTER APPLY (SELECT SUM(CAST(ROUND(l.UnitCostH * l.Quantity, 0) AS BIGINT)) AS CostH
-                             FROM sales.SaleLine AS l WHERE l.SaleId = s.SaleId) AS lc
-                OUTER APPLY (SELECT SUM(jl.DebitH - jl.CreditH) AS PostedH
-                             FROM fin.JournalEntry AS je
-                             JOIN fin.JournalLine AS jl ON jl.EntryId = je.EntryId AND jl.AccountCode = N'5100'
-                             WHERE je.Kind = N'sale' AND je.SourceReference = s.InvoiceNumber
-                               AND je.ReversesEntryId IS NULL) AS gl
-                WHERE s.Status <> N'voided' AND s.SoldAtUtc >= @Start AND s.SoldAtUtc < @Next
+                LEFT JOIN LATERAL (SELECT SUM(round(l.UnitCostH * l.Quantity, 0)::bigint) AS CostH
+                                   FROM sales.SaleLine AS l WHERE l.SaleId = s.SaleId) AS lc ON true
+                LEFT JOIN LATERAL (SELECT SUM(jl.DebitH - jl.CreditH) AS PostedH
+                                   FROM fin.JournalEntry AS je
+                                   JOIN fin.JournalLine AS jl ON jl.EntryId = je.EntryId AND jl.AccountCode = '5100'
+                                   WHERE je.Kind = 'sale' AND je.SourceReference = s.InvoiceNumber
+                                     AND je.ReversesEntryId IS NULL) AS gl ON true
+                WHERE s.Status <> 'voided' AND s.SoldAtUtc >= @Start AND s.SoldAtUtc < @Next
                   AND (@BranchId IS NULL OR s.BranchId = @BranchId OR s.BranchId IS NULL)
 
                 UNION ALL
 
-                SELECT CASE WHEN r.BranchId IS NULL THEN N'business' ELSE N'branch' END,
-                       -(ISNULL(rc.CostH, 0) - ISNULL(gl.PostedH, 0))
+                SELECT CASE WHEN r.BranchId IS NULL THEN 'business' ELSE 'branch' END,
+                       -(COALESCE(rc.CostH, 0) - COALESCE(gl.PostedH, 0))
                 FROM sales.SaleReturn AS r
-                OUTER APPLY (SELECT SUM(CAST(ROUND(rl.UnitCostH * rl.Quantity, 0) AS BIGINT)) AS CostH
-                             FROM sales.SaleReturnLine AS rl WHERE rl.ReturnId = r.ReturnId) AS rc
-                OUTER APPLY (SELECT SUM(jl.CreditH - jl.DebitH) AS PostedH
-                             FROM fin.JournalLine AS jl
-                             WHERE jl.EntryId = r.EntryId AND jl.AccountCode = N'5100') AS gl
+                LEFT JOIN LATERAL (SELECT SUM(round(rl.UnitCostH * rl.Quantity, 0)::bigint) AS CostH
+                                   FROM sales.SaleReturnLine AS rl WHERE rl.ReturnId = r.ReturnId) AS rc ON true
+                LEFT JOIN LATERAL (SELECT SUM(jl.CreditH - jl.DebitH) AS PostedH
+                                   FROM fin.JournalLine AS jl
+                                   WHERE jl.EntryId = r.EntryId AND jl.AccountCode = '5100') AS gl ON true
                 WHERE r.ReturnedAtUtc >= @Start AND r.ReturnedAtUtc < @Next
                   AND (@BranchId IS NULL OR r.BranchId = @BranchId OR r.BranchId IS NULL)
             ) AS c
             GROUP BY Scope;
             """;
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(sql,
-            new { Period = period, BranchId = branch }, cancellationToken: ct));
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(sql,
+            new
+            {
+                Start = periodStart.ToDateTime(TimeOnly.MinValue),
+                Next = periodStart.AddMonths(1).ToDateTime(TimeOnly.MinValue),
+                BranchId = branch
+            },
+            cancellationToken: ct));
 
         var accounts = (await multi.ReadAsync<SummaryAccountRow>()).ToList();
         var expenseAccounts = (await multi.ReadAsync<(string AccountCode, string NameAr, string NameEn)>()).ToList();
@@ -365,7 +369,7 @@ public static class FinanceEndpoints
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             """
             SELECT * FROM fin.vw_CommissionSummary
             WHERE (@UserId IS NULL OR UserId = @UserId)

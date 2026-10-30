@@ -1,6 +1,6 @@
 using System.Data.Common;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 
 namespace PosApi.Tenancy;
 
@@ -50,11 +50,12 @@ public sealed class LoginDirectory
         await using var connection = _catalog.Control();
         return await connection.QueryFirstOrDefaultAsync<string>(new CommandDefinition(
             """
-            SELECT TOP (1) Identifier FROM ctl.LoginDirectory
-            WHERE Identifier IN @Wanted
-              AND NOT (TenantId = @TenantId AND UserId = ISNULL(@UserId, N''));
+            SELECT Identifier FROM ctl.LoginDirectory
+            WHERE Identifier = ANY(@Wanted)
+              AND NOT (TenantId = @TenantId AND UserId = COALESCE(@UserId, ''))
+            LIMIT 1;
             """,
-            new { Wanted = wanted, TenantId = tenantId, UserId = userId }, cancellationToken: ct));
+            new { Wanted = wanted.ToArray(), TenantId = tenantId, UserId = userId }, cancellationToken: ct));
     }
 
     /// <summary>Make one user's directory entries match their row in the tenant database.</summary>
@@ -89,7 +90,7 @@ public sealed class LoginDirectory
     /// </summary>
     public async Task<int> RebuildTenantAsync(string tenantId, string tenantConnection, CancellationToken ct)
     {
-        await using var tenant = new SqlConnection(tenantConnection);
+        await using var tenant = new NpgsqlConnection(tenantConnection);
         var users = (await tenant.QueryAsync<(string UserId, string Username, string? Email, string? Phone)>(
             new CommandDefinition("SELECT UserId, Username, Email, Phone FROM core.AppUser;", cancellationToken: ct))).ToList();
 
@@ -126,7 +127,7 @@ public sealed class LoginDirectory
     }
 
     private async Task<bool> InsertAsync(
-        SqlConnection connection, DbTransaction tx, string tenantId, string userId,
+        NpgsqlConnection connection, DbTransaction tx, string tenantId, string userId,
         string identifier, string kind, CancellationToken ct)
     {
         var inserted = await connection.ExecuteAsync(new CommandDefinition(

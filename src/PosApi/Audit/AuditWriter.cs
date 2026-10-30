@@ -49,7 +49,7 @@ public sealed class AuditWriter : IAuditWriter
     public void RecordTiming(RequestTiming timing) => _queue.Writer.TryWrite(timing);
 }
 
-/// <summary>Drains the queue into SQL Server.</summary>
+/// <summary>Drains the queue into the tenant databases.</summary>
 public sealed class AuditDrainService : BackgroundService
 {
     private readonly AuditWriter _writer;
@@ -79,7 +79,7 @@ public sealed class AuditDrainService : BackgroundService
 
                 if (target is null) continue;
 
-                await using var connection = new Microsoft.Data.SqlClient.SqlConnection(target);
+                await using var connection = new Npgsql.NpgsqlConnection(target);
 
                 if (item is AuditEntry entry)
                 {

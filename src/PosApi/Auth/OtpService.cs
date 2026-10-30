@@ -124,7 +124,7 @@ public sealed class OtpService : IOtpService
 
         // Consume it. A one-time code that works twice is not one-time.
         await connection.ExecuteAsync(new CommandDefinition(
-            "UPDATE core.OtpChallenge SET ConsumedAtUtc = SYSUTCDATETIME() WHERE ChallengeId = @ChallengeId;",
+            "UPDATE core.OtpChallenge SET ConsumedAtUtc = now() AT TIME ZONE 'utc' WHERE ChallengeId = @ChallengeId;",
             new { ChallengeId = challengeId },
             cancellationToken: ct));
 

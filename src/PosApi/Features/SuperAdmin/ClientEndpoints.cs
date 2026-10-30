@@ -1,6 +1,6 @@
 using System.Text.RegularExpressions;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Tenancy;
 
@@ -149,7 +149,7 @@ public static partial class ClientEndpoints
             "SELECT ActivatedAtUtc FROM ctl.Tenant WHERE ActivatedAtUtc >= @From;",
             new { window.From }, cancellationToken: ct))).ToList();
         var suspended = (await control.QueryAsync<DateTime>(new CommandDefinition(
-            "SELECT AtUtc FROM ctl.AdminAudit WHERE Action = N'client.suspend' AND Result = N'success' AND AtUtc >= @From;",
+            "SELECT AtUtc FROM ctl.AdminAudit WHERE Action = 'client.suspend' AND Result = 'success' AND AtUtc >= @From;",
             new { window.From }, cancellationToken: ct))).ToList();
         var churned = (await control.QueryAsync<DateTime>(new CommandDefinition(
             "SELECT CancelledAtUtc FROM ctl.Subscription WHERE CancelledAtUtc >= @From;",
@@ -202,14 +202,14 @@ public static partial class ClientEndpoints
 
         var rows = await db.QueryAsync(new CommandDefinition(
             """
-            SELECT b.BranchId AS id, @ClientId AS clientId, @ClientName AS clientName, b.NameEn AS name,
-                   b.NameAr AS nameAr, b.Code AS code, b.IsActive AS isActive, @City AS city,
-                   (SELECT COUNT(*) FROM device.PosDevice AS d WHERE d.BranchId = b.BranchId AND d.IsActive = 1) AS devices,
-                   (SELECT COUNT(*) FROM device.PosDevice AS d WHERE d.BranchId = b.BranchId AND d.IsActive = 1
-                      AND d.LastHeartbeatAtUtc > DATEADD(SECOND, -120, SYSUTCDATETIME())) AS devicesOnline,
-                   (SELECT COUNT(*) FROM core.UserBranch AS ub WHERE ub.BranchId = b.BranchId) AS users,
-                   (SELECT COUNT(*) FROM sales.Sale AS s WHERE s.BranchId = b.BranchId AND s.Status = N'completed') AS transactions,
-                   (SELECT ISNULL(SUM(s.TotalH), 0) FROM sales.Sale AS s WHERE s.BranchId = b.BranchId AND s.Status = N'completed') AS salesH
+            SELECT b.BranchId AS "id", @ClientId AS "clientId", @ClientName AS "clientName", b.NameEn AS "name",
+                   b.NameAr AS "nameAr", b.Code AS "code", b.IsActive AS "isActive", @City AS "city",
+                   (SELECT COUNT(*)::int FROM device.PosDevice AS d WHERE d.BranchId = b.BranchId AND d.IsActive) AS "devices",
+                   (SELECT COUNT(*)::int FROM device.PosDevice AS d WHERE d.BranchId = b.BranchId AND d.IsActive
+                      AND d.LastHeartbeatAtUtc > (now() AT TIME ZONE 'utc') - interval '120 seconds') AS "devicesOnline",
+                   (SELECT COUNT(*)::int FROM core.UserBranch AS ub WHERE ub.BranchId = b.BranchId) AS "users",
+                   (SELECT COUNT(*)::int FROM sales.Sale AS s WHERE s.BranchId = b.BranchId AND s.Status = 'completed') AS "transactions",
+                   (SELECT COALESCE(SUM(s.TotalH), 0)::bigint FROM sales.Sale AS s WHERE s.BranchId = b.BranchId AND s.Status = 'completed') AS "salesH"
             FROM core.Branch AS b
             ORDER BY b.Code;
             """, new { ClientId = id, ClientName = tenant.Info.Name, City = tenant.City }, cancellationToken: ct));
@@ -227,7 +227,7 @@ public static partial class ClientEndpoints
     }
 
     /// <summary>A tenant's POS terminals, in the console's shape.</summary>
-    public static async Task<IReadOnlyList<object>> Terminals(SqlConnection db, string clientId, string clientName, CancellationToken ct)
+    public static async Task<IReadOnlyList<object>> Terminals(NpgsqlConnection db, string clientId, string clientName, CancellationToken ct)
     {
         var rows = await db.QueryAsync<TerminalRow>(new CommandDefinition(
             """
@@ -297,17 +297,17 @@ public static partial class ClientEndpoints
         return Results.Ok(await TenantUsers(db, id, tenant.Info.Name, ct));
     }
 
-    public static async Task<IReadOnlyList<dynamic>> TenantUsers(SqlConnection db, string clientId, string clientName, CancellationToken ct) =>
+    public static async Task<IReadOnlyList<dynamic>> TenantUsers(NpgsqlConnection db, string clientId, string clientName, CancellationToken ct) =>
         (await db.QueryAsync(new CommandDefinition(
             """
-            SELECT u.UserId AS id, @ClientId AS clientId, @ClientName AS clientName, N'client' AS scope,
-                   u.NameEn AS name, u.Username AS username, u.Email AS email, u.Phone AS phone,
-                   ISNULL(r.NameEn, u.RoleId) AS role, u.DefaultBranchId AS branchId, b.NameEn AS branchName,
-                   u.LastLoginAtUtc AS lastLoginAt, u.Status AS status
+            SELECT u.UserId AS "id", @ClientId AS "clientId", @ClientName AS "clientName", 'client' AS "scope",
+                   u.NameEn AS "name", u.Username AS "username", u.Email AS "email", u.Phone AS "phone",
+                   COALESCE(r.NameEn, u.RoleId) AS "role", u.DefaultBranchId AS "branchId", b.NameEn AS "branchName",
+                   u.LastLoginAtUtc AS "lastLoginAt", u.Status AS "status"
             FROM core.AppUser AS u
             LEFT JOIN core.Role AS r ON r.RoleId = u.RoleId
             LEFT JOIN core.Branch AS b ON b.BranchId = COALESCE(u.DefaultBranchId,
-                 (SELECT TOP (1) ub.BranchId FROM core.UserBranch AS ub WHERE ub.UserId = u.UserId ORDER BY ub.BranchId))
+                 (SELECT ub.BranchId FROM core.UserBranch AS ub WHERE ub.UserId = u.UserId ORDER BY ub.BranchId LIMIT 1))
             ORDER BY u.NameEn;
             """, new { ClientId = clientId, ClientName = clientName }, cancellationToken: ct))).ToList();
 
@@ -321,15 +321,16 @@ public static partial class ClientEndpoints
 
         var snap = await control.QuerySingleOrDefaultAsync(new CommandDefinition(
             """
-            SELECT n.TransactionsMonth, n.DbSizeMb, n.DbRows, n.DbTables, n.LargestTable, n.LargestTableRows,
-                   p.Transactions AS TxLimit, p.StorageGb AS StorageLimit,
-                   (SELECT ISNULL(SUM(d.Transactions), 0) FROM ctl.TenantDailyStat AS d
+            SELECT n.TransactionsMonth AS "TransactionsMonth", n.DbSizeMb AS "DbSizeMb", n.DbRows AS "DbRows",
+                   n.DbTables AS "DbTables", n.LargestTable AS "LargestTable", n.LargestTableRows AS "LargestTableRows",
+                   p.Transactions AS "TxLimit", p.StorageGb AS "StorageLimit",
+                   (SELECT COALESCE(SUM(d.Transactions), 0)::bigint FROM ctl.TenantDailyStat AS d
                      WHERE d.TenantId = n.TenantId
-                       AND d.StatDate >= DATEADD(MONTH, -1, DATEFROMPARTS(YEAR(SYSUTCDATETIME()), MONTH(SYSUTCDATETIME()), 1))
-                       AND d.StatDate < DATEFROMPARTS(YEAR(SYSUTCDATETIME()), MONTH(SYSUTCDATETIME()), 1)) AS TxPrevious
+                       AND d.StatDate >= (date_trunc('month', now() AT TIME ZONE 'utc') - interval '1 month')::date
+                       AND d.StatDate < date_trunc('month', now() AT TIME ZONE 'utc')::date) AS "TxPrevious"
             FROM ctl.TenantSnapshot AS n
             LEFT JOIN ctl.Subscription AS s ON s.TenantId = n.TenantId
-            LEFT JOIN ctl.[Plan] AS p ON p.PlanKey = s.PlanKey
+            LEFT JOIN ctl.Plan AS p ON p.PlanKey = s.PlanKey
             WHERE n.TenantId = @TenantId;
             """, new { TenantId = id }, cancellationToken: ct));
 
@@ -400,18 +401,18 @@ public static partial class ClientEndpoints
 
         var rows = await db.QueryAsync(new CommandDefinition(
             """
-            SELECT TOP (@Take)
-                   s.SaleId AS id, s.InvoiceNumber AS invoiceNo, s.SoldAtUtc AS [at], s.BranchId AS branchId,
-                   b.NameEn AS branchName, NULL AS deviceId, s.CashierName AS cashier,
-                   (SELECT COUNT(*) FROM sales.SaleLine AS l WHERE l.SaleId = s.SaleId) AS items,
-                   (SELECT TOP (1) p.Method FROM sales.SalePayment AS p WHERE p.SaleId = s.SaleId ORDER BY p.AmountH DESC) AS method,
-                   s.TotalH - s.TaxH AS netH, s.TaxH AS vatH, s.TotalH AS totalH,
-                   CASE s.Status WHEN N'returned' THEN -s.TotalH WHEN N'voided' THEN 0 ELSE s.TotalH END AS signedTotalH,
-                   CASE s.Status WHEN N'returned' THEN N'refunded' WHEN N'voided' THEN N'void' ELSE N'completed' END AS status,
-                   CASE WHEN s.CustomerId IS NULL THEN N'Walk-in' ELSE N'Account' END AS customer
+            SELECT s.SaleId AS "id", s.InvoiceNumber AS "invoiceNo", s.SoldAtUtc AS "at", s.BranchId AS "branchId",
+                   b.NameEn AS "branchName", NULL::text AS "deviceId", s.CashierName AS "cashier",
+                   (SELECT COUNT(*)::int FROM sales.SaleLine AS l WHERE l.SaleId = s.SaleId) AS "items",
+                   (SELECT p.Method FROM sales.SalePayment AS p WHERE p.SaleId = s.SaleId ORDER BY p.AmountH DESC LIMIT 1) AS "method",
+                   s.TotalH - s.TaxH AS "netH", s.TaxH AS "vatH", s.TotalH AS "totalH",
+                   CASE s.Status WHEN 'returned' THEN -s.TotalH WHEN 'voided' THEN 0 ELSE s.TotalH END AS "signedTotalH",
+                   CASE s.Status WHEN 'returned' THEN 'refunded' WHEN 'voided' THEN 'void' ELSE 'completed' END AS "status",
+                   CASE WHEN s.CustomerId IS NULL THEN 'Walk-in' ELSE 'Account' END AS "customer"
             FROM sales.Sale AS s
             LEFT JOIN core.Branch AS b ON b.BranchId = s.BranchId
-            ORDER BY s.SoldAtUtc DESC;
+            ORDER BY s.SoldAtUtc DESC
+            LIMIT @Take;
             """, new { Take = Math.Clamp(take ?? 240, 1, 2000) }, cancellationToken: ct));
 
         return Results.Ok(rows);
@@ -593,7 +594,7 @@ public static partial class ClientEndpoints
         var parameters = new DynamicParameters(set);
         parameters.Add("Id", id);
         await control.ExecuteAsync(new CommandDefinition(
-            $"UPDATE ctl.Tenant SET {string.Join(", ", set.Keys.Select(k => $"{k} = @{k}"))}, UpdatedAtUtc = SYSUTCDATETIME() WHERE TenantId = @Id;",
+            $"UPDATE ctl.Tenant SET {string.Join(", ", set.Keys.Select(k => $"{k} = @{k}"))}, UpdatedAtUtc = now() AT TIME ZONE 'utc' WHERE TenantId = @Id;",
             parameters, cancellationToken: ct));
 
         /* The tenant's own company record carries the same legal details;
@@ -605,7 +606,7 @@ public static partial class ClientEndpoints
             {
                 try
                 {
-                    await using var db = new SqlConnection(tenant.ConnectionString);
+                    await using var db = new NpgsqlConnection(tenant.ConnectionString);
                     await db.ExecuteAsync(new CommandDefinition(
                         """
                         UPDATE core.Company
@@ -621,9 +622,9 @@ public static partial class ClientEndpoints
                             City = set.TryGetValue("City", out var c) ? c as string : current.City
                         }, cancellationToken: ct));
                 }
-                catch (SqlException ex)
+                catch (NpgsqlException ex)
                 {
-                    return Results.Json(new { code = "tenant_update_failed", message = $"Saved in the console, but the client's own record refused it: {ex.Message}" },
+                    return Results.Json(new { code = "tenant_update_failed", message = $"Saved in the console, but the client's own record refused it: {DbMessage(ex)}" },
                         statusCode: StatusCodes.Status422UnprocessableEntity);
                 }
             }
@@ -648,13 +649,13 @@ public static partial class ClientEndpoints
         await using var control = catalog.Control();
         var affected = await control.ExecuteAsync(new CommandDefinition(
             """
-            UPDATE ctl.Tenant
-            SET Status = N'suspended', SuspendedAtUtc = SYSUTCDATETIME(), SuspendReason = @Reason, UpdatedAtUtc = SYSUTCDATETIME()
-            WHERE TenantId = @Id AND Status = N'active';
-
-            IF @@ROWCOUNT > 0
-                INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail, Severity)
-                VALUES (N'client_suspended', N'Client suspended', @Id, @Reason, N'warning');
+            WITH changed AS (
+                UPDATE ctl.Tenant
+                SET Status = 'suspended', SuspendedAtUtc = now() AT TIME ZONE 'utc', SuspendReason = @Reason, UpdatedAtUtc = now() AT TIME ZONE 'utc'
+                WHERE TenantId = @Id AND Status = 'active'
+                RETURNING TenantId)
+            INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail, Severity)
+            SELECT 'client_suspended', 'Client suspended', @Id, @Reason, 'warning' FROM changed;
             """, new { Id = id, request.Reason }, cancellationToken: ct));
 
         if (affected == 0) return Conflict("That client is not active, so it cannot be deactivated.");
@@ -684,13 +685,13 @@ public static partial class ClientEndpoints
         await using var control = catalog.Control();
         var affected = await control.ExecuteAsync(new CommandDefinition(
             """
-            UPDATE ctl.Tenant
-            SET Status = N'active', SuspendedAtUtc = NULL, SuspendReason = NULL, UpdatedAtUtc = SYSUTCDATETIME()
-            WHERE TenantId = @Id AND Status = N'suspended';
-
-            IF @@ROWCOUNT > 0
-                INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail)
-                VALUES (N'client_activated', @Label, @Id, @Reason);
+            WITH changed AS (
+                UPDATE ctl.Tenant
+                SET Status = 'active', SuspendedAtUtc = NULL, SuspendReason = NULL, UpdatedAtUtc = now() AT TIME ZONE 'utc'
+                WHERE TenantId = @Id AND Status = 'suspended'
+                RETURNING TenantId)
+            INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail)
+            SELECT 'client_activated', @Label, @Id, @Reason FROM changed;
             """, new { Id = id, Reason = reason, Label = label }, cancellationToken: ct));
 
         if (affected == 0) return Conflict("That client is not deactivated.");
@@ -713,8 +714,8 @@ public static partial class ClientEndpoints
 
         var sessionId = await control.ExecuteScalarAsync<long>(new CommandDefinition(
             """
-            INSERT INTO ctl.SupportSession (TenantId, AdminId, Reason) OUTPUT INSERTED.SessionId VALUES (@Id, @AdminId, @Reason);
-            INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail) VALUES (N'support_session', N'Support session started', @Id, @Reason);
+            INSERT INTO ctl.SupportSession (TenantId, AdminId, Reason) VALUES (@Id, @AdminId, @Reason) RETURNING SessionId;
+            INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail) VALUES ('support_session', 'Support session started', @Id, @Reason);
             """, new { Id = id, admin.AdminId, request.Reason }, cancellationToken: ct));
 
         return Results.Ok(await audit.ResultAsync("support.session", "Started support session", id, $"SS-{sessionId}",
@@ -748,7 +749,7 @@ public static partial class ClientEndpoints
 
         var after = request.Block ? "suspended" : "active";
         await db.ExecuteAsync(new CommandDefinition(
-            "UPDATE core.AppUser SET Status = @Status, UpdatedAtUtc = SYSUTCDATETIME(), UpdatedBy = N'platform admin' WHERE UserId = @UserId;",
+            "UPDATE core.AppUser SET Status = @Status, UpdatedAtUtc = now() AT TIME ZONE 'utc', UpdatedBy = 'platform admin' WHERE UserId = @UserId;",
             new { Status = after, UserId = userId }, cancellationToken: ct));
 
         if (request.Block) await RevokeSessionsAsync(catalog, id, userId, ct);
@@ -759,7 +760,7 @@ public static partial class ClientEndpoints
 
     /*============================================================== helpers */
 
-    public sealed record OpenTenant(TenantInfo Info, SqlConnection Connection, string? City);
+    public sealed record OpenTenant(TenantInfo Info, NpgsqlConnection Connection, string? City);
 
     /// <summary>A tenant's own database, for the live detail tabs. Suspended tenants can still be inspected.</summary>
     public static async Task<(OpenTenant? Tenant, IResult? Refused)> OpenTenantAsync(TenantCatalog catalog, string id, CancellationToken ct)
@@ -773,15 +774,15 @@ public static partial class ClientEndpoints
         var city = await control.ExecuteScalarAsync<string?>(new CommandDefinition(
             "SELECT City FROM ctl.Tenant WHERE TenantId = @Id;", new { Id = id }, cancellationToken: ct));
 
-        var connection = new SqlConnection(info.ConnectionString);
+        var connection = new NpgsqlConnection(info.ConnectionString);
         try
         {
             await connection.OpenAsync(ct);
         }
-        catch (SqlException ex)
+        catch (NpgsqlException ex)
         {
             await connection.DisposeAsync();
-            return (null, Results.Json(new { code = "tenant_unreachable", message = $"The client's database could not be reached: {ex.Message}" },
+            return (null, Results.Json(new { code = "tenant_unreachable", message = $"The client's database could not be reached: {DbMessage(ex)}" },
                 statusCode: StatusCodes.Status503ServiceUnavailable));
         }
 
@@ -795,12 +796,12 @@ public static partial class ClientEndpoints
 
         try
         {
-            await using var db = new SqlConnection(info.ConnectionString);
+            await using var db = new NpgsqlConnection(info.ConnectionString);
             return await db.ExecuteAsync(new CommandDefinition(
-                "UPDATE core.RefreshToken SET RevokedAtUtc = SYSUTCDATETIME() WHERE RevokedAtUtc IS NULL AND (@UserId IS NULL OR UserId = @UserId);",
+                "UPDATE core.RefreshToken SET RevokedAtUtc = now() AT TIME ZONE 'utc' WHERE RevokedAtUtc IS NULL AND (@UserId IS NULL OR UserId = @UserId);",
                 new { UserId = userId }, cancellationToken: ct));
         }
-        catch (SqlException)
+        catch (NpgsqlException)
         {
             /* Unreachable: the middleware still refuses every request, and the
                tokens die at expiry. */
@@ -815,6 +816,10 @@ public static partial class ClientEndpoints
         Results.Json(new { code = "conflict", message }, statusCode: StatusCodes.Status409Conflict);
 
     private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    /* A server refusal (PostgresException) or a connection failure: either way
+       the database could not do it, as SqlException covered both. */
+    private static string DbMessage(NpgsqlException ex) => ex is PostgresException pg ? pg.MessageText : ex.Message;
 
     private sealed record TerminalRow
     {

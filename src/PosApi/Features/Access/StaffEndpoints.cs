@@ -51,8 +51,8 @@ public static class StaffEndpoints
             SELECT u.UserId, u.NameAr, u.NameEn, u.RoleId, r.NameAr AS RoleNameAr, r.NameEn AS RoleNameEn
             FROM core.AppUser AS u
             JOIN core.Role AS r ON r.RoleId = u.RoleId
-            WHERE u.Status = N'active'
-              AND (u.AccessExpiresOn IS NULL OR u.AccessExpiresOn >= CAST(SYSUTCDATETIME() AS DATE))
+            WHERE u.Status = 'active'
+              AND (u.AccessExpiresOn IS NULL OR u.AccessExpiresOn >= (now() AT TIME ZONE 'utc')::date)
               AND EXISTS (
                     SELECT 1 FROM core.UserBranch AS ub
                     WHERE ub.UserId = u.UserId

@@ -2,6 +2,7 @@ using Dapper;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
+using Npgsql;
 
 namespace PosApi.Features.Catalog;
 
@@ -40,35 +41,38 @@ public static partial class ActivationEndpoints
     {
         await using var connection = db.Create();
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@EntityType", entityType);
-        parameters.Add("@EntityId", entityId);
-        parameters.Add("@IsActive", request.IsActive);
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@Blocked", dbType: System.Data.DbType.String,
-                       direction: System.Data.ParameterDirection.Output, size: 400);
+        string? blocked;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_SetActive", parameters,
-                commandType: System.Data.CommandType.StoredProcedure,
+            /* Null when the change was made; otherwise what is in the way. */
+            blocked = await connection.QuerySingleAsync<string?>(new CommandDefinition(
+                """
+                SELECT Blocked FROM core.usp_SetActive(
+                    p_EntityType => @EntityType, p_EntityId => @EntityId,
+                    p_IsActive => @IsActive, p_Actor => @Actor);
+                """,
+                new
+                {
+                    EntityType = entityType,
+                    EntityId = entityId,
+                    request.IsActive,
+                    Actor = current.Username
+                },
                 cancellationToken: ct));
         }
-        catch (Microsoft.Data.SqlClient.SqlException ex) when (ex.Number == 57001)
+        catch (PostgresException ex) when (ex.ErrorNumber() == 57001)
         {
             return Results.NotFound(ApiError.Create(
                 "not_found", "No such record.", "لا يوجد سجل بهذا المعرف."));
         }
-        catch (Microsoft.Data.SqlClient.SqlException ex) when (ex.Number == 57000)
+        catch (PostgresException ex) when (ex.ErrorNumber() == 57000)
         {
             return Results.BadRequest(ApiError.Create(
                 "not_activatable",
                 "That kind of record cannot be activated or deactivated.",
                 "لا يمكن تنشيط أو تعطيل هذا النوع من السجلات."));
         }
-
-        var blocked = parameters.Get<string?>("@Blocked");
 
         if (!string.IsNullOrWhiteSpace(blocked))
         {

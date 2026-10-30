@@ -59,10 +59,9 @@ public static class DiscoveryEndpoints
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
-            "device.usp_DiscoverDevices",
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
+            "SELECT * FROM device.usp_DiscoverDevices(p_WithinSeconds => @WithinSeconds);",
             new { WithinSeconds = withinSeconds <= 0 ? 120 : Math.Min(withinSeconds, 900) },
-            commandType: System.Data.CommandType.StoredProcedure,
             cancellationToken: ct));
 
         return Results.Ok(rows);
@@ -87,7 +86,7 @@ public static class DiscoveryEndpoints
             """
             INSERT INTO device.DeviceChallenge (ChallengeId, SerialNumber, Nonce, ExpiresAtUtc)
             VALUES (@ChallengeId, @SerialNumber, @Nonce,
-                    DATEADD(SECOND, 120, SYSUTCDATETIME()));
+                    (now() AT TIME ZONE 'utc') + interval '120 seconds');
             """,
             new { ChallengeId = challengeId, request.SerialNumber, Nonce = nonce },
             cancellationToken: ct));
@@ -102,12 +101,12 @@ public static class DiscoveryEndpoints
     {
         await using var connection = db.Create();
 
-        var row = await connection.QuerySingleOrDefaultAsync(new CommandDefinition(
+        var row = await connection.QuerySingleRowOrDefaultAsync(new CommandDefinition(
             """
             SELECT ChallengeId, SerialNumber, Verified, AnsweredAtUtc, ExpiresAtUtc,
-                   CASE WHEN AnsweredAtUtc IS NOT NULL THEN N'answered'
-                        WHEN ExpiresAtUtc < SYSUTCDATETIME() THEN N'expired'
-                        ELSE N'waiting' END AS Status
+                   CASE WHEN AnsweredAtUtc IS NOT NULL THEN 'answered'
+                        WHEN ExpiresAtUtc < now() AT TIME ZONE 'utc' THEN 'expired'
+                        ELSE 'waiting' END AS Status
             FROM device.DeviceChallenge WHERE ChallengeId = @ChallengeId;
             """,
             new { ChallengeId = challengeId }, cancellationToken: ct));
@@ -131,11 +130,13 @@ public static class DiscoveryEndpoints
          */
         var verified = await connection.ExecuteScalarAsync<int>(new CommandDefinition(
             """
-            SELECT COUNT(*) FROM device.DeviceChallenge
+            SELECT COUNT(*)::int FROM device.DeviceChallenge
             WHERE SerialNumber = @SerialNumber
-              AND Verified = 1
+              AND Verified
               AND AnsweredAtUtc IS NOT NULL
-              AND DATEDIFF(MINUTE, AnsweredAtUtc, SYSUTCDATETIME()) <= 10;
+              /* Minute boundaries crossed, as DATEDIFF(MINUTE, ...) counted. */
+              AND date_trunc('minute', now() AT TIME ZONE 'utc') - date_trunc('minute', AnsweredAtUtc)
+                  <= interval '10 minutes';
             """,
             new { request.SerialNumber }, cancellationToken: ct));
 
@@ -154,15 +155,14 @@ public static class DiscoveryEndpoints
         parameters.Add("@Location", request.Location);
         parameters.Add("@DeviceName", request.DeviceName);
         parameters.Add("@Actor", current.Username);
-        parameters.Add("@Blocked", dbType: System.Data.DbType.String,
-                       direction: System.Data.ParameterDirection.Output, size: 400);
 
-        await connection.ExecuteAsync(new CommandDefinition(
-            "device.usp_ConnectDiscovered", parameters,
-            commandType: System.Data.CommandType.StoredProcedure,
-            cancellationToken: ct));
-
-        var blocked = parameters.Get<string?>("@Blocked");
+        var blocked = await connection.QuerySingleAsync<string?>(new CommandDefinition(
+            """
+            SELECT Blocked FROM device.usp_ConnectDiscovered(
+                p_SerialNumber => @SerialNumber, p_DeviceId => @DeviceId, p_BranchId => @BranchId,
+                p_Location => @Location, p_DeviceName => @DeviceName, p_Actor => @Actor);
+            """,
+            parameters, cancellationToken: ct));
 
         if (!string.IsNullOrWhiteSpace(blocked))
         {
@@ -223,7 +223,14 @@ public static class DiscoveryEndpoints
         await using var connection = db.Create();
 
         await connection.ExecuteAsync(new CommandDefinition(
-            "device.usp_RecordAnnouncement",
+            """
+            SELECT device.usp_RecordAnnouncement(
+                p_SerialNumber => @SerialNumber, p_ClaimedDeviceId => @ClaimedDeviceId,
+                p_DeviceName => @DeviceName, p_Manufacturer => @Manufacturer,
+                p_DeviceModel => @DeviceModel, p_AndroidId => @AndroidId,
+                p_AppVersion => @AppVersion, p_LocalIpAddress => @LocalIpAddress,
+                p_NetworkName => @NetworkName, p_SourceIpAddress => @SourceIpAddress);
+            """,
             new
             {
                 request.SerialNumber, request.ClaimedDeviceId, request.DeviceName,
@@ -231,19 +238,19 @@ public static class DiscoveryEndpoints
                 request.AppVersion, request.LocalIpAddress, request.NetworkName,
                 SourceIpAddress = http.Connection.RemoteIpAddress?.ToString()
             },
-            commandType: System.Data.CommandType.StoredProcedure,
             cancellationToken: ct));
 
         /* Anything waiting for this terminal: a challenge to answer, or a
            registration code created for it while it was announcing. */
-        var pending = await connection.QuerySingleOrDefaultAsync(new CommandDefinition(
+        var pending = await connection.QuerySingleRowOrDefaultAsync(new CommandDefinition(
             """
-            SELECT TOP (1) c.ChallengeId, c.Nonce
+            SELECT c.ChallengeId, c.Nonce
             FROM device.DeviceChallenge AS c
             WHERE c.SerialNumber = @SerialNumber
               AND c.AnsweredAtUtc IS NULL
-              AND c.ExpiresAtUtc > SYSUTCDATETIME()
-            ORDER BY c.IssuedAtUtc DESC;
+              AND c.ExpiresAtUtc > now() AT TIME ZONE 'utc'
+            ORDER BY c.IssuedAtUtc DESC
+            LIMIT 1;
 
             """,
             new { request.SerialNumber }, cancellationToken: ct));
@@ -254,7 +261,7 @@ public static class DiscoveryEndpoints
             WHERE SerialNumber = @SerialNumber
               AND RegisteredAtUtc IS NULL
               AND RegistrationCode IS NOT NULL
-              AND CodeExpiresAtUtc > SYSUTCDATETIME();
+              AND CodeExpiresAtUtc > now() AT TIME ZONE 'utc';
             """,
             new { request.SerialNumber }, cancellationToken: ct));
 
@@ -350,8 +357,8 @@ public static class DiscoveryEndpoints
         await connection.ExecuteAsync(new CommandDefinition(
             """
             UPDATE device.DeviceChallenge
-            SET AnsweredAtUtc = SYSUTCDATETIME(),
-                ConsumedAtUtc = SYSUTCDATETIME(),
+            SET AnsweredAtUtc = now() AT TIME ZONE 'utc',
+                ConsumedAtUtc = now() AT TIME ZONE 'utc',
                 Verified = @Verified
             WHERE ChallengeId = @ChallengeId;
             """,

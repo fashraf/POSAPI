@@ -1,5 +1,5 @@
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using Microsoft.Extensions.Options;
 using PosApi.Auth;
 
@@ -8,13 +8,13 @@ namespace PosApi.Tenancy;
 /// <summary>
 /// Brings the control database up before the API takes a request.
 ///
-///  1. Creates POSCONTROL if it is missing and applies db-control/ files.
+///  1. Creates the control database if it is missing and applies db-control/ files.
 ///  2. Creates the first platform administrator from SuperAdmin:Mobile and
 ///     SuperAdmin:Password when there is none — a hash cannot be seeded
 ///     honestly from SQL, and an unusable seed admin is worse than none.
-///  3. Adopts the database that existed before tenancy (Tenancy:AdoptDatabase,
-///     POSMAIN by default) as the first tenant, so an existing installation
-///     keeps working: its users sign in exactly as before.
+///  3. Adopts a database built by apply-migrations (Tenancy:AdoptDatabase,
+///     posmain by default) as the first tenant, so a demo or single-business
+///     install signs in without being provisioned through the console.
 ///
 /// Runs synchronously at startup. If the control database cannot be reached
 /// the API refuses to start: every sign-in depends on it, and an API that is
@@ -55,7 +55,7 @@ public sealed class ControlDatabaseInitializer
             throw new InvalidOperationException($"No control database migrations found in {folder}.");
 
         var applied = await _runner.ApplyAsync(
-            _connections.ControlServer, _connections.ControlDatabase, "POSCONTROL", files, ct);
+            _connections.ControlServer, _connections.ControlDatabase, files, ct);
 
         _logger.LogInformation("Control database {Database}: {Count} migration(s) applied.",
             _connections.ControlDatabase, applied.Count);
@@ -66,7 +66,7 @@ public sealed class ControlDatabaseInitializer
 
     private async Task SeedAdminAsync(CancellationToken ct)
     {
-        await using var control = new SqlConnection(_connections.Control);
+        await using var control = new NpgsqlConnection(_connections.Control);
 
         if (await control.ExecuteScalarAsync<int>(new CommandDefinition(
                 "SELECT COUNT(*) FROM ctl.Admin;", cancellationToken: ct)) > 0)
@@ -91,7 +91,7 @@ public sealed class ControlDatabaseInitializer
         await control.ExecuteAsync(new CommandDefinition(
             """
             INSERT INTO ctl.Admin (AdminId, Name, Mobile, Email, Role, PasswordHash, PasswordSalt, MustChangePassword)
-            VALUES (N'adm_root', @Name, @Mobile, @Email, N'Owner', @Hash, @Salt, 0);
+            VALUES ('adm_root', @Name, @Mobile, @Email, 'Owner', @Hash, @Salt, false);
             """,
             new
             {
@@ -107,10 +107,10 @@ public sealed class ControlDatabaseInitializer
 
     private async Task AdoptAsync(CancellationToken ct)
     {
-        var database = _options.AdoptDatabase;
+        var database = _options.AdoptDatabase.ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(database) || !SqlScriptRunner.IsSafeName(database)) return;
 
-        await using var control = new SqlConnection(_connections.Control);
+        await using var control = new NpgsqlConnection(_connections.Control);
 
         if (await control.ExecuteScalarAsync<int?>(new CommandDefinition(
                 "SELECT 1 FROM ctl.Tenant WHERE DatabaseName = @Database;",
@@ -119,40 +119,31 @@ public sealed class ControlDatabaseInitializer
 
         var tenantConnection = _connections.ForTenant(database);
 
-        /* Only a database that really is a POS tenant: present, with a schema.
-           One built before tracking existed is baselined at 001–002, as
-           apply-migrations --adopt does; the later files are safe to rerun. */
+        /* Only a database that really is a POS tenant: present, and built by
+           the migrations (they record themselves in dbo.SchemaMigration). */
         var applied = await _runner.AppliedAsync(_connections.TenantServer, database, ct);
         if (applied.Count == 0)
         {
-            var baseline = SqlScriptRunner.Files(
-                SqlScriptRunner.ResolveFolder(_options.TenantMigrationsPath, "db-migrations", _environment), 1, 2);
-
-            if (!await _runner.BaselineAsync(_connections.TenantServer, database, baseline, ct))
-            {
-                _logger.LogInformation("Nothing to adopt: {Database} is missing or has no POS schema.", database);
-                return;
-            }
-
-            applied = await _runner.AppliedAsync(_connections.TenantServer, database, ct);
+            _logger.LogInformation("Nothing to adopt: {Database} is missing or has no POS schema.", database);
+            return;
         }
 
-        await using var tenant = new SqlConnection(tenantConnection);
+        await using var tenant = new NpgsqlConnection(tenantConnection);
 
         var company = await tenant.QueryFirstOrDefaultAsync<(string NameEn, string NameAr, string? City, string? CrNumber, string? VatNumber, string? Email, string? Phone)>(
-            new CommandDefinition("SELECT TOP (1) NameEn, NameAr, City, CrNumber, VatNumber, Email, Phone FROM core.Company ORDER BY CompanyId;",
+            new CommandDefinition("SELECT NameEn, NameAr, City, CrNumber, VatNumber, Email, Phone FROM core.Company ORDER BY CompanyId LIMIT 1;",
                 cancellationToken: ct));
 
         var owner = await tenant.QueryFirstOrDefaultAsync<(string UserId, string NameEn, string Username, string? Email, string? Phone)>(
             new CommandDefinition(
-                "SELECT TOP (1) UserId, NameEn, Username, Email, Phone FROM core.AppUser WHERE RoleId = N'rol_owner' ORDER BY CreatedAtUtc;",
+                "SELECT UserId, NameEn, Username, Email, Phone FROM core.AppUser WHERE RoleId = 'rol_owner' ORDER BY CreatedAtUtc LIMIT 1;",
                 cancellationToken: ct));
 
         var number = await control.ExecuteScalarAsync<int>(new CommandDefinition(
-            "SELECT NEXT VALUE FOR ctl.TenantNumber;", cancellationToken: ct));
+            "SELECT nextval('ctl.TenantNumber')::int;", cancellationToken: ct));
         var tenantId = $"CL-{number:00000}";
         var subNumber = await control.ExecuteScalarAsync<int>(new CommandDefinition(
-            "SELECT NEXT VALUE FOR ctl.SubscriptionNumber;", cancellationToken: ct));
+            "SELECT nextval('ctl.SubscriptionNumber')::int;", cancellationToken: ct));
 
         await control.ExecuteAsync(new CommandDefinition(
             """
@@ -161,18 +152,18 @@ public sealed class ControlDatabaseInitializer
                  DatabaseName, Status, Source, PocUserId, PocName, PocUsername, PocMobile, PocEmail,
                  SchemaVersion, MigratedAtUtc, RegisteredBy, ActivatedBy, ActivatedAtUtc)
             VALUES
-                (@TenantId, @Name, @NameAr, N'Retail', @City, N'Saudi Arabia', @CrNumber, @VatNumber, @Email, @Phone,
-                 @Database, N'active', N'adopted', @PocUserId, @PocName, @PocUsername, @PocMobile, @PocEmail,
-                 @Version, SYSUTCDATETIME(), N'migration', N'migration', SYSUTCDATETIME());
+                (@TenantId, @Name, @NameAr, 'Retail', @City, 'Saudi Arabia', @CrNumber, @VatNumber, @Email, @Phone,
+                 @Database, 'active', 'adopted', @PocUserId, @PocName, @PocUsername, @PocMobile, @PocEmail,
+                 @Version, now() AT TIME ZONE 'utc', 'migration', 'migration', now() AT TIME ZONE 'utc');
 
             /* An adopted business keeps working as it did: no limits and a
                long term, to be put on a real plan from the console. */
             INSERT INTO ctl.Subscription (SubscriptionId, TenantId, PlanKey, Cycle, StartsOn, RenewsOn)
-            VALUES (@SubscriptionId, @TenantId, N'Enterprise', N'annual',
-                    CAST(SYSUTCDATETIME() AS DATE), DATEADD(YEAR, 1, CAST(SYSUTCDATETIME() AS DATE)));
+            VALUES (@SubscriptionId, @TenantId, 'Enterprise', 'annual',
+                    (now() AT TIME ZONE 'utc')::date, ((now() AT TIME ZONE 'utc') + interval '1 year')::date);
 
             INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail)
-            VALUES (N'client_created', N'Client adopted', @TenantId, @Detail);
+            VALUES ('client_created', 'Client adopted', @TenantId, @Detail);
             """,
             new
             {
@@ -250,9 +241,9 @@ public sealed class TenantMigrationService : BackgroundService
         var files = SqlScriptRunner.Files(_provisioner.MigrationsFolder);
         if (files.Count == 0) return [];
 
-        await using var control = new SqlConnection(_connections.Control);
+        await using var control = new NpgsqlConnection(_connections.Control);
         var tenants = (await control.QueryAsync<(string TenantId, string DatabaseName)>(new CommandDefinition(
-            "SELECT TenantId, DatabaseName FROM ctl.Tenant WHERE Status IN (N'active', N'suspended') ORDER BY TenantId;",
+            "SELECT TenantId, DatabaseName FROM ctl.Tenant WHERE Status IN ('active', 'suspended') ORDER BY TenantId;",
             cancellationToken: ct))).ToList();
 
         var outcomes = new List<MigrationOutcome>();
@@ -261,14 +252,14 @@ public sealed class TenantMigrationService : BackgroundService
         {
             try
             {
-                var applied = await _runner.ApplyAsync(_connections.TenantServer, database, "POSMAIN", files, ct);
+                var applied = await _runner.ApplyAsync(_connections.TenantServer, database, files, ct);
 
                 if (applied.Count > 0)
                 {
                     _logger.LogInformation("Tenant {TenantId}: applied {Files}.", tenantId, string.Join(", ", applied));
 
                     await control.ExecuteAsync(new CommandDefinition(
-                        "UPDATE ctl.Tenant SET SchemaVersion = @Version, MigratedAtUtc = SYSUTCDATETIME() WHERE TenantId = @TenantId;",
+                        "UPDATE ctl.Tenant SET SchemaVersion = @Version, MigratedAtUtc = now() AT TIME ZONE 'utc' WHERE TenantId = @TenantId;",
                         new { Version = applied[^1], TenantId = tenantId }, cancellationToken: ct));
                 }
 
@@ -282,7 +273,7 @@ public sealed class TenantMigrationService : BackgroundService
                 await control.ExecuteAsync(new CommandDefinition(
                     """
                     INSERT INTO ctl.PlatformEvent (Kind, Label, TenantId, Detail, Severity)
-                    VALUES (N'migration_failed', N'Database update failed', @TenantId, @Detail, N'warning');
+                    VALUES ('migration_failed', 'Database update failed', @TenantId, @Detail, 'warning');
                     """,
                     new { TenantId = tenantId, Detail = ex.Message.Length > 400 ? ex.Message[..400] : ex.Message },
                     cancellationToken: ct));

@@ -1,6 +1,5 @@
-using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -123,7 +122,7 @@ public static class SalesEndpoints
             await using var check = db.Create();
 
             var approver = await check.QuerySingleOrDefaultAsync<(string? Hash, string? Salt)>(new CommandDefinition(
-                "SELECT PasswordHash, PasswordSalt FROM core.AppUser WHERE UserId = @UserId AND Status = N'active';",
+                "SELECT PasswordHash, PasswordSalt FROM core.AppUser WHERE UserId = @UserId AND Status = 'active';",
                 new { UserId = approverId }, cancellationToken: ct));
 
             if (string.IsNullOrEmpty(request.ApproverPassword) ||
@@ -138,69 +137,60 @@ public static class SalesEndpoints
             }
         }
 
-        var lines = new DataTable();
-        lines.Columns.Add("ItemId", typeof(string));
-        lines.Columns.Add("Quantity", typeof(decimal));
-        lines.Columns.Add("UnitPriceH", typeof(long));
-        lines.Columns.Add("LineDiscountH", typeof(long));
-        lines.Columns.Add("Note", typeof(string));
-
-        foreach (var line in request.Lines)
+        var lines = request.Lines.Select(line => new
         {
-            lines.Rows.Add(line.ItemId, line.Quantity, line.UnitPriceH,
-                           line.LineDiscountH, (object?)line.Note ?? DBNull.Value);
-        }
+            line.ItemId, line.Quantity, line.UnitPriceH, line.LineDiscountH, line.Note
+        });
 
-        var payments = new DataTable();
-        payments.Columns.Add("Method", typeof(string));
-        payments.Columns.Add("AmountH", typeof(long));
-        payments.Columns.Add("Reference", typeof(string));
-
-        foreach (var payment in request.Payments)
+        var payments = request.Payments.Select(payment => new
         {
-            payments.Rows.Add(payment.Method, payment.AmountH,
-                              (object?)payment.Reference ?? DBNull.Value);
-        }
-
-        var parameters = new DynamicParameters();
-        parameters.Add("@BranchId", request.BranchId);
-        parameters.Add("@CustomerId", request.CustomerId);
-        parameters.Add("@ServedByUserId", request.ServedByUserId);
-        parameters.Add("@CashierName", current.Username);
-        parameters.Add("@DiscountId", request.DiscountId);
-        parameters.Add("@DiscountH", request.DiscountH);
-        parameters.Add("@TenderedH", request.TenderedH);
-        parameters.Add("@IdempotencyKey", request.IdempotencyKey);
-        parameters.Add("@ApprovedByUserId", approverId);
-        parameters.Add("@OrderType", ProcErrors.Blank(request.OrderType)?.ToLowerInvariant());
-        parameters.Add("@CashierUserId", current.UserId);
-        parameters.Add("@OverrideReason", ProcErrors.Blank(request.OverrideReason));
-        parameters.Add("@Lines", lines.AsTableValuedParameter("sales.SaleLineTable"));
-        parameters.Add("@Payments", payments.AsTableValuedParameter("sales.SalePaymentTable"));
-        parameters.Add("@SaleId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-        parameters.Add("@InvoiceNumber", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
+            payment.Method, payment.AmountH, payment.Reference
+        });
 
         await using var connection = db.Create();
 
+        string saleId, invoiceNumber;
+
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "sales.usp_CommitSale",
-                parameters,
-                commandType: CommandType.StoredProcedure,
+            (saleId, invoiceNumber) = await connection.QuerySingleAsync<(string, string)>(new CommandDefinition(
+                """
+                SELECT SaleId, InvoiceNumber FROM sales.usp_CommitSale(
+                    p_BranchId => @BranchId, p_CustomerId => @CustomerId,
+                    p_ServedByUserId => @ServedByUserId, p_CashierName => @CashierName,
+                    p_DiscountId => @DiscountId, p_DiscountH => @DiscountH, p_TenderedH => @TenderedH,
+                    p_IdempotencyKey => @IdempotencyKey, p_ApprovedByUserId => @ApprovedByUserId,
+                    p_OrderType => @OrderType, p_CashierUserId => @CashierUserId,
+                    p_OverrideReason => @OverrideReason,
+                    p_Lines => @Lines::jsonb, p_Payments => @Payments::jsonb);
+                """,
+                new
+                {
+                    request.BranchId,
+                    request.CustomerId,
+                    request.ServedByUserId,
+                    CashierName = current.Username,
+                    request.DiscountId,
+                    request.DiscountH,
+                    request.TenderedH,
+                    request.IdempotencyKey,
+                    ApprovedByUserId = approverId,
+                    OrderType = ProcErrors.Blank(request.OrderType)?.ToLowerInvariant(),
+                    CashierUserId = current.UserId,
+                    OverrideReason = ProcErrors.Blank(request.OverrideReason),
+                    Lines = DbList.Json(lines),
+                    Payments = DbList.Json(payments)
+                },
                 cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number is (>= 52000 and < 53000) or 63050 or 63051)
+        catch (PostgresException ex) when (ex.ErrorNumber() is (>= 52000 and < 53000) or 63050 or 63051)
         {
-            // The procedure's own rules. These are business outcomes, not
+            // The function's own rules. These are business outcomes, not
             // faults, so they come back as 422 with the reason intact.
             return Results.Json(
-                Translate(ex.Number, ex.Message),
+                Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
-
-        var saleId = parameters.Get<string>("@SaleId");
-        var invoiceNumber = parameters.Get<string>("@InvoiceNumber");
 
         logger.LogInformation("Sale {Invoice} committed at {Branch}.", invoiceNumber, request.BranchId);
 
@@ -242,12 +232,12 @@ public static class SalesEndpoints
 
         await using var connection = db.Create();
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
-            """
-            DECLARE @Now DATETIME2(0) = SYSUTCDATETIME();
-            DECLARE @Start DATETIME2(0) = DATEADD(DAY, -@Days, @Now);
-            DECLARE @PrevStart DATETIME2(0) = DATEADD(DAY, -(@Days * 2), @Now);
+        /* The window ends now (whole seconds, as DATETIME2(0) kept it). */
+        var now = DateTime.UtcNow;
+        now = now.AddTicks(-(now.Ticks % TimeSpan.TicksPerSecond));
 
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(
+            """
             /* Voided sales are excluded everywhere here: they are reversed in
                the ledger, and counting them would overstate every figure. */
 
@@ -259,34 +249,34 @@ public static class SalesEndpoints
             ),
             Sold AS (
                 SELECT p.Prev,
-                       COUNT(s.SaleId)                                AS Transactions,
-                       ISNULL(SUM(s.TotalH), 0)                       AS GrossSalesH,
-                       ISNULL(SUM(s.TotalH - s.TaxH), 0)              AS NetSalesH,
-                       ISNULL(SUM(c.CostH), 0)                        AS CostH
+                       COUNT(s.SaleId)::int                           AS Transactions,
+                       COALESCE(SUM(s.TotalH), 0)::bigint             AS GrossSalesH,
+                       COALESCE(SUM(s.TotalH - s.TaxH), 0)::bigint    AS NetSalesH,
+                       COALESCE(SUM(c.CostH), 0)::bigint              AS CostH
                 FROM Periods AS p
                 LEFT JOIN sales.Sale AS s
-                       ON s.Status <> N'voided'
+                       ON s.Status <> 'voided'
                       AND s.SoldAtUtc >= p.FromUtc AND s.SoldAtUtc < p.ToUtc
                       AND (@BranchId IS NULL OR s.BranchId = @BranchId)
-                OUTER APPLY (
-                    SELECT SUM(CAST(ROUND(l.UnitCostH * l.Quantity, 0) AS BIGINT)) AS CostH
+                LEFT JOIN LATERAL (
+                    SELECT SUM(round(l.UnitCostH * l.Quantity, 0)::bigint) AS CostH
                     FROM sales.SaleLine AS l WHERE l.SaleId = s.SaleId
-                ) AS c
+                ) AS c ON true
                 GROUP BY p.Prev
             ),
             Returned AS (
                 SELECT p.Prev,
-                       ISNULL(SUM(r.RefundH), 0)    AS ReturnsH,
-                       ISNULL(SUM(r.SubtotalH), 0)  AS NetReturnsH,
-                       ISNULL(SUM(c.CostH), 0)      AS CostH
+                       COALESCE(SUM(r.RefundH), 0)::bigint    AS ReturnsH,
+                       COALESCE(SUM(r.SubtotalH), 0)::bigint  AS NetReturnsH,
+                       COALESCE(SUM(c.CostH), 0)::bigint      AS CostH
                 FROM Periods AS p
                 LEFT JOIN sales.SaleReturn AS r
                        ON r.ReturnedAtUtc >= p.FromUtc AND r.ReturnedAtUtc < p.ToUtc
                       AND (@BranchId IS NULL OR r.BranchId = @BranchId)
-                OUTER APPLY (
-                    SELECT SUM(CAST(ROUND(rl.UnitCostH * rl.Quantity, 0) AS BIGINT)) AS CostH
+                LEFT JOIN LATERAL (
+                    SELECT SUM(round(rl.UnitCostH * rl.Quantity, 0)::bigint) AS CostH
                     FROM sales.SaleReturnLine AS rl WHERE rl.ReturnId = r.ReturnId
-                ) AS c
+                ) AS c ON true
                 GROUP BY p.Prev
             )
             SELECT
@@ -305,36 +295,36 @@ public static class SalesEndpoints
             ORDER BY s.Prev;
 
             -- 3. Daily totals, net of the refunds issued that day.
-            SELECT [Date], SUM(AmountH) AS SalesH
+            SELECT Date, SUM(AmountH)::bigint AS SalesH
             FROM (
-                SELECT CAST(s.SoldAtUtc AS DATE) AS [Date], s.TotalH AS AmountH
+                SELECT s.SoldAtUtc::date AS Date, s.TotalH AS AmountH
                 FROM sales.Sale AS s
-                WHERE s.Status <> N'voided'
+                WHERE s.Status <> 'voided'
                   AND s.SoldAtUtc >= @Start
                   AND (@BranchId IS NULL OR s.BranchId = @BranchId)
                 UNION ALL
-                SELECT CAST(r.ReturnedAtUtc AS DATE), -r.RefundH
+                SELECT r.ReturnedAtUtc::date, -r.RefundH
                 FROM sales.SaleReturn AS r
                 WHERE r.ReturnedAtUtc >= @Start
                   AND (@BranchId IS NULL OR r.BranchId = @BranchId)
             ) AS d
-            GROUP BY [Date]
-            ORDER BY [Date];
+            GROUP BY Date
+            ORDER BY Date;
 
             -- 4. By payment method. Cash is stored as handed over (one row per
             --    sale), so the change given back is taken off to show takings,
             --    and refunds come off the method they were paid back by.
-            SELECT Method, SUM(AmountH) AS AmountH
+            SELECT Method, SUM(AmountH)::bigint AS AmountH
             FROM (
                 SELECT p.Method,
-                       p.AmountH - CASE WHEN p.Method = N'cash' THEN s.ChangeH ELSE 0 END AS AmountH
+                       p.AmountH - CASE WHEN p.Method = 'cash' THEN s.ChangeH ELSE 0 END AS AmountH
                 FROM sales.SalePayment AS p
                 JOIN sales.Sale AS s ON s.SaleId = p.SaleId
-                WHERE s.Status <> N'voided'
+                WHERE s.Status <> 'voided'
                   AND s.SoldAtUtc >= @Start
                   AND (@BranchId IS NULL OR s.BranchId = @BranchId)
                 UNION ALL
-                SELECT ISNULL(r.RefundMethod, N'cash'), -r.RefundH
+                SELECT COALESCE(r.RefundMethod, 'cash'), -r.RefundH
                 FROM sales.SaleReturn AS r
                 WHERE r.ReturnedAtUtc >= @Start
                   AND (@BranchId IS NULL OR r.BranchId = @BranchId)
@@ -343,27 +333,34 @@ public static class SalesEndpoints
 
             -- 5. Best sellers, by what was sold and kept: returned quantities
             --    (and their share of the line discount) are taken off.
-            SELECT TOP (5)
+            SELECT
                 l.ItemId, l.NameAr, l.NameEn,
                 SUM(l.Quantity - l.ReturnedQty)          AS Quantity,
-                SUM(CAST(ROUND((l.UnitPriceH * l.Quantity - l.LineDiscountH)
-                               * (l.Quantity - l.ReturnedQty) / NULLIF(l.Quantity, 0), 0) AS BIGINT)) AS RevenueH
+                SUM(round((l.UnitPriceH * l.Quantity - l.LineDiscountH)
+                          * (l.Quantity - l.ReturnedQty) / NULLIF(l.Quantity, 0), 0)::bigint)::bigint AS RevenueH
             FROM sales.SaleLine AS l
             JOIN sales.Sale AS s ON s.SaleId = l.SaleId
-            WHERE s.Status <> N'voided'
+            WHERE s.Status <> 'voided'
               AND s.SoldAtUtc >= @Start
               AND (@BranchId IS NULL OR s.BranchId = @BranchId)
               AND l.Quantity - l.ReturnedQty > 0
             GROUP BY l.ItemId, l.NameAr, l.NameEn
-            ORDER BY RevenueH DESC;
+            ORDER BY RevenueH DESC
+            LIMIT 5;
             """,
-            new { Days = window, BranchId = branchId },
+            new
+            {
+                Now = now,
+                Start = now.AddDays(-window),
+                PrevStart = now.AddDays(-(window * 2)),
+                BranchId = branchId
+            },
             cancellationToken: ct));
 
         var periods = (await multi.ReadAsync<AnalyticsPeriod>()).ToList();
-        var daily = (await multi.ReadAsync()).ToList();
-        var byMethod = (await multi.ReadAsync()).ToList();
-        var topItems = (await multi.ReadAsync()).ToList();
+        var daily = (await multi.ReadRowsAsync()).ToList();
+        var byMethod = (await multi.ReadRowsAsync()).ToList();
+        var topItems = (await multi.ReadRowsAsync()).ToList();
 
         object Shape(AnalyticsPeriod p) => new
         {
@@ -455,13 +452,13 @@ public static class SalesEndpoints
 
         const string filter = """
             WHERE (@BranchId IS NULL OR s.BranchId = @BranchId OR s.BranchId IS NULL)
-              AND (@Search IS NULL OR s.InvoiceNumber LIKE N'%' + @Search + N'%')
-              AND (@From IS NULL OR CAST(s.SoldAtUtc AS DATE) >= @From)
-              AND (@To   IS NULL OR CAST(s.SoldAtUtc AS DATE) <= @To)
+              AND (@Search IS NULL OR s.InvoiceNumber COLLATE "default" ILIKE '%' || @Search || '%')
+              AND (@From IS NULL OR s.SoldAtUtc::date >= @From)
+              AND (@To   IS NULL OR s.SoldAtUtc::date <= @To)
               AND (@Status IS NULL OR s.Status = @Status)
               AND (@Method IS NULL
-                   OR (@Method = N'mixed' AND s.PaymentMethod = N'mixed')
-                   OR (@Method <> N'mixed' AND EXISTS (
+                   OR (@Method = 'mixed' AND s.PaymentMethod = 'mixed')
+                   OR (@Method <> 'mixed' AND EXISTS (
                            SELECT 1 FROM sales.SalePayment AS p
                            WHERE p.SaleId = s.SaleId AND p.Method = @Method AND p.AmountH > 0)))
             """;
@@ -470,15 +467,15 @@ public static class SalesEndpoints
             /* Net of returns: what these sales took less what their credit
                notes refunded (SaleReturn.RefundH, VAT inclusive — the figure
                the finance summary's returnsH sums), so the KPI agrees with it. */
-            SELECT COUNT(*) AS TotalCount,
-                   ISNULL(SUM(CASE WHEN s.Status <> N'voided' THEN s.TotalH END), 0)
-                     - ISNULL(SUM(CASE WHEN s.Status <> N'voided' THEN rf.RefundH END), 0) AS NetH,
-                   SUM(CASE WHEN s.Status <> N'voided' THEN 1 ELSE 0 END) AS Invoices,
-                   SUM(CASE WHEN s.Status IN (N'returned', N'partially_returned') THEN 1 ELSE 0 END) AS Returned,
-                   ISNULL(SUM(CASE WHEN s.Status <> N'voided' THEN rf.RefundH END), 0) AS ReturnsH
+            SELECT COUNT(*)::int AS TotalCount,
+                   (COALESCE(SUM(CASE WHEN s.Status <> 'voided' THEN s.TotalH END), 0)
+                     - COALESCE(SUM(CASE WHEN s.Status <> 'voided' THEN rf.RefundH END), 0))::bigint AS NetH,
+                   SUM(CASE WHEN s.Status <> 'voided' THEN 1 ELSE 0 END)::int AS Invoices,
+                   SUM(CASE WHEN s.Status IN ('returned', 'partially_returned') THEN 1 ELSE 0 END)::int AS Returned,
+                   COALESCE(SUM(CASE WHEN s.Status <> 'voided' THEN rf.RefundH END), 0)::bigint AS ReturnsH
             FROM sales.vw_SaleSummary AS s
-            OUTER APPLY (SELECT SUM(r.RefundH) AS RefundH
-                         FROM sales.SaleReturn AS r WHERE r.SaleId = s.SaleId) AS rf
+            LEFT JOIN LATERAL (SELECT SUM(r.RefundH) AS RefundH
+                               FROM sales.SaleReturn AS r WHERE r.SaleId = s.SaleId) AS rf ON true
             {filter};
 
             SELECT *
@@ -488,7 +485,7 @@ public static class SalesEndpoints
             OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY;
             """;
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(sql,
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(sql,
             new
             {
                 BranchId = branchId,
@@ -503,7 +500,7 @@ public static class SalesEndpoints
             cancellationToken: ct));
 
         var totals = await multi.ReadSingleAsync<(int TotalCount, long NetH, int? Invoices, int? Returned, long ReturnsH)>();
-        var rows = (await multi.ReadAsync()).ToList();
+        var rows = (await multi.ReadRowsAsync()).ToList();
 
         var result = new PagedResult<object>
         {
@@ -537,7 +534,7 @@ public static class SalesEndpoints
     {
         await using var connection = db.Create();
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(
             """
             SELECT * FROM sales.vw_SaleSummary WHERE SaleId = @SaleId;
             SELECT * FROM sales.SaleLine    WHERE SaleId = @SaleId ORDER BY SaleLineId;
@@ -546,11 +543,11 @@ public static class SalesEndpoints
             new { SaleId = saleId },
             cancellationToken: ct));
 
-        var sale = await multi.ReadSingleOrDefaultAsync();
+        var sale = await multi.ReadSingleRowOrDefaultAsync();
         if (sale is null) return Results.NotFound();
 
-        var lines = (await multi.ReadAsync()).ToList();
-        var payments = (await multi.ReadAsync()).ToList();
+        var lines = (await multi.ReadRowsAsync()).ToList();
+        var payments = (await multi.ReadRowsAsync()).ToList();
 
         return Results.Ok(new { sale, lines, payments });
     }
@@ -567,20 +564,19 @@ public static class SalesEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "sales.usp_VoidSale",
+                "SELECT sales.usp_VoidSale(p_SaleId => @SaleId, p_Reason => @Reason, p_Actor => @Actor);",
                 new { SaleId = saleId, request.Reason, Actor = current.Username },
-                commandType: CommandType.StoredProcedure,
                 cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number == 67012)
+        catch (PostgresException ex) when (ex.ErrorNumber() == 67012)
         {
             return ProcErrors.Conflict("sale_has_returns",
                 "This sale has returns against it and cannot be voided. Return the remaining items instead.",
                 "على هذه الفاتورة مرتجعات ولا يمكن إلغاؤها. أرجع الأصناف المتبقية بدلًا من ذلك.");
         }
-        catch (SqlException ex) when (ex.Number >= 52000 && ex.Number < 53000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 52000 && ex.ErrorNumber() < 53000)
         {
-            return Results.Json(Translate(ex.Number, ex.Message),
+            return Results.Json(Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 

@@ -111,15 +111,14 @@ public sealed class ClientReader
                    n.Reachable, n.CollectedAtUtc, n.Error AS CollectError, n.Branches, n.Devices, n.DevicesOnline,
                    n.Users, n.Transactions, n.SalesH, n.ApiRequestsToday, n.ApiErrorsToday,
                    n.FirstLoginAtUtc, n.LastLoginAtUtc, n.LastTransactionAtUtc, n.DbSizeMb,
-                   (SELECT ISNULL(SUM(i.AmountH), 0) FROM ctl.Invoice AS i
-                     WHERE i.TenantId = t.TenantId AND i.Status IN (N'pending', N'failed')) AS BalanceH,
-                   CAST(CASE WHEN EXISTS (SELECT 1 FROM ctl.Invoice AS i WHERE i.TenantId = t.TenantId
-                         AND (i.Status = N'failed' OR (i.Status = N'pending' AND i.IssuedOn < DATEADD(DAY, -14, CAST(SYSUTCDATETIME() AS DATE)))))
-                        THEN 1 ELSE 0 END AS BIT) AS PaymentOverdue,
-                   (SELECT COUNT(*) FROM ctl.Issue AS x WHERE x.TenantId = t.TenantId AND x.Status <> N'resolved') AS OpenIssues
+                   (SELECT COALESCE(SUM(i.AmountH), 0)::bigint FROM ctl.Invoice AS i
+                     WHERE i.TenantId = t.TenantId AND i.Status IN ('pending', 'failed')) AS BalanceH,
+                   EXISTS (SELECT 1 FROM ctl.Invoice AS i WHERE i.TenantId = t.TenantId
+                         AND (i.Status = 'failed' OR (i.Status = 'pending' AND i.IssuedOn < (now() AT TIME ZONE 'utc')::date - 14))) AS PaymentOverdue,
+                   (SELECT COUNT(*)::int FROM ctl.Issue AS x WHERE x.TenantId = t.TenantId AND x.Status <> 'resolved') AS OpenIssues
             FROM ctl.Tenant AS t
             LEFT JOIN ctl.Subscription AS s ON s.TenantId = t.TenantId
-            LEFT JOIN ctl.[Plan] AS p ON p.PlanKey = s.PlanKey
+            LEFT JOIN ctl.Plan AS p ON p.PlanKey = s.PlanKey
             LEFT JOIN ctl.TenantSnapshot AS n ON n.TenantId = t.TenantId
             WHERE @TenantId IS NULL OR t.TenantId = @TenantId
             ORDER BY t.CreatedAtUtc DESC;

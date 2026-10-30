@@ -1,8 +1,7 @@
-using System.Data;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -147,8 +146,10 @@ public static partial class CompanyEndpoints
             .RequireAuthorization()
             .RequireRateLimiting("standard");
 
-        company.MapGet("", GetCompanyAsync)
-               .RequireAuthorization(PermissionPolicy.For("company.view"));
+        /* Any signed-in user: every receipt prints the company's name, VAT and
+           CR numbers and address, and a cashier does not hold company.view.
+           Changing it still needs company.edit. */
+        company.MapGet("", GetCompanyAsync);
 
         company.MapPut("", SaveCompanyAsync)
                .RequireAuthorization(PermissionPolicy.For("company.edit"));
@@ -213,7 +214,7 @@ public static partial class CompanyEndpoints
         await using var connection = db.Create();
 
         var stored = await connection.QuerySingleOrDefaultAsync<(string? DescriptionAr, string? DescriptionEn)>(
-            new CommandDefinition("SELECT TOP (1) DescriptionAr, DescriptionEn FROM core.Company;",
+            new CommandDefinition("SELECT DescriptionAr, DescriptionEn FROM core.Company LIMIT 1;",
                                   cancellationToken: ct));
 
         /* Only the known platforms, and only those filled in. */
@@ -247,12 +248,21 @@ public static partial class CompanyEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_SaveCompany", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                """
+                SELECT core.usp_SaveCompany(
+                    p_NameAr => @NameAr, p_NameEn => @NameEn,
+                    p_DescriptionAr => @DescriptionAr, p_DescriptionEn => @DescriptionEn,
+                    p_LogoUrl => @LogoUrl, p_CrNumber => @CrNumber, p_VatNumber => @VatNumber,
+                    p_Phone => @Phone, p_Email => @Email, p_Website => @Website,
+                    p_Street => @Street, p_District => @District, p_City => @City,
+                    p_PostalCode => @PostalCode, p_Country => @Country,
+                    p_SocialLinks => @SocialLinks);
+                """,
+                parameters, cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number is >= 62000 and < 62020)
+        catch (PostgresException ex) when (ex.ErrorNumber() is >= 62000 and < 62020)
         {
-            return ex.Number switch
+            return ex.ErrorNumber() switch
             {
                 62003 => ProcErrors.NotFound("No company record exists.", "لا يوجد سجل للشركة."),
                 62000 => ProcErrors.Field(string.IsNullOrWhiteSpace(request.NameAr) ? "nameAr" : "nameEn",
@@ -272,14 +282,15 @@ public static partial class CompanyEndpoints
     }
 
     private static async Task<CompanyDto?> LoadCompanyAsync(
-        SqlConnection connection, ILanguageContext language, CancellationToken ct)
+        NpgsqlConnection connection, ILanguageContext language, CancellationToken ct)
     {
         var r = await connection.QuerySingleOrDefaultAsync<CompanyRow>(new CommandDefinition(
             """
-            SELECT TOP (1) NameAr, NameEn, DescriptionAr, DescriptionEn, LogoUrl, CrNumber,
+            SELECT NameAr, NameEn, DescriptionAr, DescriptionEn, LogoUrl, CrNumber,
                    VatNumber, Phone, Email, Website, Street, District, City, PostalCode,
                    Country, SocialLinks, CreatedAtUtc, UpdatedAtUtc
-            FROM core.Company ORDER BY CompanyId;
+            FROM core.Company ORDER BY CompanyId
+            LIMIT 1;
             """,
             cancellationToken: ct));
 
@@ -406,22 +417,37 @@ public static partial class CompanyEndpoints
         parameters.Add("@FooterAr", ProcErrors.Blank(r.FooterAr));
         parameters.Add("@FooterEn", ProcErrors.Blank(r.FooterEn));
         parameters.Add("@IsActive", r.Status == "active");
-        parameters.Add("@SavedId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
 
         await using var connection = db.Create();
 
+        string savedId;
+
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_SaveBillTemplate", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            savedId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT SavedId FROM core.usp_SaveBillTemplate(
+                    p_BillId => @BillId, p_Name => @Name, p_Audience => @Audience,
+                    p_PrintGroupId => @PrintGroupId, p_IsDefault => @IsDefault,
+                    p_PaperSize => @PaperSize, p_BillLanguage => @BillLanguage,
+                    p_HeaderAlignment => @HeaderAlignment, p_LogoSize => @LogoSize,
+                    p_ShowLogo => @ShowLogo, p_ShowCompanyName => @ShowCompanyName,
+                    p_ShowDescription => @ShowDescription, p_ShowVatNumber => @ShowVatNumber,
+                    p_ShowCrNumber => @ShowCrNumber, p_ShowAddress => @ShowAddress,
+                    p_ShowItemName => @ShowItemName, p_ShowSku => @ShowSku, p_ShowBarcode => @ShowBarcode,
+                    p_ShowUnitPrice => @ShowUnitPrice, p_ShowQuantity => @ShowQuantity,
+                    p_ShowLineTotal => @ShowLineTotal, p_ShowLineDiscount => @ShowLineDiscount,
+                    p_ShowSubtotal => @ShowSubtotal, p_ShowDiscount => @ShowDiscount,
+                    p_ShowVat => @ShowVat, p_ShowGrandTotal => @ShowGrandTotal,
+                    p_ShowZatcaQr => @ShowZatcaQr, p_FooterAr => @FooterAr, p_FooterEn => @FooterEn,
+                    p_IsActive => @IsActive);
+                """,
+                parameters, cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapTemplateError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapTemplateError(ex) is { } mapped)
         {
             return mapped;
         }
-
-        var savedId = parameters.Get<string>("@SavedId");
 
         logger.LogInformation("Bill template {BillId} {Action} by {Actor}.",
             savedId, billId is null ? "created" : "updated", current.Username);
@@ -448,10 +474,10 @@ public static partial class CompanyEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "core.usp_DeleteBillTemplate", new { BillId = billId },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                "SELECT core.usp_DeleteBillTemplate(p_BillId => @BillId);", new { BillId = billId },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapTemplateError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapTemplateError(ex) is { } mapped)
         {
             return mapped;
         }
@@ -465,7 +491,7 @@ public static partial class CompanyEndpoints
     private static IResult TemplateNotFound() =>
         ProcErrors.NotFound("No such template.", "لا يوجد قالب بهذا المعرف.");
 
-    private static IResult? MapTemplateError(SqlException ex) => ex.Number switch
+    private static IResult? MapTemplateError(PostgresException ex) => ex.ErrorNumber() switch
     {
         62026 => TemplateNotFound(),
         62029 => ProcErrors.Conflict("default_template",
@@ -493,7 +519,7 @@ public static partial class CompanyEndpoints
     };
 
     private static async Task<List<BillTemplateDto>> LoadTemplatesAsync(
-        SqlConnection connection, string? billId, CancellationToken ct)
+        NpgsqlConnection connection, string? billId, CancellationToken ct)
     {
         var rows = await connection.QueryAsync<BillTemplateRow>(new CommandDefinition(
             """
@@ -505,7 +531,7 @@ public static partial class CompanyEndpoints
                    IsActive, CreatedAtUtc, UpdatedAtUtc
             FROM core.BillTemplate
             WHERE @BillId IS NULL OR BillId = @BillId
-            ORDER BY CASE Audience WHEN N'customer' THEN 0 ELSE 1 END, Name;
+            ORDER BY CASE Audience WHEN 'customer' THEN 0 ELSE 1 END, Name;
             """,
             new { BillId = billId }, cancellationToken: ct));
 

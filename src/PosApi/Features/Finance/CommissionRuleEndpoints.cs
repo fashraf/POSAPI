@@ -1,6 +1,5 @@
-using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -97,29 +96,33 @@ public static class CommissionRuleEndpoints
         if (request.Status is not (null or "active" or "inactive"))
             return ProcErrors.Field("status", "Status must be active or inactive.", "الحالة إما نشط أو غير نشط.");
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@RuleId", ruleId);
-        parameters.Add("@Basis", request.Basis);
-        parameters.Add("@Value", request.Value);
-        parameters.Add("@UserIds", ProcErrors.Csv(request.UserIds));
-        parameters.Add("@ItemIds", ProcErrors.Csv(request.ItemIds));
-        parameters.Add("@IsActive", request.Status != "inactive");
-        parameters.Add("@SavedId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string savedId;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_SaveCommissionRule", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            savedId = await connection.QuerySingleAsync<string>(new CommandDefinition(
+                """
+                SELECT SavedId FROM fin.usp_SaveCommissionRule(
+                    p_RuleId => @RuleId, p_Basis => @Basis, p_Value => @Value,
+                    p_UserIds => @UserIds, p_ItemIds => @ItemIds, p_IsActive => @IsActive);
+                """,
+                new
+                {
+                    RuleId = ruleId,
+                    request.Basis,
+                    request.Value,
+                    UserIds = ProcErrors.Csv(request.UserIds),
+                    ItemIds = ProcErrors.Csv(request.ItemIds),
+                    IsActive = request.Status != "inactive"
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapError(ex) is { } mapped)
         {
             return mapped;
         }
-
-        var savedId = parameters.Get<string>("@SavedId");
 
         logger.LogInformation("Commission rule {RuleId} {Action} by {Actor}.",
             savedId, ruleId is null ? "created" : "updated", current.Username);
@@ -146,10 +149,10 @@ public static class CommissionRuleEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "fin.usp_DeleteCommissionRule", new { RuleId = ruleId },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                "SELECT fin.usp_DeleteCommissionRule(p_RuleId => @RuleId);", new { RuleId = ruleId },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapError(ex) is { } mapped)
         {
             return mapped;
         }
@@ -163,7 +166,7 @@ public static class CommissionRuleEndpoints
     private static IResult NotFound() =>
         ProcErrors.NotFound("No such commission rule.", "لا توجد قاعدة عمولة بهذا المعرف.");
 
-    private static IResult? MapError(SqlException ex) => ex.Number switch
+    private static IResult? MapError(PostgresException ex) => ex.ErrorNumber() switch
     {
         64005 => NotFound(),
         64000 => ProcErrors.Field("basis", "Commission is a percentage or a fixed amount.", "العمولة إما نسبة أو مبلغ ثابت."),
@@ -177,7 +180,7 @@ public static class CommissionRuleEndpoints
     };
 
     private static async Task<List<CommissionRuleDto>> LoadAsync(
-        SqlConnection connection, string? ruleId, CancellationToken ct)
+        NpgsqlConnection connection, string? ruleId, CancellationToken ct)
     {
         await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
             """

@@ -1,6 +1,5 @@
-using System.Data;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -63,33 +62,33 @@ public static class InventoryEndpoints
         await using var connection = db.Create();
 
         const string sql = """
-            SELECT COUNT(*)
+            SELECT COUNT(*)::int
             FROM core.CatalogItem AS i
             LEFT JOIN inv.StockLevel AS s ON s.ItemId = i.ItemId AND s.BranchId = @BranchId
-            WHERE i.TracksStock = 1 AND i.IsActive = 1
-              AND (@Search IS NULL OR i.NameAr LIKE N'%' + @Search + N'%'
-                                   OR i.NameEn LIKE N'%' + @Search + N'%')
-              AND (@LowOnly = 0 OR ISNULL(s.Quantity, 0) <= i.ReorderLevel);
+            WHERE i.TracksStock AND i.IsActive
+              AND (@Search IS NULL OR i.NameAr COLLATE "default" ILIKE '%' || @Search || '%'
+                                   OR i.NameEn COLLATE "default" ILIKE '%' || @Search || '%')
+              AND (NOT @LowOnly OR COALESCE(s.Quantity, 0) <= i.ReorderLevel);
 
             SELECT
                 i.ItemId, i.NameAr, i.NameEn, i.Sku, i.CategoryId,
                 i.CostH, i.PriceH, i.ReorderLevel,
-                ISNULL(s.Quantity, 0) AS Quantity,
-                CAST(ISNULL(s.Quantity, 0) * i.CostH AS BIGINT) AS StockValueH,
-                CASE WHEN ISNULL(s.Quantity, 0) <= 0 THEN N'out'
-                     WHEN ISNULL(s.Quantity, 0) <= i.ReorderLevel THEN N'low'
-                     ELSE N'ok' END AS StockStatus
+                COALESCE(s.Quantity, 0) AS Quantity,
+                trunc(COALESCE(s.Quantity, 0) * i.CostH)::bigint AS StockValueH,
+                CASE WHEN COALESCE(s.Quantity, 0) <= 0 THEN 'out'
+                     WHEN COALESCE(s.Quantity, 0) <= i.ReorderLevel THEN 'low'
+                     ELSE 'ok' END AS StockStatus
             FROM core.CatalogItem AS i
             LEFT JOIN inv.StockLevel AS s ON s.ItemId = i.ItemId AND s.BranchId = @BranchId
-            WHERE i.TracksStock = 1 AND i.IsActive = 1
-              AND (@Search IS NULL OR i.NameAr LIKE N'%' + @Search + N'%'
-                                   OR i.NameEn LIKE N'%' + @Search + N'%')
-              AND (@LowOnly = 0 OR ISNULL(s.Quantity, 0) <= i.ReorderLevel)
+            WHERE i.TracksStock AND i.IsActive
+              AND (@Search IS NULL OR i.NameAr COLLATE "default" ILIKE '%' || @Search || '%'
+                                   OR i.NameEn COLLATE "default" ILIKE '%' || @Search || '%')
+              AND (NOT @LowOnly OR COALESCE(s.Quantity, 0) <= i.ReorderLevel)
             ORDER BY i.NameEn
             OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY;
             """;
 
-        await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(sql,
+        await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(sql,
             new
             {
                 BranchId = branchId,
@@ -101,7 +100,7 @@ public static class InventoryEndpoints
             cancellationToken: ct));
 
         var total = await multi.ReadSingleAsync<int>();
-        var rows = (await multi.ReadAsync()).ToList();
+        var rows = (await multi.ReadRowsAsync()).ToList();
 
         return Results.Ok(new PagedResult<object>
         {
@@ -118,15 +117,16 @@ public static class InventoryEndpoints
     {
         await using var connection = db.Create();
 
-        var rows = await connection.QueryAsync(new CommandDefinition(
+        var rows = await connection.QueryRowsAsync(new CommandDefinition(
             """
-            SELECT TOP (@Take)
+            SELECT
                 MovementId, ItemId, BranchId, MovementType, Quantity, BalanceAfter,
                 UnitCostH, Reference, ReasonAr, ReasonEn, OccurredAtUtc, Actor
             FROM inv.StockMovement
             WHERE ItemId = @ItemId
               AND (@BranchId IS NULL OR BranchId = @BranchId OR BranchId IS NULL)
-            ORDER BY OccurredAtUtc DESC;
+            ORDER BY OccurredAtUtc DESC
+            LIMIT @Take;
             """,
             new { ItemId = itemId, BranchId = branchId, Take = take <= 0 ? 100 : Math.Min(take, 500) },
             cancellationToken: ct));
@@ -142,46 +142,43 @@ public static class InventoryEndpoints
     {
         if (!current.CanSeeBranch(request.BranchId)) return Results.Forbid();
 
-        var lines = new DataTable();
-        lines.Columns.Add("ItemId", typeof(string));
-        lines.Columns.Add("Quantity", typeof(decimal));
-        lines.Columns.Add("UnitCostH", typeof(long));
-
-        foreach (var line in request.Lines)
-        {
-            lines.Rows.Add(line.ItemId, line.Quantity, line.UnitCostH);
-        }
-
-        var parameters = new DynamicParameters();
-        parameters.Add("@VendorId", request.VendorId);
-        parameters.Add("@BranchId", request.BranchId);
-        parameters.Add("@InvoiceNumber", request.InvoiceNumber);
-        parameters.Add("@VatRate", request.VatRate <= 0 ? 15.00m : request.VatRate);
-        parameters.Add("@PaidOnReceipt", request.PaidOnReceipt);
-        parameters.Add("@ReceivedBy", current.Username);
-        parameters.Add("@Note", ProcErrors.Blank(request.Note));
-        parameters.Add("@Lines", lines.AsTableValuedParameter("inv.PurchaseLineTable"));
-        parameters.Add("@PurchaseId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-        parameters.Add("@Reference", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-
         await using var connection = db.Create();
+
+        string purchaseId, reference;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "inv.usp_ReceivePurchase", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            (purchaseId, reference) = await connection.QuerySingleAsync<(string, string)>(new CommandDefinition(
+                """
+                SELECT PurchaseId, Reference FROM inv.usp_ReceivePurchase(
+                    p_VendorId => @VendorId, p_BranchId => @BranchId,
+                    p_InvoiceNumber => @InvoiceNumber, p_VatRate => @VatRate,
+                    p_PaidOnReceipt => @PaidOnReceipt, p_ReceivedBy => @ReceivedBy,
+                    p_Note => @Note, p_Lines => @Lines::jsonb);
+                """,
+                new
+                {
+                    request.VendorId,
+                    request.BranchId,
+                    request.InvoiceNumber,
+                    VatRate = request.VatRate <= 0 ? 15.00m : request.VatRate,
+                    request.PaidOnReceipt,
+                    ReceivedBy = current.Username,
+                    Note = ProcErrors.Blank(request.Note),
+                    Lines = DbList.Json(request.Lines.Select(l => new { l.ItemId, l.Quantity, l.UnitCostH }))
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 54000 && ex.Number < 55000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 54000 && ex.ErrorNumber() < 55000)
         {
-            return Results.Json(Translate(ex.Number, ex.Message),
+            return Results.Json(Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 
         return Results.Ok(new
         {
-            purchaseId = parameters.Get<string>("@PurchaseId"),
-            reference = parameters.Get<string>("@Reference")
+            purchaseId,
+            reference
         });
     }
 
@@ -199,7 +196,11 @@ public static class InventoryEndpoints
         try
         {
             await connection.ExecuteAsync(new CommandDefinition(
-                "inv.usp_AdjustStock",
+                """
+                SELECT inv.usp_AdjustStock(
+                    p_ItemId => @ItemId, p_BranchId => @BranchId, p_NewQuantity => @NewQuantity,
+                    p_ReasonEn => @ReasonEn, p_ReasonAr => @ReasonAr, p_Actor => @Actor);
+                """,
                 new
                 {
                     ItemId = itemId,
@@ -209,11 +210,11 @@ public static class InventoryEndpoints
                     request.ReasonAr,
                     Actor = current.Username
                 },
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (ex.Number >= 54000 && ex.Number < 55000)
+        catch (PostgresException ex) when (ex.ErrorNumber() >= 54000 && ex.ErrorNumber() < 55000)
         {
-            return Results.Json(Translate(ex.Number, ex.Message),
+            return Results.Json(Translate(ex.ErrorNumber(), ex.MessageText),
                 statusCode: StatusCodes.Status422UnprocessableEntity);
         }
 

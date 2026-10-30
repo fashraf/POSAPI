@@ -1,8 +1,7 @@
-using System.Data;
 using System.Globalization;
 using System.Text.Json;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
@@ -101,7 +100,7 @@ public static class ReturnEndpoints
         var rows = await connection.QueryAsync<(long SaleLineId, decimal Remaining)>(new CommandDefinition(
             """
             SELECT sl.SaleLineId,
-                   CASE WHEN s.Status = N'voided' THEN 0 ELSE sl.Quantity - sl.ReturnedQty END AS Remaining
+                   CASE WHEN s.Status = 'voided' THEN 0 ELSE sl.Quantity - sl.ReturnedQty END AS Remaining
             FROM sales.SaleLine AS sl
             JOIN sales.Sale AS s ON s.SaleId = sl.SaleId
             WHERE sl.SaleId = @SaleId
@@ -135,9 +134,7 @@ public static class ReturnEndpoints
                 "Refunding money needs the refund permission. Refund to the customer's account, or ask a manager.",
                 "رد المبلغ يحتاج صلاحية الاسترداد. أعده إلى حساب العميل أو اطلب من المدير.");
 
-        var lines = new DataTable();
-        lines.Columns.Add("SaleLineId", typeof(long));
-        lines.Columns.Add("Quantity", typeof(decimal));
+        var lines = new List<ReturnLineRow>();
 
         foreach (var line in request.Lines ?? [])
         {
@@ -145,7 +142,7 @@ public static class ReturnEndpoints
                 return Unprocessable("unknown_line", "lines",
                     "That line is not part of this invoice.", "هذا السطر ليس من هذه الفاتورة.");
 
-            lines.Rows.Add(lineId, line.Quantity);
+            lines.Add(new ReturnLineRow(lineId, line.Quantity));
         }
 
         await using var connection = db.Create();
@@ -154,31 +151,34 @@ public static class ReturnEndpoints
         if (branch is null) return SaleNotFound();
         if (!current.CanSeeBranch(branch.BranchId)) return Results.Forbid();
 
-        var parameters = new DynamicParameters();
-        parameters.Add("@SaleId", saleId);
-        parameters.Add("@ReasonCode", request.Reason?.Trim());
-        parameters.Add("@Note", ProcErrors.Blank(request.Note));
-        parameters.Add("@RefundMethod", method);
-        parameters.Add("@Actor", current.Username);
-        parameters.Add("@Lines", lines.AsTableValuedParameter("sales.ReturnLineTable"));
-        parameters.Add("@ReturnId", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
-        parameters.Add("@NoteNumber", dbType: DbType.String, direction: ParameterDirection.Output, size: 40);
+        string returnId, noteNumber;
 
         try
         {
-            await connection.ExecuteAsync(new CommandDefinition(
-                "sales.usp_IssueReturn", parameters,
-                commandType: CommandType.StoredProcedure, cancellationToken: ct));
+            (returnId, noteNumber) = await connection.QuerySingleAsync<(string, string)>(new CommandDefinition(
+                """
+                SELECT ReturnId, NoteNumber FROM sales.usp_IssueReturn(
+                    p_SaleId => @SaleId, p_ReasonCode => @ReasonCode, p_Note => @Note,
+                    p_RefundMethod => @RefundMethod, p_Actor => @Actor, p_Lines => @Lines::jsonb);
+                """,
+                new
+                {
+                    SaleId = saleId,
+                    ReasonCode = request.Reason?.Trim(),
+                    Note = ProcErrors.Blank(request.Note),
+                    RefundMethod = method,
+                    Actor = current.Username,
+                    Lines = DbList.Json(lines)
+                },
+                cancellationToken: ct));
         }
-        catch (SqlException ex) when (MapError(ex) is { } mapped)
+        catch (PostgresException ex) when (MapError(ex) is { } mapped)
         {
             return mapped;
         }
 
-        var returnId = parameters.Get<string>("@ReturnId");
-
         logger.LogInformation("Credit note {NoteNumber} issued against {SaleId} by {Actor}.",
-            parameters.Get<string>("@NoteNumber"), saleId, current.Username);
+            noteNumber, saleId, current.Username);
         http.Items["AuditEntityId"] = returnId;
 
         var note = (await LoadAsync(connection, saleId, returnId, ct)).Single();
@@ -198,13 +198,13 @@ public static class ReturnEndpoints
     }
 
     private static Task<SaleRef?> SaleBranchAsync(
-        SqlConnection connection, string saleId, CancellationToken ct) =>
+        NpgsqlConnection connection, string saleId, CancellationToken ct) =>
         connection.QuerySingleOrDefaultAsync<SaleRef?>(new CommandDefinition(
             "SELECT BranchId, Status FROM sales.Sale WHERE SaleId = @SaleId;",
             new { SaleId = saleId }, cancellationToken: ct));
 
     internal static async Task<List<CreditNoteDto>> LoadAsync(
-        SqlConnection connection, string saleId, string? returnId, CancellationToken ct)
+        NpgsqlConnection connection, string saleId, string? returnId, CancellationToken ct)
     {
         await using var multi = await connection.QueryMultipleAsync(new CommandDefinition(
             """
@@ -216,7 +216,7 @@ public static class ReturnEndpoints
             WHERE r.SaleId = @SaleId AND (@ReturnId IS NULL OR r.ReturnId = @ReturnId)
             ORDER BY r.ReturnedAtUtc DESC;
 
-            SELECT rl.ReturnId, rl.SaleLineId, ISNULL(rl.ItemId, sl.ItemId) AS ItemId, sl.NameAr, sl.NameEn,
+            SELECT rl.ReturnId, rl.SaleLineId, COALESCE(rl.ItemId, sl.ItemId) AS ItemId, sl.NameAr, sl.NameEn,
                    rl.Quantity, CASE WHEN rl.UnitPriceH > 0 THEN rl.UnitPriceH ELSE sl.UnitPriceH END AS UnitPriceH,
                    rl.AmountH
             FROM sales.SaleReturnLine AS rl
@@ -248,7 +248,7 @@ public static class ReturnEndpoints
         Results.UnprocessableEntity(ApiError.Create(code, en, ar,
             new Dictionary<string, string[]> { [field] = [en] }));
 
-    private static IResult? MapError(SqlException ex) => ex.Number switch
+    private static IResult? MapError(PostgresException ex) => ex.ErrorNumber() switch
     {
         67000 => SaleNotFound(),
         67001 => ProcErrors.Conflict("sale_voided",
@@ -275,6 +275,9 @@ public static class ReturnEndpoints
             "Return quantities cannot be negative.", "لا يمكن أن تكون كميات الإرجاع سالبة."),
         _ => null
     };
+
+    /* One row of the list sales.usp_IssueReturn reads as sales.ReturnLineTable. */
+    private sealed record ReturnLineRow(long SaleLineId, decimal Quantity);
 
     private sealed record SaleRef
     {

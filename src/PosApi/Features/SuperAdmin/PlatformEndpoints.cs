@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Diagnostics;
 using Dapper;
-using Microsoft.Data.SqlClient;
+using Npgsql;
 using Microsoft.Extensions.Options;
 using PosApi.Tenancy;
 
@@ -50,13 +50,13 @@ public static class PlatformEndpoints
         var stats = await control.QuerySingleAsync(new CommandDefinition(
             """
             SELECT
-              (SELECT ISNULL(SUM(CAST(Transactions AS BIGINT)), 0) FROM ctl.TenantDailyStat WHERE StatDate >= @From AND StatDate < @To) AS Tx,
-              (SELECT ISNULL(SUM(SalesH), 0) FROM ctl.TenantDailyStat WHERE StatDate >= @From AND StatDate < @To) AS Sales,
-              (SELECT ISNULL(SUM(CAST(Transactions AS BIGINT)), 0) FROM ctl.TenantDailyStat WHERE StatDate >= @PFrom AND StatDate < @PTo) AS PrevTx,
-              (SELECT ISNULL(SUM(SalesH), 0) FROM ctl.TenantDailyStat WHERE StatDate >= @PFrom AND StatDate < @PTo) AS PrevSales,
-              (SELECT COUNT(*) FROM ctl.Tenant WHERE Status IN (N'active', N'suspended') AND CreatedAtUtc < @PTo) AS PrevClients,
-              (SELECT COUNT(*) FROM ctl.Issue WHERE Status <> N'resolved') AS OpenIssues,
-              (SELECT COUNT(*) FROM ctl.Issue WHERE OpenedAtUtc < @PTo AND (ResolvedAtUtc IS NULL OR ResolvedAtUtc >= @PTo)) AS PrevIssues;
+              (SELECT COALESCE(SUM(Transactions::bigint), 0)::bigint FROM ctl.TenantDailyStat WHERE StatDate >= @From AND StatDate < @To) AS "Tx",
+              (SELECT COALESCE(SUM(SalesH), 0)::bigint FROM ctl.TenantDailyStat WHERE StatDate >= @From AND StatDate < @To) AS "Sales",
+              (SELECT COALESCE(SUM(Transactions::bigint), 0)::bigint FROM ctl.TenantDailyStat WHERE StatDate >= @PFrom AND StatDate < @PTo) AS "PrevTx",
+              (SELECT COALESCE(SUM(SalesH), 0)::bigint FROM ctl.TenantDailyStat WHERE StatDate >= @PFrom AND StatDate < @PTo) AS "PrevSales",
+              (SELECT COUNT(*)::int FROM ctl.Tenant WHERE Status IN ('active', 'suspended') AND CreatedAtUtc < @PTo) AS "PrevClients",
+              (SELECT COUNT(*)::int FROM ctl.Issue WHERE Status <> 'resolved') AS "OpenIssues",
+              (SELECT COUNT(*)::int FROM ctl.Issue WHERE OpenedAtUtc < @PTo AND (ResolvedAtUtc IS NULL OR ResolvedAtUtc >= @PTo)) AS "PrevIssues";
             """,
             new { From = window.From.Date, To = window.To.Date, PFrom = window.PreviousFrom.Date, PTo = window.PreviousTo.Date },
             cancellationToken: ct));
@@ -65,7 +65,7 @@ public static class PlatformEndpoints
             new CommandDefinition(
                 """
                 SELECT s.IsTrial, s.Cycle, s.CustomMonthlyH, p.MonthlyH, p.AnnualH, s.CreatedAtUtc, s.CancelledAtUtc
-                FROM ctl.Subscription AS s JOIN ctl.[Plan] AS p ON p.PlanKey = s.PlanKey;
+                FROM ctl.Subscription AS s JOIN ctl.Plan AS p ON p.PlanKey = s.PlanKey;
                 """, cancellationToken: ct))).ToList();
         long previousMrr = subs
             .Where(s => !s.IsTrial && s.Created <= window.PreviousTo && (s.Cancelled is null || s.Cancelled > window.PreviousTo))
@@ -101,10 +101,11 @@ public static class PlatformEndpoints
         await using var control = catalog.Control();
         var rows = await control.QueryAsync(new CommandDefinition(
             """
-            SELECT TOP (@Take) CONCAT(N'EV-', e.EventId) AS id, e.AtUtc AS [at], e.Kind AS kind, e.Label AS label,
-                   e.TenantId AS clientId, t.Name AS clientName, e.Detail AS detail, e.Severity AS severity
+            SELECT 'EV-' || e.EventId AS "id", e.AtUtc AS "at", e.Kind AS "kind", e.Label AS "label",
+                   e.TenantId AS "clientId", t.Name AS "clientName", e.Detail AS "detail", e.Severity AS "severity"
             FROM ctl.PlatformEvent AS e LEFT JOIN ctl.Tenant AS t ON t.TenantId = e.TenantId
-            ORDER BY e.EventId DESC;
+            ORDER BY e.EventId DESC
+            LIMIT @Take;
             """, new { Take = Math.Clamp(take ?? 12, 1, 200) }, cancellationToken: ct));
 
         return Results.Ok(rows);
@@ -130,25 +131,21 @@ public static class PlatformEndpoints
 
         var tenants = await control.QuerySingleAsync(new CommandDefinition(
             """
-            SELECT COUNT(*) AS Total,
-                   SUM(CASE WHEN n.Reachable = 0 THEN 1 ELSE 0 END) AS Unreachable,
-                   (SELECT COUNT(*) FROM ctl.PlatformEvent WHERE Kind = N'migration_failed' AND AtUtc >= DATEADD(DAY, -1, SYSUTCDATETIME())) AS FailedToday,
-                   (SELECT COUNT(*) FROM ctl.PlatformEvent WHERE Kind = N'migration_failed'
-                      AND AtUtc >= DATEADD(DAY, -2, SYSUTCDATETIME()) AND AtUtc < DATEADD(DAY, -1, SYSUTCDATETIME())) AS FailedYesterday
+            SELECT COUNT(*)::int AS "Total",
+                   SUM(CASE WHEN NOT n.Reachable THEN 1 ELSE 0 END)::int AS "Unreachable",
+                   (SELECT COUNT(*)::int FROM ctl.PlatformEvent WHERE Kind = 'migration_failed'
+                      AND AtUtc >= (now() AT TIME ZONE 'utc') - interval '1 day') AS "FailedToday",
+                   (SELECT COUNT(*)::int FROM ctl.PlatformEvent WHERE Kind = 'migration_failed'
+                      AND AtUtc >= (now() AT TIME ZONE 'utc') - interval '2 days'
+                      AND AtUtc < (now() AT TIME ZONE 'utc') - interval '1 day') AS "FailedYesterday"
             FROM ctl.Tenant AS t LEFT JOIN ctl.TenantSnapshot AS n ON n.TenantId = t.TenantId
-            WHERE t.Status IN (N'active', N'suspended');
+            WHERE t.Status IN ('active', 'suspended');
             """, cancellationToken: ct));
 
+        /* SQL Server kept backup history in msdb; PostgreSQL keeps none in the
+           database (backups are taken outside it, by pg_dump or the host), so
+           the last backup is unknown, not "never". */
         DateTime? lastBackup = null;
-        try
-        {
-            lastBackup = await control.ExecuteScalarAsync<DateTime?>(new CommandDefinition(
-                "SELECT MAX(backup_finish_date) FROM msdb.dbo.backupset WHERE database_name = DB_NAME();", cancellationToken: ct));
-        }
-        catch (SqlException)
-        {
-            /* No permission on msdb: unknown, not "never". */
-        }
 
         var hour = metrics.Over(60);
         var previousHour = metrics.Over(60, 60);
@@ -198,11 +195,11 @@ public static class PlatformEndpoints
 
     /// <summary>Run a read against every live tenant database, a few at a time; unreachable ones are skipped.</summary>
     private static async Task<List<T>> FanOutAsync<T>(
-        TenantCatalog catalog, Func<SqlConnection, string, string, Task<IEnumerable<T>>> read, CancellationToken ct)
+        TenantCatalog catalog, Func<NpgsqlConnection, string, string, Task<IEnumerable<T>>> read, CancellationToken ct)
     {
         await using var control = catalog.Control();
         var tenants = (await control.QueryAsync<(string TenantId, string Name)>(new CommandDefinition(
-            "SELECT TenantId, Name FROM ctl.Tenant WHERE Status IN (N'active', N'suspended');", cancellationToken: ct))).ToList();
+            "SELECT TenantId, Name FROM ctl.Tenant WHERE Status IN ('active', 'suspended');", cancellationToken: ct))).ToList();
 
         var bag = new ConcurrentBag<T>();
         await Parallel.ForEachAsync(tenants, new ParallelOptions { MaxDegreeOfParallelism = 6, CancellationToken = ct },
@@ -212,11 +209,11 @@ public static class PlatformEndpoints
                 {
                     var info = await catalog.GetAsync(t.TenantId, token);
                     if (info is null) return;
-                    await using var db = new SqlConnection(info.ConnectionString);
+                    await using var db = new NpgsqlConnection(info.ConnectionString);
                     await db.OpenAsync(token);
                     foreach (var row in await read(db, t.TenantId, t.Name)) bag.Add(row);
                 }
-                catch (SqlException)
+                catch (NpgsqlException)
                 {
                     /* Marked unreachable by the snapshot; not fatal to the list. */
                 }
@@ -237,16 +234,16 @@ public static class PlatformEndpoints
         await using var control = catalog.Control();
         var s = await control.QuerySingleAsync(new CommandDefinition(
             """
-            SELECT ISNULL(SUM(n.ApiRequestsToday), 0) AS ApiToday, ISNULL(SUM(CAST(n.ApiRequestsMonth AS BIGINT)), 0) AS ApiMonth,
-                   ISNULL(SUM(n.TransactionsToday), 0) AS TxToday, ISNULL(SUM(CAST(n.TransactionsMonth AS BIGINT)), 0) AS TxMonth,
-                   ISNULL(SUM(n.LoginsToday), 0) AS UsersToday, ISNULL(SUM(n.ActiveUsersMonth), 0) AS UsersMonth,
-                   ISNULL(SUM(n.HeartbeatsToday), 0) AS HbToday, ISNULL(SUM(n.DbSizeMb), 0) AS DbMb,
-                   CASE WHEN EXISTS (SELECT 1 FROM ctl.Subscription AS s JOIN ctl.[Plan] AS p ON p.PlanKey = s.PlanKey
-                                     WHERE s.Status = N'active' AND p.StorageGb IS NULL) THEN NULL
-                        ELSE (SELECT SUM(p.StorageGb) FROM ctl.Subscription AS s JOIN ctl.[Plan] AS p ON p.PlanKey = s.PlanKey
-                              WHERE s.Status = N'active') END AS LimitGb
+            SELECT COALESCE(SUM(n.ApiRequestsToday), 0)::int AS "ApiToday", COALESCE(SUM(n.ApiRequestsMonth::bigint), 0)::bigint AS "ApiMonth",
+                   COALESCE(SUM(n.TransactionsToday), 0)::int AS "TxToday", COALESCE(SUM(n.TransactionsMonth::bigint), 0)::bigint AS "TxMonth",
+                   COALESCE(SUM(n.LoginsToday), 0)::int AS "UsersToday", COALESCE(SUM(n.ActiveUsersMonth), 0)::int AS "UsersMonth",
+                   COALESCE(SUM(n.HeartbeatsToday), 0)::int AS "HbToday", COALESCE(SUM(n.DbSizeMb), 0) AS "DbMb",
+                   CASE WHEN EXISTS (SELECT 1 FROM ctl.Subscription AS s JOIN ctl.Plan AS p ON p.PlanKey = s.PlanKey
+                                     WHERE s.Status = 'active' AND p.StorageGb IS NULL) THEN NULL
+                        ELSE (SELECT SUM(p.StorageGb) FROM ctl.Subscription AS s JOIN ctl.Plan AS p ON p.PlanKey = s.PlanKey
+                              WHERE s.Status = 'active') END AS "LimitGb"
             FROM ctl.TenantSnapshot AS n JOIN ctl.Tenant AS t ON t.TenantId = n.TenantId
-            WHERE t.Status IN (N'active', N'suspended');
+            WHERE t.Status IN ('active', 'suspended');
             """, cancellationToken: ct));
 
         var minutesToday = Math.Max(1, (DateTime.UtcNow - DateTime.UtcNow.Date).TotalMinutes);
@@ -272,9 +269,9 @@ public static class PlatformEndpoints
         await using var control = catalog.Control();
         return Results.Ok(await control.QueryAsync(new CommandDefinition(
             """
-            SELECT t.TenantId AS id, t.Name AS name, t.DatabaseName AS databaseName, t.Status AS status,
-                   t.Source AS source, t.SchemaVersion AS schemaVersion, t.MigratedAtUtc AS migratedAtUtc,
-                   n.Reachable AS reachable, n.CollectedAtUtc AS collectedAtUtc, n.Error AS error, n.DbSizeMb AS dbSizeMb
+            SELECT t.TenantId AS "id", t.Name AS "name", t.DatabaseName AS "databaseName", t.Status AS "status",
+                   t.Source AS "source", t.SchemaVersion AS "schemaVersion", t.MigratedAtUtc AS "migratedAtUtc",
+                   n.Reachable AS "reachable", n.CollectedAtUtc AS "collectedAtUtc", n.Error AS "error", n.DbSizeMb AS "dbSizeMb"
             FROM ctl.Tenant AS t LEFT JOIN ctl.TenantSnapshot AS n ON n.TenantId = t.TenantId
             ORDER BY t.TenantId;
             """, cancellationToken: ct)));
@@ -304,15 +301,17 @@ public static class PlatformEndpoints
     public static async Task<IEnumerable<dynamic>> IssuesAsync(DbConnection control, string? tenantId, CancellationToken ct) =>
         await control.QueryAsync(new CommandDefinition(
             """
-            SELECT i.IssueId AS id, i.TenantId AS clientId, t.Name AS clientName, i.Title AS title,
-                   i.Description AS description, i.Priority AS priority, i.Status AS status,
-                   i.OpenedAtUtc AS openedAt, i.ResolvedAtUtc AS resolvedAt,
-                   DATEDIFF(HOUR, i.OpenedAtUtc, ISNULL(i.ResolvedAtUtc, SYSUTCDATETIME())) AS ageHours,
-                   ISNULL(i.Assignee, N'Unassigned') AS assignee
+            SELECT i.IssueId AS "id", i.TenantId AS "clientId", t.Name AS "clientName", i.Title AS "title",
+                   i.Description AS "description", i.Priority AS "priority", i.Status AS "status",
+                   i.OpenedAtUtc AS "openedAt", i.ResolvedAtUtc AS "resolvedAt",
+                   /* Hour boundaries crossed, as DATEDIFF(HOUR, ...) counted them. */
+                   (extract(epoch FROM date_trunc('hour', COALESCE(i.ResolvedAtUtc, now() AT TIME ZONE 'utc'))
+                                       - date_trunc('hour', i.OpenedAtUtc)) / 3600)::int AS "ageHours",
+                   COALESCE(i.Assignee, 'Unassigned') AS "assignee"
             FROM ctl.Issue AS i JOIN ctl.Tenant AS t ON t.TenantId = i.TenantId
             WHERE @TenantId IS NULL OR i.TenantId = @TenantId
-            ORDER BY CASE i.Status WHEN N'open' THEN 0 WHEN N'waiting' THEN 1 ELSE 2 END,
-                     CASE i.Priority WHEN N'high' THEN 0 WHEN N'medium' THEN 1 ELSE 2 END, i.OpenedAtUtc DESC;
+            ORDER BY CASE i.Status WHEN 'open' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END,
+                     CASE i.Priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, i.OpenedAtUtc DESC;
             """, new { TenantId = tenantId }, cancellationToken: ct));
 
     private static async Task<IResult> ListIssuesAsync(string? clientId, TenantCatalog catalog, CancellationToken ct)
@@ -333,7 +332,7 @@ public static class PlatformEndpoints
                 "SELECT 1 FROM ctl.Tenant WHERE TenantId = @Id;", new { Id = request.ClientId }, cancellationToken: ct)) is null)
             return ClientEndpoints.NotFound();
 
-        var number = await control.ExecuteScalarAsync<int>(new CommandDefinition("SELECT NEXT VALUE FOR ctl.IssueNumber;", cancellationToken: ct));
+        var number = await control.ExecuteScalarAsync<int>(new CommandDefinition("SELECT nextval('ctl.IssueNumber')::int;", cancellationToken: ct));
         var id = $"ISS-{number}";
 
         await control.ExecuteAsync(new CommandDefinition(
@@ -363,8 +362,8 @@ public static class PlatformEndpoints
             SET Status = COALESCE(@Status, Status), Priority = COALESCE(@Priority, Priority),
                 Assignee = COALESCE(@Assignee, Assignee), Title = COALESCE(@Title, Title),
                 Description = COALESCE(@Description, Description),
-                ResolvedAtUtc = CASE WHEN @Status = N'resolved' AND ResolvedAtUtc IS NULL THEN SYSUTCDATETIME()
-                                     WHEN @Status IN (N'open', N'waiting') THEN NULL ELSE ResolvedAtUtc END
+                ResolvedAtUtc = CASE WHEN @Status = 'resolved' AND ResolvedAtUtc IS NULL THEN now() AT TIME ZONE 'utc'
+                                     WHEN @Status IN ('open', 'waiting') THEN NULL ELSE ResolvedAtUtc END
             WHERE IssueId = @Id;
             """, new { request.Status, request.Priority, request.Assignee, request.Title, request.Description, Id = id }, cancellationToken: ct));
 
@@ -378,48 +377,64 @@ public static class PlatformEndpoints
     {
         if (string.IsNullOrWhiteSpace(q) || q.Trim().Length < 2) return Results.Ok(Array.Empty<object>());
 
-        var like = $"%{q.Trim().Replace("[", "[[]").Replace("%", "[%]").Replace("_", "[_]")}%";
+        /* LIKE's own characters match literally: escaped with a backslash, the
+           default escape character. */
+        var like = $"%{q.Trim().Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_")}%";
         await using var control = catalog.Control();
 
         var rows = await control.QueryAsync(new CommandDefinition(
             """
-            SELECT TOP (4) N'client' AS kind, t.TenantId AS id, t.Name AS title,
-                   CONCAT(ISNULL(s.PlanKey, N'—'), N' · ', ISNULL(t.City, N'—'), N' · ', ISNULL(n.Branches, 0), N' branches') AS subtitle,
-                   CONCAT(N'/superadmin/clients/', t.TenantId) AS [to]
-            FROM ctl.Tenant AS t LEFT JOIN ctl.Subscription AS s ON s.TenantId = t.TenantId
-            LEFT JOIN ctl.TenantSnapshot AS n ON n.TenantId = t.TenantId
-            WHERE t.Name LIKE @Like OR t.NameAr LIKE @Like OR t.TenantId LIKE @Like OR t.PocName LIKE @Like
-               OR t.PocMobile LIKE @Like OR t.PocEmail LIKE @Like OR t.VatNumber LIKE @Like OR t.CrNumber LIKE @Like
+            /* The short text columns are case-insensitive (ci), which LIKE refuses:
+               each is compared in the default collation with ILIKE, which keeps
+               the search case-insensitive. */
+            (SELECT 'client' AS "kind", t.TenantId AS "id", t.Name AS "title",
+                    concat(COALESCE(s.PlanKey, '—'), ' · ', COALESCE(t.City, '—'), ' · ', COALESCE(n.Branches, 0), ' branches') AS "subtitle",
+                    '/superadmin/clients/' || t.TenantId AS "to"
+             FROM ctl.Tenant AS t LEFT JOIN ctl.Subscription AS s ON s.TenantId = t.TenantId
+             LEFT JOIN ctl.TenantSnapshot AS n ON n.TenantId = t.TenantId
+             WHERE t.Name COLLATE "default" ILIKE @Like OR t.NameAr COLLATE "default" ILIKE @Like
+                OR t.TenantId COLLATE "default" ILIKE @Like OR t.PocName COLLATE "default" ILIKE @Like
+                OR t.PocMobile COLLATE "default" ILIKE @Like OR t.PocEmail COLLATE "default" ILIKE @Like
+                OR t.VatNumber COLLATE "default" ILIKE @Like OR t.CrNumber COLLATE "default" ILIKE @Like
+             LIMIT 4)
             UNION ALL
-            SELECT TOP (4) N'device', h.DeviceId, CONCAT(ISNULL(h.Manufacturer + N' ', N''), h.Model, N' · ', h.Serial),
-                   CONCAT(ISNULL(t.Name, N'Unassigned'), N' · ', ISNULL(h.BranchName, N'—'), N' · ', h.Status),
-                   N'/superadmin/maintenance/devices'
-            FROM ctl.HardwareDevice AS h LEFT JOIN ctl.Tenant AS t ON t.TenantId = h.TenantId
-            WHERE h.Serial LIKE @Like OR h.DeviceId LIKE @Like OR h.MacAddress LIKE @Like OR h.Imei LIKE @Like
+            (SELECT 'device', h.DeviceId, concat(COALESCE(h.Manufacturer || ' ', ''), h.Model, ' · ', h.Serial),
+                    concat(COALESCE(t.Name, 'Unassigned'), ' · ', COALESCE(h.BranchName, '—'), ' · ', h.Status),
+                    '/superadmin/maintenance/devices'
+             FROM ctl.HardwareDevice AS h LEFT JOIN ctl.Tenant AS t ON t.TenantId = h.TenantId
+             WHERE h.Serial COLLATE "default" ILIKE @Like OR h.DeviceId COLLATE "default" ILIKE @Like
+                OR h.MacAddress COLLATE "default" ILIKE @Like OR h.Imei COLLATE "default" ILIKE @Like
+             LIMIT 4)
             UNION ALL
-            SELECT TOP (4) N'user', d.Identifier, d.Identifier, CONCAT(t.Name, N' · ', d.Kind),
-                   CONCAT(N'/superadmin/clients/', d.TenantId)
-            FROM ctl.LoginDirectory AS d JOIN ctl.Tenant AS t ON t.TenantId = d.TenantId
-            WHERE d.Identifier LIKE @Like
+            (SELECT 'user', d.Identifier, d.Identifier, concat(t.Name, ' · ', d.Kind),
+                    '/superadmin/clients/' || d.TenantId
+             FROM ctl.LoginDirectory AS d JOIN ctl.Tenant AS t ON t.TenantId = d.TenantId
+             WHERE d.Identifier COLLATE "default" ILIKE @Like
+             LIMIT 4)
             UNION ALL
-            SELECT TOP (4) N'subscription', s.SubscriptionId, CONCAT(s.SubscriptionId, N' · ', t.Name),
-                   CONCAT(t.Name, N' · ', s.PlanKey, N' · renews ', CONVERT(NVARCHAR(10), s.RenewsOn, 23)),
-                   N'/superadmin/subscriptions'
-            FROM ctl.Subscription AS s JOIN ctl.Tenant AS t ON t.TenantId = s.TenantId
-            WHERE s.SubscriptionId LIKE @Like
+            (SELECT 'subscription', s.SubscriptionId, concat(s.SubscriptionId, ' · ', t.Name),
+                    concat(t.Name, ' · ', s.PlanKey, ' · renews ', to_char(s.RenewsOn, 'YYYY-MM-DD')),
+                    '/superadmin/subscriptions'
+             FROM ctl.Subscription AS s JOIN ctl.Tenant AS t ON t.TenantId = s.TenantId
+             WHERE s.SubscriptionId COLLATE "default" ILIKE @Like
+             LIMIT 4)
             UNION ALL
-            SELECT TOP (4) N'invoice', i.InvoiceId, i.InvoiceId, CONCAT(t.Name, N' · ', i.Status), N'/superadmin/revenue/payments'
-            FROM ctl.Invoice AS i JOIN ctl.Tenant AS t ON t.TenantId = i.TenantId
-            WHERE i.InvoiceId LIKE @Like
+            (SELECT 'invoice', i.InvoiceId, i.InvoiceId, concat(t.Name, ' · ', i.Status), '/superadmin/revenue/payments'
+             FROM ctl.Invoice AS i JOIN ctl.Tenant AS t ON t.TenantId = i.TenantId
+             WHERE i.InvoiceId COLLATE "default" ILIKE @Like
+             LIMIT 4)
             UNION ALL
-            SELECT TOP (4) N'issue', i.IssueId, i.Title, CONCAT(t.Name, N' · ', i.Priority), N'/superadmin/support'
-            FROM ctl.Issue AS i JOIN ctl.Tenant AS t ON t.TenantId = i.TenantId
-            WHERE i.IssueId LIKE @Like OR i.Title LIKE @Like
+            (SELECT 'issue', i.IssueId, i.Title, concat(t.Name, ' · ', i.Priority), '/superadmin/support'
+             FROM ctl.Issue AS i JOIN ctl.Tenant AS t ON t.TenantId = i.TenantId
+             WHERE i.IssueId COLLATE "default" ILIKE @Like OR i.Title COLLATE "default" ILIKE @Like
+             LIMIT 4)
             UNION ALL
-            SELECT TOP (3) N'audit', CONCAT(N'AUD-', a.AuditId), a.Label,
-                   CONCAT(ISNULL(t.Name, N'Platform'), N' · ', CONVERT(NVARCHAR(16), a.AtUtc, 120)), N'/superadmin/audit'
-            FROM ctl.AdminAudit AS a LEFT JOIN ctl.Tenant AS t ON t.TenantId = a.TenantId
-            WHERE CONCAT(N'AUD-', a.AuditId) LIKE @Like OR a.Label LIKE @Like OR a.Reason LIKE @Like;
+            (SELECT 'audit', 'AUD-' || a.AuditId, a.Label,
+                    concat(COALESCE(t.Name, 'Platform'), ' · ', to_char(a.AtUtc, 'YYYY-MM-DD HH24:MI')), '/superadmin/audit'
+             FROM ctl.AdminAudit AS a LEFT JOIN ctl.Tenant AS t ON t.TenantId = a.TenantId
+             WHERE ('AUD-' || a.AuditId) ILIKE @Like OR a.Label COLLATE "default" ILIKE @Like
+                OR a.Reason COLLATE "default" ILIKE @Like
+             LIMIT 3);
             """, new { Like = like }, cancellationToken: ct));
 
         return Results.Ok(rows);

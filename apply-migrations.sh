@@ -1,29 +1,35 @@
 #!/usr/bin/env bash
-# Create or update the POSMAIN database from db-migrations/ — the Linux and
-# macOS twin of apply-migrations.cmd. Same files, same tracking table, same
-# options, so a database built by one can be updated by the other.
+# Create or update the posmain database from db-migrations/ — the Linux and
+# macOS twin of apply-migrations.cmd, and the shell twin of the API's own
+# runner (src/PosApi/Tenancy/SqlScriptRunner.cs). Same files, same tracking
+# table, so a database built by one can be updated by the others.
 #
-#   ./apply-migrations.sh -S 127.0.0.1,1433 -U sa -P 'Root@123'
-#   ./apply-migrations.sh --docker sql2019 -U sa -P 'Root@123'
+#   POS_PG_PASSWORD='Root@123' ./apply-migrations.sh -h 127.0.0.1 -p 5432 -U postgres
+#   ./apply-migrations.sh --docker pos-pg16 -U postgres --demo
 #
-#   -S SERVER          server, default 127.0.0.1,1433 (localhost inside --docker)
-#   -U USER -P PASS    SQL login; Linux has no Windows login, so a user is required
-#   --docker NAME      run sqlcmd inside that SQL Server container instead of on
-#                      this machine (no local sqlcmd needed; files are copied in)
+#   -h HOST            server, default 127.0.0.1 (the container's own socket
+#                      inside --docker)
+#   -p PORT            port, default 5432
+#   -U USER            PostgreSQL role, default postgres. It needs CREATEDB to
+#                      create the database.
+#   -d DATABASE        database, default posmain. Names are lower case.
+#   --docker NAME      run psql inside that PostgreSQL container instead of on
+#                      this machine (no local psql needed; files are piped in)
 #   --dry-run          list what would run; change nothing
 #   --demo             also load 900-demo-data.sql (demo company, users with
 #                      password 1234). Only on a database this run creates.
-#   --adopt            take over a database built by the old migration files
-#                      (11-43): record 001 and 002 as already applied
-#   --recreate         DROP POSMAIN and build it again from scratch
+#   --recreate         DROP the database and build it again from scratch
 #   --yes              do not ask before --recreate drops the database
 #
-# The server and login can also come from POS_SQL_SERVER, POS_SQL_USER and
-# POS_SQL_PASSWORD (and the container from POS_SQL_DOCKER), which keeps a
-# password out of shell history.
+# The password comes from POS_PG_PASSWORD (or PGPASSWORD, or ~/.pgpass), never
+# the command line, which keeps it out of shell history and the process list.
+# The server, port, role, database and container can also come from
+# POS_PG_HOST, POS_PG_PORT, POS_PG_USER, POS_PG_DATABASE and POS_PG_DOCKER.
 #
 # Files, in name order:
-#   001-899  migrations. Each runs once and is recorded in dbo.SchemaMigration.
+#   001-899  migrations. Each runs once, in a transaction of its own, and is
+#            recorded in dbo.SchemaMigration in that same transaction: a file
+#            that fails leaves the database as it was before it.
 #   900-998  optional data, run only with --demo on a new database.
 #   999      read-only health check, run after every apply.
 
@@ -32,110 +38,116 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MIG="$HERE/db-migrations"
 
-SERVER="${POS_SQL_SERVER:-}"
-SQLUSER="${POS_SQL_USER:-}"
-SQLPASS="${POS_SQL_PASSWORD:-}"
-DOCKER="${POS_SQL_DOCKER:-}"
-DEMO=""; DRYRUN=""; ADOPT=""; RECREATE=""; YES=""
-CREATED=""; ADOPTING=""
+PGHOSTNAME="${POS_PG_HOST:-}"
+PGPORTNUM="${POS_PG_PORT:-}"
+PGROLE="${POS_PG_USER:-postgres}"
+PGPASS="${POS_PG_PASSWORD:-${PGPASSWORD:-}}"
+DB="${POS_PG_DATABASE:-posmain}"
+DOCKER="${POS_PG_DOCKER:-}"
+DEMO=""; DRYRUN=""; RECREATE=""; YES=""
+CREATED=""
 APPLIED=0; PENDING=0
 
-usage() { sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        -S)         SERVER="${2:-}"; shift 2 ;;
-        -U)         SQLUSER="${2:-}"; shift 2 ;;
-        -P)         SQLPASS="${2:-}"; shift 2 ;;
+        -h)         PGHOSTNAME="${2:-}"; shift 2 ;;
+        -p)         PGPORTNUM="${2:-}"; shift 2 ;;
+        -U)         PGROLE="${2:-}"; shift 2 ;;
+        -d)         DB="${2:-}"; shift 2 ;;
         --docker)   DOCKER="${2:-}"; shift 2 ;;
         --demo)     DEMO=1; shift ;;
         --dry-run)  DRYRUN=1; shift ;;
-        --adopt)    ADOPT=1; shift ;;
         --recreate) RECREATE=1; shift ;;
         --yes)      YES=1; shift ;;
-        -h|--help)  usage; exit 0 ;;
+        --help)     usage; exit 0 ;;
+        --adopt)    echo "--adopt is gone: there are no SQL Server-era databases to take over in PostgreSQL."
+                    exit 2 ;;
         *)          echo "Unknown option: $1"; echo "Run with --help for usage."; exit 2 ;;
     esac
 done
 
-if [ -n "$ADOPT" ] && [ -n "$RECREATE" ]; then
-    echo "--adopt keeps the database and --recreate drops it. Choose one."
+# PostgreSQL folds unquoted names to lower case; the API does the same.
+DB="$(printf '%s' "$DB" | tr '[:upper:]' '[:lower:]')"
+if ! printf '%s' "$DB" | grep -Eq '^[a-z][a-z0-9_]{0,62}$'; then
+    echo "'$DB' is not a valid database name: letters, digits and _, starting with a letter."
     exit 2
 fi
-if [ -z "$SQLUSER" ]; then
-    echo "A SQL login is required: -U user -P password (or POS_SQL_USER / POS_SQL_PASSWORD)."
+if [ -z "$PGROLE" ]; then
+    echo "A PostgreSQL role is required: -U user (or POS_PG_USER)."
     exit 2
 fi
-if [ -z "$SERVER" ]; then
-    if [ -n "$DOCKER" ]; then SERVER="localhost"; else SERVER="127.0.0.1,1433"; fi
-fi
+if [ -z "$PGHOSTNAME" ] && [ -z "$DOCKER" ]; then PGHOSTNAME="127.0.0.1"; fi
+if [ -z "$PGPORTNUM" ]; then PGPORTNUM="5432"; fi
 
-# ------------------------------------------------------------------ sqlcmd
-# Either the local sqlcmd or the one inside the container. The password goes
-# in SQLCMDPASSWORD rather than -P, so it does not show up in the process list.
-SQLCMD_BIN=""
+# -------------------------------------------------------------------- psql
+# Either the local psql or the one inside the container. The password goes
+# in PGPASSWORD rather than on the command line.
 if [ -n "$DOCKER" ]; then
     if ! docker inspect -f '{{.State.Running}}' "$DOCKER" 2>/dev/null | grep -q true; then
         echo "Container '$DOCKER' is not running (docker start $DOCKER)."
         exit 1
     fi
-    for candidate in /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd; do
-        if docker exec "$DOCKER" test -x "$candidate" 2>/dev/null; then SQLCMD_BIN="$candidate"; break; fi
-    done
-    if [ -z "$SQLCMD_BIN" ]; then
-        echo "No sqlcmd found inside container '$DOCKER'."
+    if ! docker exec "$DOCKER" sh -c 'command -v psql' >/dev/null 2>&1; then
+        echo "No psql found inside container '$DOCKER'."
         exit 1
     fi
 else
-    for candidate in sqlcmd /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd; do
-        if command -v "$candidate" >/dev/null 2>&1; then SQLCMD_BIN="$(command -v "$candidate")"; break; fi
-    done
-    if [ -z "$SQLCMD_BIN" ]; then
-        echo "sqlcmd was not found. Install Microsoft's sqlcmd (mssql-tools18 or go-sqlcmd),"
-        echo "or run against a SQL Server container with --docker <name>."
+    if ! command -v psql >/dev/null 2>&1; then
+        echo "psql was not found. Install the PostgreSQL client (postgresql-client),"
+        echo "or run against a PostgreSQL container with --docker <name>."
         exit 1
     fi
 fi
 
-# -b  stop and fail on the first error
-# -I  QUOTED_IDENTIFIER ON; filtered indexes fail without it
-# -C  trust the server certificate (not understood by the old mssql-tools 17)
-# -f  read the files as UTF-8, or every Arabic string is stored garbled
-SQLCMD_ARGS=(-S "$SERVER" -U "$SQLUSER" -b -I -f 65001)
-case "$SQLCMD_BIN" in */mssql-tools/bin/*) ;; *) SQLCMD_ARGS+=(-C) ;; esac
+# -X                 ignore ~/.psqlrc, so nobody's settings change the run
+# -w                 never prompt for a password (fail instead of hanging)
+# ON_ERROR_STOP=1    stop and fail on the first error
+# PGCLIENTENCODING   read the files as UTF-8, or every Arabic string is garbled
+PSQL_ARGS=(-X -w -q -v ON_ERROR_STOP=1 -p "$PGPORTNUM" -U "$PGROLE")
+[ -n "$PGHOSTNAME" ] && PSQL_ARGS+=(-h "$PGHOSTNAME")
 
-# sql DB ARGS...  — run sqlcmd against database DB.
-sql() {
+# READONLY=1 makes the session refuse every write (used for 999).
+READONLY=""
+
+# pg DB ARGS...  — run psql against database DB; stdin passes through.
+pg() {
     local db="$1"; shift
+    local options=""
+    [ -n "$READONLY" ] && options="-c default_transaction_read_only=on"
     if [ -n "$DOCKER" ]; then
-        docker exec -e SQLCMDPASSWORD="$SQLPASS" "$DOCKER" "$SQLCMD_BIN" "${SQLCMD_ARGS[@]}" -d "$db" "$@"
+        docker exec -i -e PGPASSWORD="$PGPASS" -e PGCLIENTENCODING=UTF8 -e PGOPTIONS="$options" \
+            "$DOCKER" psql "${PSQL_ARGS[@]}" -d "$db" "$@"
     else
-        SQLCMDPASSWORD="$SQLPASS" "$SQLCMD_BIN" "${SQLCMD_ARGS[@]}" -d "$db" "$@"
+        PGPASSWORD="$PGPASS" PGCLIENTENCODING=UTF8 PGOPTIONS="$options" \
+            psql "${PSQL_ARGS[@]}" -d "$db" "$@"
     fi
 }
 
-# scalar DB QUERY  — the last non-empty line of a one-value query.
+# scalar DB QUERY  — the single value a one-row, one-column query returns.
 scalar() {
-    sql "$1" -h -1 -W -Q "SET NOCOUNT ON; $2" 2>/dev/null | sed '/^[[:space:]]*$/d' | tail -n 1 | tr -d '\r[:space:]'
+    pg "$1" -At -c "$2" 2>/dev/null | tr -d '\r[:space:]'
 }
 
-# run_file NAME  — run one migration file (from master: 001 creates POSMAIN
-# itself, and every file says USE POSMAIN).
+# The tracking table, exactly as SqlScriptRunner creates it.
+TRACKING_SQL="CREATE SCHEMA IF NOT EXISTS dbo;
+CREATE TABLE IF NOT EXISTS dbo.SchemaMigration (
+    FileName     varchar(200) NOT NULL PRIMARY KEY,
+    AppliedAtUtc timestamp(3) NOT NULL DEFAULT (now() AT TIME ZONE 'utc'),
+    AppliedBy    varchar(128) NOT NULL DEFAULT current_user);"
+
+# run_file NAME  — run one migration and record it, in one transaction. The
+# file and the INSERT go down the same pipe into one psql --single-transaction,
+# so either both are committed or neither is.
 run_file() {
-    local file="$MIG/$1"
-    if [ -n "$DOCKER" ]; then
-        local remote="/tmp/pos-migration-$$-$1"
-        docker cp "$file" "$DOCKER:$remote" >/dev/null || return 1
-        sql master -i "$remote"
-        local rc=$?
-        docker exec -u 0 "$DOCKER" rm -f "$remote" >/dev/null 2>&1
-        return $rc
-    fi
-    sql master -i "$file"
-}
-
-ensure_tracking() {
-    sql POSMAIN -h -1 -Q "SET NOCOUNT ON; IF OBJECT_ID(N'dbo.SchemaMigration') IS NULL CREATE TABLE dbo.SchemaMigration (FileName NVARCHAR(200) NOT NULL CONSTRAINT PK_SchemaMigration PRIMARY KEY, AppliedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_SchemaMigration_At DEFAULT SYSUTCDATETIME(), AppliedBy NVARCHAR(128) NOT NULL CONSTRAINT DF_SchemaMigration_By DEFAULT SUSER_SNAME(), Baselined BIT NOT NULL CONSTRAINT DF_SchemaMigration_Baselined DEFAULT 0);" >/dev/null
+    local name="$1"
+    local quoted="${name//\'/\'\'}"
+    {
+        cat "$MIG/$name"
+        printf '\n;\nSET LOCAL client_min_messages = warning;\n%s\nINSERT INTO dbo.SchemaMigration (FileName) VALUES (%s) ON CONFLICT (FileName) DO NOTHING;\n' \
+            "$TRACKING_SQL" "'$quoted'"
+    } | pg "$DB" --single-transaction -f -
 }
 
 fail() {
@@ -146,102 +158,93 @@ fail() {
 }
 
 echo
+if [ -n "$PGHOSTNAME" ]; then SERVER="$PGHOSTNAME:$PGPORTNUM"; else SERVER="local socket, port $PGPORTNUM"; fi
 echo "Server:     $SERVER${DOCKER:+  (inside container $DOCKER)}"
-echo "Login:      $SQLUSER"
+echo "Role:       $PGROLE"
 echo "Migrations: $MIG"
 [ -n "$DRYRUN" ] && echo "Mode:       dry run - nothing will be changed"
 echo
 
-if ! sql master -h -1 -Q "SET NOCOUNT ON; SELECT 1;" >/dev/null; then
+if ! pg postgres -c "SELECT 1;" >/dev/null; then
     echo "Could not connect to $SERVER. The error is above."
     exit 1
 fi
 
 # --------------------------------------------------------------- what is there
-# missing  no POSMAIN database
-# empty    POSMAIN exists with no schema
-# tracked  built from 001 by this script (or the .cmd)
-# legacy   built by the old migration files, before 001 existed
-STATE="$(scalar master "IF DB_ID(N'POSMAIN') IS NULL SELECT N'missing' ELSE EXEC (N'USE POSMAIN; IF OBJECT_ID(N''dbo.SchemaMigration'') IS NULL SELECT CASE WHEN SCHEMA_ID(N''core'') IS NULL THEN N''empty'' ELSE N''legacy'' END ELSE SELECT CASE WHEN EXISTS (SELECT 1 FROM dbo.SchemaMigration WHERE FileName = N''001-baseline-schema.sql'') THEN N''tracked'' WHEN SCHEMA_ID(N''core'') IS NULL THEN N''empty'' ELSE N''legacy'' END');")"
+# missing    no database of that name
+# empty      the database exists with no schema
+# tracked    built from these files, by this script, the .cmd or the API
+# untracked  holds a POS schema that no runner recorded
+EXISTS="$(scalar postgres "SELECT count(*) FROM pg_database WHERE datname = '$DB';")"
+if [ "$EXISTS" = "0" ]; then
+    STATE=missing
+elif [ "$EXISTS" = "1" ]; then
+    STATE="$(scalar "$DB" "SELECT CASE WHEN to_regclass('dbo.schemamigration') IS NOT NULL THEN 'tracked' WHEN to_regnamespace('core') IS NULL THEN 'empty' ELSE 'untracked' END;")"
+else
+    STATE=""
+fi
 
 case "$STATE" in
-    missing|empty|tracked|legacy) ;;
-    *) echo "Could not tell what state POSMAIN is in."; exit 1 ;;
+    missing|empty|tracked|untracked) ;;
+    *) echo "Could not tell what state $DB is in."; exit 1 ;;
 esac
-echo "Database:   POSMAIN is $STATE"
+echo "Database:   $DB is $STATE"
 echo
 
 recreate() {
     local sales
-    sales="$(scalar POSMAIN "IF OBJECT_ID(N'sales.Sale') IS NULL SELECT 0 ELSE SELECT COUNT(*) FROM sales.Sale;")"
+    sales="$(scalar "$DB" "SELECT CASE WHEN to_regclass('sales.sale') IS NULL THEN 0 ELSE (SELECT count(*) FROM sales.Sale) END;")"
     if [ -n "$DRYRUN" ]; then
-        echo "Would DROP POSMAIN (${sales:-0} sale(s) in it) and build it again."
+        echo "Would DROP $DB (${sales:-0} sale(s) in it) and build it again."
         STATE=missing; CREATED=1
         return
     fi
-    echo "--recreate will DROP the POSMAIN database on $SERVER."
+    echo "--recreate will DROP the $DB database on $SERVER."
     echo "It holds ${sales:-0} sale(s). Everything in it is deleted."
     if [ -z "$YES" ]; then
         local confirm=""
-        read -r -p "Type POSMAIN to confirm: " confirm || true
-        if [ "$confirm" != "POSMAIN" ]; then
+        read -r -p "Type $DB to confirm: " confirm || true
+        if [ "$confirm" != "$DB" ]; then
             echo "Not confirmed. Nothing was changed."
             exit 1
         fi
     fi
-    sql master -h -1 -Q "SET NOCOUNT ON; ALTER DATABASE POSMAIN SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE POSMAIN;" \
-        || fail "dropping POSMAIN"
-    echo "POSMAIN dropped."
+    # WITH (FORCE) closes the connections still open to it, the API's included.
+    pg postgres -c "DROP DATABASE $DB WITH (FORCE);" || fail "dropping $DB"
+    echo "$DB dropped."
     echo
     STATE=missing; CREATED=1
 }
 
-adopt() {
-    # Adopting is only honest if the schema really is the final one. The two
-    # newest old migrations each left a parameter only they add.
-    local final
-    final="$(scalar POSMAIN "SELECT CASE WHEN OBJECT_DEFINITION(OBJECT_ID(N'sales.usp_CommitSale')) LIKE N'%@CashDueH%' AND OBJECT_DEFINITION(OBJECT_ID(N'core.usp_RegisterBusiness')) LIKE N'%@PasswordHash%' AND COL_LENGTH(N'sales.Sale', N'OrderType') IS NOT NULL THEN 1 ELSE 0 END;")"
-    if [ "$final" != "1" ]; then
-        echo "Cannot adopt: this database stopped before the last old migration"
-        echo "(42 or 43 is missing), so its schema does not match 001."
-        echo "Use --recreate to rebuild it."
-        exit 1
-    fi
-    if [ -n "$DRYRUN" ]; then
-        echo "Would record 001 and 002 as already applied."
-        ADOPTING=1
-        return
-    fi
-    ensure_tracking || fail "creating dbo.SchemaMigration"
-    sql POSMAIN -h -1 -Q "SET NOCOUNT ON; INSERT INTO dbo.SchemaMigration (FileName, Baselined) SELECT v.f, 1 FROM (VALUES (N'001-baseline-schema.sql'), (N'002-reference-data.sql')) AS v (f) WHERE NOT EXISTS (SELECT 1 FROM dbo.SchemaMigration WHERE FileName = v.f);" >/dev/null \
-        || fail "recording the adoption"
-    echo "Adopted: 001 and 002 recorded as already applied."
-    echo
-}
-
 if [ -n "$RECREATE" ] && [ "$STATE" != "missing" ]; then
     recreate
-elif [ "$STATE" = "legacy" ]; then
-    if [ -n "$ADOPT" ]; then
-        adopt
-    else
-        echo "POSMAIN was built by the old migration files (11-43), which 001 and 002"
-        echo "replaced. Choose one:"
-        echo
-        echo "  --adopt     the database has every old migration applied (through 43)."
-        echo "              Its schema already matches 001; it is recorded as such."
-        echo "  --recreate  DROP the database and build it again. Use this when an old"
-        echo "              migration failed part-way, or the data is only test data."
-        exit 1
-    fi
+elif [ "$STATE" = "untracked" ]; then
+    echo "$DB has a POS schema but no dbo.SchemaMigration, so nothing records which"
+    echo "files built it. It was not made by these files (or by the API)."
+    echo
+    echo "  --recreate  DROP the database and build it again. Use this when the data"
+    echo "              is only test data."
+    exit 1
 fi
 
 [ "$STATE" = "missing" ] || [ "$STATE" = "empty" ] && CREATED=1
 
 if [ -n "$DEMO" ] && [ -z "$CREATED" ]; then
-    echo "--demo only loads into a database this run creates. POSMAIN already"
+    echo "--demo only loads into a database this run creates. $DB already"
     echo "exists; add --recreate to rebuild it with the demo data."
     exit 2
+fi
+
+if [ "$STATE" = "missing" ]; then
+    if [ -n "$DRYRUN" ]; then
+        echo "Would create $DB (UTF8)."
+    else
+        # UTF-8 whatever the server's default; template0 because template1 may
+        # carry another encoding or objects someone added to it.
+        pg postgres -c "CREATE DATABASE $DB ENCODING 'UTF8' TEMPLATE template0;" || fail "creating $DB"
+        echo "Created $DB."
+    fi
+    echo
 fi
 
 # ------------------------------------------------------------------ migrations
@@ -250,25 +253,26 @@ files=()
 for path in "$MIG"/[0-9][0-9][0-9]-*.sql; do files+=("$(basename "$path")"); done
 IFS=$'\n' files=($(printf '%s\n' "${files[@]}" | LC_ALL=C sort)); unset IFS
 
+# What has already run (nothing, on a database this run creates).
+applied=""
+if [ "$STATE" = "tracked" ]; then
+    applied="$(pg "$DB" -At -c "SELECT FileName FROM dbo.SchemaMigration;")" \
+        || fail "reading dbo.SchemaMigration"
+fi
+
 for file in "${files[@]}"; do
     prefix="${file:0:3}"
 
     # 999 is the health check, run once at the end.
     [ "$prefix" = "999" ] && continue
 
-    # A dry run of --adopt: these two would be recorded, not run.
-    if [ -n "$ADOPTING" ] && { [ "$prefix" = "001" ] || [ "$prefix" = "002" ]; }; then continue; fi
-
     # 900-998: optional data, only into a database this run created.
     if [ "${prefix:0:1}" = "9" ]; then
         [ -n "$DEMO" ] && [ -n "$CREATED" ] || continue
     fi
 
-    done_count=0
-    if ! { [ -n "$CREATED" ] && [ -n "$DRYRUN" ]; }; then
-        done_count="$(scalar POSMAIN "IF OBJECT_ID(N'dbo.SchemaMigration') IS NULL SELECT 0 ELSE SELECT COUNT(*) FROM dbo.SchemaMigration WHERE FileName = N'$file';")"
-    fi
-    [ "$done_count" = "1" ] && continue
+    # Compared ignoring case, as the ci collation of FileName does.
+    if [ -n "$applied" ] && printf '%s\n' "$applied" | grep -Fxiq -- "$file"; then continue; fi
 
     if [ -n "$DRYRUN" ]; then
         echo "Pending:  $file"
@@ -278,9 +282,6 @@ for file in "${files[@]}"; do
 
     echo "Applying: $file"
     run_file "$file" || fail "$file"
-    ensure_tracking || fail "creating dbo.SchemaMigration"
-    sql POSMAIN -h -1 -Q "SET NOCOUNT ON; INSERT INTO dbo.SchemaMigration (FileName) VALUES (N'$file');" >/dev/null \
-        || { echo "Applied $file but could not record it."; fail "$file"; }
     APPLIED=$((APPLIED + 1))
 done
 
@@ -295,6 +296,8 @@ if [ "$APPLIED" = "0" ]; then echo "The database is up to date."; else echo "App
 if [ -f "$MIG/999-verify-install.sql" ]; then
     echo
     echo "Verifying the install..."
-    run_file "999-verify-install.sql"
+    READONLY=1
+    pg "$DB" -At -f - < "$MIG/999-verify-install.sql"
+    READONLY=""
 fi
 exit 0
