@@ -524,6 +524,7 @@ try
     app.MapAuthEndpoints();
     app.MapCatalogEndpoints();
     app.MapSalesEndpoints();
+    app.MapOfflineSaleEndpoints();
     app.MapReturnEndpoints();
     app.MapCustomerEndpoints();
     app.MapFinanceEndpoints();

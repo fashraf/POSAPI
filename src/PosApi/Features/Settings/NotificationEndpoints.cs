@@ -28,7 +28,10 @@ public static class NotificationEndpoints
      * every request.
      */
     private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(15);
-    private static long _lastRefreshTicks;
+
+    /* Per tenant database: one business refreshing must not hold back the
+       bell of every other business for the next fifteen seconds. */
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> LastRefreshTicks = new();
 
     public static void MapNotificationEndpoints(this IEndpointRouteBuilder app)
     {
@@ -113,10 +116,11 @@ public static class NotificationEndpoints
         Npgsql.NpgsqlConnection connection, ILogger logger, CancellationToken ct)
     {
         var now = DateTime.UtcNow.Ticks;
-        var last = Interlocked.Read(ref _lastRefreshTicks);
+        var key = connection.Database;
+        var last = LastRefreshTicks.GetOrAdd(key, 0);
 
         if (now - last < RefreshInterval.Ticks) return;
-        if (Interlocked.CompareExchange(ref _lastRefreshTicks, now, last) != last) return;
+        if (!LastRefreshTicks.TryUpdate(key, now, last)) return;
 
         try
         {

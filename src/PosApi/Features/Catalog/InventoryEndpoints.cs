@@ -54,7 +54,7 @@ public static class InventoryEndpoints
     /// it with a quantity of zero invites someone to "correct" it.
     /// </summary>
     private static async Task<IResult> LevelsAsync(
-        ISqlConnectionFactory db, string? branchId, string? search,
+        ISqlConnectionFactory db, ICurrentUser current, string? branchId, string? search,
         bool? lowOnly, int page = 1, int pageSize = 25, CancellationToken ct = default)
     {
         var paging = new PageQuery { Page = page <= 0 ? 1 : page, PageSize = pageSize };
@@ -64,7 +64,16 @@ public static class InventoryEndpoints
         const string sql = """
             SELECT COUNT(*)::int
             FROM core.CatalogItem AS i
-            LEFT JOIN inv.StockLevel AS s ON s.ItemId = i.ItemId AND s.BranchId = @BranchId
+            LEFT JOIN (
+                -- One branch's stock, or with no branch, every branch the user
+                -- works at added up. Zero for every item was a lie the dashboard
+                -- and the till both believed.
+                SELECT ItemId, SUM(Quantity) AS Quantity
+                FROM inv.StockLevel
+                WHERE BranchId = @BranchId
+                   OR (@BranchId IS NULL AND (cardinality(@Branches) = 0 OR BranchId = ANY(@Branches)))
+                GROUP BY ItemId
+            ) AS s ON s.ItemId = i.ItemId
             WHERE i.TracksStock AND i.IsActive
               AND (@Search IS NULL OR i.NameAr COLLATE "default" ILIKE '%' || @Search || '%'
                                    OR i.NameEn COLLATE "default" ILIKE '%' || @Search || '%')
@@ -79,7 +88,16 @@ public static class InventoryEndpoints
                      WHEN COALESCE(s.Quantity, 0) <= i.ReorderLevel THEN 'low'
                      ELSE 'ok' END AS StockStatus
             FROM core.CatalogItem AS i
-            LEFT JOIN inv.StockLevel AS s ON s.ItemId = i.ItemId AND s.BranchId = @BranchId
+            LEFT JOIN (
+                -- One branch's stock, or with no branch, every branch the user
+                -- works at added up. Zero for every item was a lie the dashboard
+                -- and the till both believed.
+                SELECT ItemId, SUM(Quantity) AS Quantity
+                FROM inv.StockLevel
+                WHERE BranchId = @BranchId
+                   OR (@BranchId IS NULL AND (cardinality(@Branches) = 0 OR BranchId = ANY(@Branches)))
+                GROUP BY ItemId
+            ) AS s ON s.ItemId = i.ItemId
             WHERE i.TracksStock AND i.IsActive
               AND (@Search IS NULL OR i.NameAr COLLATE "default" ILIKE '%' || @Search || '%'
                                    OR i.NameEn COLLATE "default" ILIKE '%' || @Search || '%')
@@ -92,6 +110,7 @@ public static class InventoryEndpoints
             new
             {
                 BranchId = branchId,
+                Branches = current.BranchIds.ToArray(),
                 Search = string.IsNullOrWhiteSpace(search) ? null : search.Trim(),
                 LowOnly = lowOnly ?? false,
                 paging.Offset,

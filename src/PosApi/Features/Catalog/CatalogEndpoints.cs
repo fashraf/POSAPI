@@ -99,6 +99,9 @@ public sealed record SavePrintGroupRequest(
 
 public static class CatalogEndpoints
 {
+    /// <summary>1,000,000.00 SAR: the most an item may cost or sell for.</summary>
+    private const long MaxAmountH = 100_000_000;
+
     public static void MapCatalogEndpoints(this IEndpointRouteBuilder app)
     {
         var group = app.MapGroup("/api/catalog")
@@ -150,10 +153,12 @@ public static class CatalogEndpoints
     ///
     /// Stock is joined per branch, because a product exists once for the
     /// business but its quantity is physical and belongs where the shelf is.
+    /// Without a branch it is the total over the branches the user works at.
     /// </summary>
     private static async Task<IResult> ListAsync(
         ISqlConnectionFactory db,
         ILanguageContext language,
+        ICurrentUser current,
         string? search,
         string? categoryId,
         string? kind,
@@ -189,8 +194,16 @@ public static class CatalogEndpoints
                 i.TracksStock, i.ReorderLevel, i.RequiresPreparation, i.IsActive,
                 COALESCE(s.Quantity, 0) AS Quantity
             FROM core.CatalogItem AS i
-            LEFT JOIN inv.StockLevel AS s
-                   ON s.ItemId = i.ItemId AND s.BranchId = @BranchId
+            LEFT JOIN (
+                -- One branch's stock, or with no branch, every branch the user
+                -- works at added up. Zero for every item was a lie the dashboard
+                -- and the till both believed.
+                SELECT ItemId, SUM(Quantity) AS Quantity
+                FROM inv.StockLevel
+                WHERE BranchId = @BranchId
+                   OR (@BranchId IS NULL AND (cardinality(@Branches) = 0 OR BranchId = ANY(@Branches)))
+                GROUP BY ItemId
+            ) AS s ON s.ItemId = i.ItemId
             WHERE (@Search IS NULL
                    OR i.NameAr  COLLATE "default" ILIKE '%' || @Search || '%'
                    OR i.NameEn  COLLATE "default" ILIKE '%' || @Search || '%'
@@ -211,6 +224,7 @@ public static class CatalogEndpoints
                 CategoryId = categoryId,
                 Kind = kind,
                 BranchId = branchId,
+                Branches = current.BranchIds.ToArray(),
                 ActiveOnly = activeOnly ?? true,
                 // An explicit status filter ("active" or "inactive") wins over
                 // activeOnly, which the POS grid relies on defaulting to true.
@@ -312,6 +326,20 @@ public static class CatalogEndpoints
             return ProcErrors.Field("sku", "A product needs a SKU.", "المنتج يحتاج إلى رمز SKU.");
         }
 
+        /* A million riyals is beyond anything a shop sells; above it is a typo
+           (the database refuses it too: CK_CatalogItem_PriceLimit). */
+        if (request.PriceH > MaxAmountH)
+        {
+            return ProcErrors.Field("priceH", "The price cannot be more than 1,000,000.00 SAR.",
+                "لا يمكن أن يتجاوز السعر 1,000,000.00 ر.س.");
+        }
+
+        if (request.CostH > MaxAmountH)
+        {
+            return ProcErrors.Field("costH", "The cost cannot be more than 1,000,000.00 SAR.",
+                "لا يمكن أن تتجاوز التكلفة 1,000,000.00 ر.س.");
+        }
+
         await using var connection = db.Create();
 
         string savedId;
@@ -399,11 +427,19 @@ public static class CatalogEndpoints
                 i.TracksStock, i.ReorderLevel, i.RequiresPreparation, i.IsActive,
                 COALESCE(s.Quantity, 0) AS Quantity
             FROM core.CatalogItem AS i
-            LEFT JOIN inv.StockLevel AS s
-                   ON s.ItemId = i.ItemId AND s.BranchId = @BranchId
+            LEFT JOIN (
+                -- One branch's stock, or with no branch, every branch the user
+                -- works at added up. Zero for every item was a lie the dashboard
+                -- and the till both believed.
+                SELECT ItemId, SUM(Quantity) AS Quantity
+                FROM inv.StockLevel
+                WHERE BranchId = @BranchId
+                   OR (@BranchId IS NULL AND (cardinality(@Branches) = 0 OR BranchId = ANY(@Branches)))
+                GROUP BY ItemId
+            ) AS s ON s.ItemId = i.ItemId
             WHERE i.ItemId = @ItemId;
             """,
-            new { ItemId = itemId, BranchId = branchId },
+            new { ItemId = itemId, BranchId = branchId, Branches = Array.Empty<string>() },
             cancellationToken: ct));
 
     private static CatalogItemDto ToDto(ItemRow r, ILanguageContext language) => new(

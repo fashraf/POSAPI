@@ -96,10 +96,37 @@ public static class SalesEndpoints
         ILogger<Program> logger,
         CancellationToken ct)
     {
-        if (request.Lines.Count == 0)
+        if (request.Lines is null || request.Lines.Count == 0)
         {
             return Results.BadRequest(ApiError.Create(
-                "empty_basket", "Add something to the sale first.", "أضف أصنافًا إلى الفاتورة أولًا."));
+                "empty_basket", "Add something to the sale first.", "أضف أصنافًا إلى الفاتورة أولًا.",
+                new Dictionary<string, string[]> { ["lines"] = ["Add at least one item."] }));
+        }
+
+        /* Checked here rather than left to the database: an unknown method or
+           a missing branch used to reach a constraint and come back as a 500,
+           which tells the till nothing it can show. */
+        if (string.IsNullOrWhiteSpace(request.BranchId))
+        {
+            return Results.UnprocessableEntity(ApiError.Create(
+                "branch_required", "Choose the branch for this sale.", "اختر فرع الفاتورة.",
+                new Dictionary<string, string[]> { ["branchId"] = ["Required."] }));
+        }
+
+        if (request.Lines.Any(l => l is null || string.IsNullOrWhiteSpace(l.ItemId)))
+        {
+            return Results.UnprocessableEntity(ApiError.Create(
+                "unknown_item", "Every line needs an item.", "كل سطر يحتاج إلى صنف.",
+                new Dictionary<string, string[]> { ["lines"] = ["Every line needs an item."] }));
+        }
+
+        if ((request.Payments ?? []).Any(p => p is null || p.Method is not ("cash" or "card" or "bank" or "credit") || p.AmountH < 0))
+        {
+            return Results.UnprocessableEntity(ApiError.Create(
+                "bad_payment",
+                "A payment is cash, card, bank or credit, with an amount of zero or more.",
+                "طريقة الدفع: نقدًا أو بطاقة أو تحويل أو آجل، بمبلغ صفر أو أكثر.",
+                new Dictionary<string, string[]> { ["payments"] = ["Unknown payment method or negative amount."] }));
         }
 
         // A cashier must not post a sale to a branch they do not work at.
@@ -137,51 +164,15 @@ public static class SalesEndpoints
             }
         }
 
-        var lines = request.Lines.Select(line => new
-        {
-            line.ItemId, line.Quantity, line.UnitPriceH, line.LineDiscountH, line.Note
-        });
-
-        var payments = request.Payments.Select(payment => new
-        {
-            payment.Method, payment.AmountH, payment.Reference
-        });
-
         await using var connection = db.Create();
 
         string saleId, invoiceNumber;
 
         try
         {
-            (saleId, invoiceNumber) = await connection.QuerySingleAsync<(string, string)>(new CommandDefinition(
-                """
-                SELECT SaleId, InvoiceNumber FROM sales.usp_CommitSale(
-                    p_BranchId => @BranchId, p_CustomerId => @CustomerId,
-                    p_ServedByUserId => @ServedByUserId, p_CashierName => @CashierName,
-                    p_DiscountId => @DiscountId, p_DiscountH => @DiscountH, p_TenderedH => @TenderedH,
-                    p_IdempotencyKey => @IdempotencyKey, p_ApprovedByUserId => @ApprovedByUserId,
-                    p_OrderType => @OrderType, p_CashierUserId => @CashierUserId,
-                    p_OverrideReason => @OverrideReason,
-                    p_Lines => @Lines::jsonb, p_Payments => @Payments::jsonb);
-                """,
-                new
-                {
-                    request.BranchId,
-                    request.CustomerId,
-                    request.ServedByUserId,
-                    CashierName = current.Username,
-                    request.DiscountId,
-                    request.DiscountH,
-                    request.TenderedH,
-                    request.IdempotencyKey,
-                    ApprovedByUserId = approverId,
-                    OrderType = ProcErrors.Blank(request.OrderType)?.ToLowerInvariant(),
-                    CashierUserId = current.UserId,
-                    OverrideReason = ProcErrors.Blank(request.OverrideReason),
-                    Lines = DbList.Json(lines),
-                    Payments = DbList.Json(payments)
-                },
-                cancellationToken: ct));
+            (saleId, invoiceNumber) = await CommitSaleAsync(
+                connection, null, request, current.Username, current.UserId, approverId,
+                forcedByUserId: null, forceReason: null, ct);
         }
         catch (PostgresException ex) when (ex.ErrorNumber() is (>= 52000 and < 53000) or 63050 or 63051)
         {
@@ -195,6 +186,66 @@ public static class SalesEndpoints
         logger.LogInformation("Sale {Invoice} committed at {Branch}.", invoiceNumber, request.BranchId);
 
         return Results.Created($"/api/sales/{saleId}", new { saleId, invoiceNumber });
+    }
+
+    /// <summary>
+    /// One call to sales.usp_CommitSale — for the till, and for a manager
+    /// posting an offline sale the server refused (forcedByUserId set).
+    /// </summary>
+    internal static async Task<(string SaleId, string InvoiceNumber)> CommitSaleAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction? transaction,
+        CommitSaleRequest request,
+        string cashierName,
+        string? cashierUserId,
+        string? approverId,
+        string? forcedByUserId,
+        string? forceReason,
+        CancellationToken ct)
+    {
+        var lines = request.Lines.Select(line => new
+        {
+            line.ItemId, line.Quantity, line.UnitPriceH, line.LineDiscountH, line.Note
+        });
+
+        var payments = (request.Payments ?? []).Select(payment => new
+        {
+            payment.Method, payment.AmountH, payment.Reference
+        });
+
+        return await connection.QuerySingleAsync<(string, string)>(new CommandDefinition(
+            """
+            SELECT SaleId, InvoiceNumber FROM sales.usp_CommitSale(
+                p_BranchId => @BranchId, p_CustomerId => @CustomerId,
+                p_ServedByUserId => @ServedByUserId, p_CashierName => @CashierName,
+                p_DiscountId => @DiscountId, p_DiscountH => @DiscountH, p_TenderedH => @TenderedH,
+                p_IdempotencyKey => @IdempotencyKey, p_ApprovedByUserId => @ApprovedByUserId,
+                p_OrderType => @OrderType, p_CashierUserId => @CashierUserId,
+                p_OverrideReason => @OverrideReason,
+                p_Lines => @Lines::jsonb, p_Payments => @Payments::jsonb,
+                p_ForcedByUserId => @ForcedByUserId, p_ForceReason => @ForceReason);
+            """,
+            new
+            {
+                request.BranchId,
+                request.CustomerId,
+                request.ServedByUserId,
+                CashierName = cashierName,
+                request.DiscountId,
+                request.DiscountH,
+                request.TenderedH,
+                request.IdempotencyKey,
+                ApprovedByUserId = approverId,
+                OrderType = ProcErrors.Blank(request.OrderType)?.ToLowerInvariant(),
+                CashierUserId = cashierUserId,
+                OverrideReason = ProcErrors.Blank(request.OverrideReason),
+                Lines = DbList.Json(lines),
+                Payments = DbList.Json(payments),
+                ForcedByUserId = forcedByUserId,
+                ForceReason = forceReason
+            },
+            transaction,
+            cancellationToken: ct));
     }
 
     /// <summary>
@@ -232,9 +283,15 @@ public static class SalesEndpoints
 
         await using var connection = db.Create();
 
-        /* The window ends now (whole seconds, as DATETIME2(0) kept it). */
+        /* The window ends now (whole seconds) and starts at midnight in Riyadh:
+           days=1 is today so far, days=7 is today and the six days before.
+           The previous period is the same length immediately before it, so
+           "today so far" is compared with "yesterday up to the same hour's
+           length" rather than with an empty day. */
         var now = DateTime.UtcNow;
         now = now.AddTicks(-(now.Ticks % TimeSpan.TicksPerSecond));
+        var start = BusinessDay.StartUtc(now, window - 1);
+        var prevStart = start - (now - start);
 
         await using var multi = await connection.QueryMultipleNamedAsync(new CommandDefinition(
             """
@@ -294,16 +351,16 @@ public static class SalesEndpoints
             JOIN Returned AS r ON r.Prev = s.Prev
             ORDER BY s.Prev;
 
-            -- 3. Daily totals, net of the refunds issued that day.
+            -- 3. Daily totals by Riyadh date, net of the refunds issued that day.
             SELECT Date, SUM(AmountH)::bigint AS SalesH
             FROM (
-                SELECT s.SoldAtUtc::date AS Date, s.TotalH AS AmountH
+                SELECT (s.SoldAtUtc + make_interval(mins => @Offset))::date AS Date, s.TotalH AS AmountH
                 FROM sales.Sale AS s
                 WHERE s.Status <> 'voided'
                   AND s.SoldAtUtc >= @Start
                   AND (@BranchId IS NULL OR s.BranchId = @BranchId)
                 UNION ALL
-                SELECT r.ReturnedAtUtc::date, -r.RefundH
+                SELECT (r.ReturnedAtUtc + make_interval(mins => @Offset))::date, -r.RefundH
                 FROM sales.SaleReturn AS r
                 WHERE r.ReturnedAtUtc >= @Start
                   AND (@BranchId IS NULL OR r.BranchId = @BranchId)
@@ -351,8 +408,9 @@ public static class SalesEndpoints
             new
             {
                 Now = now,
-                Start = now.AddDays(-window),
-                PrevStart = now.AddDays(-(window * 2)),
+                Start = start,
+                PrevStart = prevStart,
+                Offset = BusinessDay.OffsetMinutes(now),
                 BranchId = branchId
             },
             cancellationToken: ct));
@@ -619,6 +677,13 @@ public static class SalesEndpoints
             "Customer not found.", "العميل غير موجود."),
         52022 => ApiError.Create("over_collection",
             "That is more than this customer owes.", "المبلغ أكبر مما على العميل."),
+        52008 => ApiError.Create("quantity_too_large",
+            "A quantity cannot be more than 100,000.",
+            "لا يمكن أن تتجاوز الكمية 100,000.",
+            new Dictionary<string, string[]> { ["lines"] = ["A quantity cannot be more than 100,000."] }),
+        52050 => ApiError.Create("drawer_closed",
+            "The cash drawer is closed. Open the drawer before taking cash, or take card payment.",
+            "درج النقدية مغلق. افتح الدرج قبل استلام النقد، أو ادفع بالبطاقة."),
         52030 => ApiError.Create("bad_order_type",
             "Order type is dine_in, takeaway, delivery or other.",
             "نوع الطلب: محلي أو سفري أو توصيل أو أخرى."),
