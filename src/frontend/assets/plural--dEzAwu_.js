@@ -1,1 +1,0 @@
-import{a as u,r as c,f as l}from"./index-BmfPohFv.js";const f=["zero","one","two","few","many","other"];function b(){const{language:e,t}=u();return c.useCallback((n,o)=>{const r=new Intl.PluralRules(e==="ar"?"ar":"en").select(o),a=f.includes(r)?r:"other",s=`counts.${n}.${a}`;return t(s,{count:l(o,{language:e})})},[e,t])}export{b as u};

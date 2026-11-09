@@ -23,6 +23,11 @@ public static class CashEndpoints
         group.MapGet("/drawer/current", CurrentDrawerAsync)
              .RequireAuthorization(PermissionPolicy.For("pos.open_drawer"));
 
+        /* Open or closed, nothing else: a cashier's till needs to know before
+           it takes cash offline, but not the drawer's figures. */
+        group.MapGet("/drawer/status", DrawerStatusAsync)
+             .RequireAuthorization(PermissionPolicy.For("pos.create_sale"));
+
         group.MapGet("/drawer/{sessionId}/expectation", ExpectationAsync)
              .RequireAuthorization(PermissionPolicy.For("pos.open_drawer"));
 
@@ -46,6 +51,28 @@ public static class CashEndpoints
 
         group.MapPost("/settlements", RecordSettlementAsync)
              .RequireAuthorization(PermissionPolicy.For("finance.expenses"));
+    }
+
+    /// <summary>
+    /// Whether the branch has an open drawer, by the same rule usp_CommitSale
+    /// applies to cash (a drawer for the branch, or one with no branch).
+    /// </summary>
+    private static async Task<IResult> DrawerStatusAsync(
+        ISqlConnectionFactory db, string? branchId, CancellationToken ct)
+    {
+        await using var connection = db.Create();
+
+        var open = await connection.ExecuteScalarAsync<bool>(new CommandDefinition(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM fin.DrawerSession
+                WHERE ClosedAtUtc IS NULL
+                  AND (@BranchId IS NULL OR BranchId = @BranchId OR BranchId IS NULL));
+            """,
+            new { BranchId = string.IsNullOrWhiteSpace(branchId) ? null : branchId },
+            cancellationToken: ct));
+
+        return Results.Ok(new { open });
     }
 
     private static async Task<IResult> CurrentDrawerAsync(
