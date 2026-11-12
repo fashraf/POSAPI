@@ -51,7 +51,14 @@ public sealed record CommitSaleRequest(
      * pos.override_price (the cashier, or ApprovedByUserId with their
      * password). Recorded on the sale. Leave null for an ordinary sale.
      */
-    string? OverrideReason = null);
+    string? OverrideReason = null,
+    /*
+     * A sale the till took offline and is sending now: the till's clock when
+     * the customer paid. Stored beside the invoice's own time (SoldAtUtc,
+     * the moment the server issues it), never instead of it. Ignored when it
+     * is in the future or more than 30 days old: a till's clock can be wrong.
+     */
+    DateTime? TakenAt = null);
 
 public sealed record VoidSaleRequest(string Reason);
 
@@ -213,7 +220,7 @@ public static class SalesEndpoints
             payment.Method, payment.AmountH, payment.Reference
         });
 
-        return await connection.QuerySingleAsync<(string, string)>(new CommandDefinition(
+        var result = await connection.QuerySingleAsync<(string, string)>(new CommandDefinition(
             """
             SELECT SaleId, InvoiceNumber FROM sales.usp_CommitSale(
                 p_BranchId => @BranchId, p_CustomerId => @CustomerId,
@@ -246,6 +253,37 @@ public static class SalesEndpoints
             },
             transaction,
             cancellationToken: ct));
+
+        /* An offline sale: keep when the till took it. Only once — a replay
+           returns the original sale and must not move its time. */
+        var takenAt = TakenAtOrNull(request.TakenAt);
+        if (takenAt is not null)
+        {
+            await connection.ExecuteAsync(new CommandDefinition(
+                "UPDATE sales.Sale SET TakenAtUtc = @TakenAt WHERE SaleId = @SaleId AND TakenAtUtc IS NULL;",
+                new { TakenAt = takenAt, SaleId = result.Item1 },
+                transaction,
+                cancellationToken: ct));
+        }
+
+        return result;
+    }
+
+    /// <summary>The till's time for an offline sale, in UTC; null when it cannot be right.</summary>
+    internal static DateTime? TakenAtOrNull(DateTime? takenAt)
+    {
+        if (takenAt is not { } value) return null;
+        var utc = value.Kind switch
+        {
+            DateTimeKind.Utc => value,
+            DateTimeKind.Local => value.ToUniversalTime(),
+            _ => DateTime.SpecifyKind(value, DateTimeKind.Utc),
+        };
+        var now = DateTime.UtcNow;
+        if (utc > now.AddMinutes(5) || utc < now.AddDays(-30)) return null;
+        /* Within a few seconds of now it was not really offline: nothing to keep. */
+        if (utc > now.AddSeconds(-30)) return null;
+        return DateTime.SpecifyKind(utc, DateTimeKind.Unspecified);
     }
 
     /// <summary>
