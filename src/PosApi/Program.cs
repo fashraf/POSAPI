@@ -18,6 +18,7 @@ using PosApi.Features.Access;
 using PosApi.Features.Catalog;
 using PosApi.Features.Devices;
 using PosApi.Features.Finance;
+using PosApi.Features.Zatca;
 using PosApi.Features.Sales;
 using PosApi.Features.Settings;
 using PosApi.Features.SuperAdmin;
@@ -200,6 +201,13 @@ try
     builder.Services.AddHostedService(sp => sp.GetRequiredService<TenantMigrationService>());
     builder.Services.AddSingleton<TenantSnapshotService>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<TenantSnapshotService>());
+    /* ZATCA Phase 2: the key vault, the signer and the sweeper that signs what
+       a failed signing left behind (Features/Zatca). */
+    builder.Services.AddSingleton<ZatcaVault>();
+    builder.Services.AddSingleton<ZatcaIssuer>();
+    builder.Services.AddHostedService<ZatcaSigningService>();
+    builder.Services.AddHttpClient<ZatcaGateway>().ConfigurePrimaryHttpMessageHandler(ZatcaGateway.Handler);
+    builder.Services.AddTransient<ZatcaOnboarding>();
     builder.Services.AddScoped<ITenantContext, TenantContext>();
     builder.Services.AddScoped<TenantGate>();
     builder.Services.AddScoped<ISqlConnectionFactory, SqlConnectionFactory>();
@@ -549,6 +557,8 @@ try
     app.MapAuditEndpoints();
     app.MapSearchEndpoints();
     app.MapStocktakeEndpoints();
+    app.MapZatcaEndpoints();
+    app.MapZatcaOnboardingEndpoints();
 
     /* The SaaS console: /api/superadmin, and its app at /admin. */
     app.MapAdminAuthEndpoints();

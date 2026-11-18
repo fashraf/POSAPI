@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <!-- A stand-in for ZATCA's gateway, for development and tests only.
+       Run: dotnet run - -urls http://127.0.0.1:5099  (then Zatca:GatewayBaseUrl=http://127.0.0.1:5099) -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\PosApi\PosApi.csproj" />
+  </ItemGroup>
+</Project>

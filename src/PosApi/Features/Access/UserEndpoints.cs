@@ -247,6 +247,12 @@ public static partial class UserEndpoints
         if (email is not null && !EmailPattern().IsMatch(email))
             fieldErrors["email"] = ["Enter a valid email address."];
 
+        if (string.IsNullOrWhiteSpace(request.FirstName))
+            fieldErrors["firstName"] = ["First name is required."];
+
+        if (string.IsNullOrWhiteSpace(request.LastName))
+            fieldErrors["lastName"] = ["Last name is required."];
+
         if (string.IsNullOrWhiteSpace(request.NameAr))
             fieldErrors["nameAr"] = ["Arabic name is required."];
 

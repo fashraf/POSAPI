@@ -417,11 +417,36 @@ public static class PayrollEndpoints
         return Results.NoContent();
     }
 
+    /* Journal kinds owned by a source workflow; never reversed from the ledger. */
+    private static readonly HashSet<string> SourceOwnedKinds =
+        new(StringComparer.OrdinalIgnoreCase) { "sale", "return", "void", "expense", "expense_recognition" };
+
     private static async Task<IResult> ReverseEntryAsync(
         string entryId, ReverseRequest request, ISqlConnectionFactory db,
         ICurrentUser current, CancellationToken ct)
     {
         await using var connection = db.Create();
+
+        /*
+         * An entry a sale, return or expense posted is undone through that
+         * record (void or return the sale, reverse the expense), which also
+         * puts back stock, the invoice's status and the customer's balance.
+         * Reversing only the journal here would leave those behind.
+         */
+        var kind = await connection.QuerySingleOrDefaultAsync<string?>(new CommandDefinition(
+            "SELECT Kind FROM fin.JournalEntry WHERE EntryId = @EntryId;",
+            new { EntryId = entryId }, cancellationToken: ct));
+
+        if (kind is not null && SourceOwnedKinds.Contains(kind))
+        {
+            var (en, ar) = kind is "expense" or "expense_recognition"
+                ? ("This entry was posted by an expense. Reverse the expense instead.",
+                   "هذا القيد صادر عن مصروف. اعكس المصروف بدلًا منه.")
+                : ("This entry was posted by a sale or return. Void or return the sale from Sales instead.",
+                   "هذا القيد صادر عن بيع أو مرتجع. ألغِ البيع أو أرجعه من شاشة المبيعات بدلًا منه.");
+            return Results.Json(ApiError.Create("source_owned", en, ar),
+                statusCode: StatusCodes.Status422UnprocessableEntity);
+        }
 
         string newEntryId;
 

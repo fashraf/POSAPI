@@ -9,8 +9,14 @@ using PosApi.Localization;
 
 namespace PosApi.Features.Settings;
 
+/// <summary>
+/// The national address. <c>BuildingNumber</c> and <c>AdditionalNumber</c>
+/// (4 digits each) are what a ZATCA invoice states as the seller's; on save,
+/// either left null keeps what is stored (send "" to clear one).
+/// </summary>
 public sealed record CompanyAddressDto(
-    string Street, string District, string City, string PostalCode, string Country);
+    string Street, string District, string City, string PostalCode, string Country,
+    string? BuildingNumber = null, string? AdditionalNumber = null);
 
 /// <summary>
 /// The business as printed on every invoice.
@@ -213,9 +219,11 @@ public static partial class CompanyEndpoints
 
         await using var connection = db.Create();
 
-        var stored = await connection.QuerySingleOrDefaultAsync<(string? DescriptionAr, string? DescriptionEn)>(
-            new CommandDefinition("SELECT DescriptionAr, DescriptionEn FROM core.Company LIMIT 1;",
-                                  cancellationToken: ct));
+        var stored = await connection.QuerySingleOrDefaultAsync<(string? DescriptionAr, string? DescriptionEn,
+                                                                  string? BuildingNumber, string? AdditionalNumber)>(
+            new CommandDefinition(
+                "SELECT DescriptionAr, DescriptionEn, BuildingNumber, AdditionalNumber FROM core.Company LIMIT 1;",
+                cancellationToken: ct));
 
         /* Only the known platforms, and only those filled in. */
         var social = SocialKeys
@@ -243,6 +251,10 @@ public static partial class CompanyEndpoints
         parameters.Add("@City", ProcErrors.Blank(request.Address?.City));
         parameters.Add("@PostalCode", ProcErrors.Blank(request.Address?.PostalCode));
         parameters.Add("@Country", ProcErrors.Blank(request.Address?.Country));
+        parameters.Add("@BuildingNumber", request.Address?.BuildingNumber is null
+            ? stored.BuildingNumber : ProcErrors.Blank(request.Address.BuildingNumber));
+        parameters.Add("@AdditionalNumber", request.Address?.AdditionalNumber is null
+            ? stored.AdditionalNumber : ProcErrors.Blank(request.Address.AdditionalNumber));
         parameters.Add("@SocialLinks", social.Count == 0 ? null : JsonSerializer.Serialize(social));
 
         try
@@ -256,7 +268,8 @@ public static partial class CompanyEndpoints
                     p_Phone => @Phone, p_Email => @Email, p_Website => @Website,
                     p_Street => @Street, p_District => @District, p_City => @City,
                     p_PostalCode => @PostalCode, p_Country => @Country,
-                    p_SocialLinks => @SocialLinks);
+                    p_SocialLinks => @SocialLinks,
+                    p_BuildingNumber => @BuildingNumber, p_AdditionalNumber => @AdditionalNumber);
                 """,
                 parameters, cancellationToken: ct));
         }
@@ -271,6 +284,8 @@ public static partial class CompanyEndpoints
                     "A Saudi VAT number is 15 digits, starting and ending with 3.",
                     "الرقم الضريبي ١٥ رقمًا يبدأ وينتهي بالرقم ٣."),
                 62002 => ProcErrors.Field("crNumber", "A CR number is 10 digits.", "رقم السجل التجاري ١٠ أرقام."),
+                62005 => ProcErrors.Field("address.buildingNumber", "A building number is 4 digits.", "رقم المبنى ٤ أرقام."),
+                62006 => ProcErrors.Field("address.additionalNumber", "An additional number is 4 digits.", "الرقم الإضافي ٤ أرقام."),
                 _ => ProcErrors.Field("social", "The social links are not valid.", "روابط التواصل غير صالحة.")
             };
         }
@@ -288,7 +303,7 @@ public static partial class CompanyEndpoints
             """
             SELECT NameAr, NameEn, DescriptionAr, DescriptionEn, LogoUrl, CrNumber,
                    VatNumber, Phone, Email, Website, Street, District, City, PostalCode,
-                   Country, SocialLinks, CreatedAtUtc, UpdatedAtUtc
+                   Country, SocialLinks, BuildingNumber, AdditionalNumber, CreatedAtUtc, UpdatedAtUtc
             FROM core.Company ORDER BY CompanyId
             LIMIT 1;
             """,
@@ -314,7 +329,8 @@ public static partial class CompanyEndpoints
             r.Phone ?? string.Empty, r.Email ?? string.Empty, r.Website ?? string.Empty,
             new CompanyAddressDto(r.Street ?? string.Empty, r.District ?? string.Empty,
                                   r.City ?? string.Empty, r.PostalCode ?? string.Empty,
-                                  r.Country ?? string.Empty),
+                                  r.Country ?? string.Empty,
+                                  r.BuildingNumber ?? string.Empty, r.AdditionalNumber ?? string.Empty),
             social, r.CreatedAtUtc, r.UpdatedAtUtc);
     }
 
@@ -590,6 +606,8 @@ public static partial class CompanyEndpoints
         public string? PostalCode { get; init; }
         public string? Country { get; init; }
         public string? SocialLinks { get; init; }
+        public string? BuildingNumber { get; init; }
+        public string? AdditionalNumber { get; init; }
         public DateTime CreatedAtUtc { get; init; }
         public DateTime UpdatedAtUtc { get; init; }
     }

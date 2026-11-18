@@ -21,11 +21,30 @@ public sealed record CustomerInput(
     long CreditLimitH,
     long OpeningBalanceH = 0,
     DateOnly? OpeningAsOf = null,
-    string? BranchId = null);
+    string? BranchId = null,
+    CustomerAddressInput? Address = null);
+
+/// <summary>
+/// A buyer's details for a standard (B2B) tax invoice: the Saudi national
+/// address and, for a buyer without a VAT number, an identifier and its
+/// scheme (CRN, MOM, MLS, 700, SAG, NAT, GCC, IQA, PAS, OTH). All optional;
+/// each is checked for form by core.usp_CheckBuyerDetails.
+/// </summary>
+public sealed record CustomerAddressInput(
+    string? Street,
+    string? BuildingNumber,
+    string? AdditionalNumber,
+    string? District,
+    string? City,
+    string? PostalCode,
+    string? CountryCode,
+    string? BuyerIdScheme,
+    string? BuyerId);
 
 /// <summary>
 /// Edit a customer. The balance is never written here. <c>CustomerType</c>
-/// and <c>Status</c> left null keep what is stored.
+/// and <c>Status</c> left null keep what is stored. <c>Address</c> left null
+/// keeps the stored address; sent, it replaces all of it.
 /// </summary>
 public sealed record UpdateCustomerRequest(
     string NameAr,
@@ -35,7 +54,8 @@ public sealed record UpdateCustomerRequest(
     string? VatNumber,
     string? CustomerType,
     long CreditLimitH,
-    string? Status);
+    string? Status,
+    CustomerAddressInput? Address = null);
 
 public sealed record CollectionRequest(
     long AmountH,
@@ -314,6 +334,9 @@ public static class CustomerEndpoints
                         input.CreditLimitH) is { } invalid)
             return invalid;
 
+        if (CheckAddress(input.Address) is { } badAddress)
+            return badAddress;
+
         if (input.OpeningBalanceH < 0)
             return ProcErrors.Field("openingBalanceH", "An opening balance cannot be negative.",
                 "لا يمكن أن يكون الرصيد الافتتاحي سالبًا.");
@@ -334,9 +357,13 @@ public static class CustomerEndpoints
                     p_NameAr => @NameAr, p_NameEn => @NameEn, p_Phone => @Phone, p_Email => @Email,
                     p_VatNumber => @VatNumber, p_CustomerType => @CustomerType,
                     p_CreditLimitH => @CreditLimitH, p_OpeningBalanceH => @OpeningBalanceH,
-                    p_OpeningAsOf => @OpeningAsOf::date, p_BranchId => @BranchId, p_Actor => @Actor);
+                    p_OpeningAsOf => @OpeningAsOf::date, p_BranchId => @BranchId, p_Actor => @Actor,
+                    p_Street => @Street, p_BuildingNumber => @BuildingNumber,
+                    p_AdditionalNumber => @AdditionalNumber, p_District => @District, p_City => @City,
+                    p_PostalCode => @PostalCode, p_CountryCode => @CountryCode,
+                    p_BuyerIdScheme => @BuyerIdScheme, p_BuyerId => @BuyerId);
                 """,
-                new
+                AddressParameters(input.Address, new
                 {
                     NameAr = input.NameAr.Trim(),
                     NameEn = input.NameEn.Trim(),
@@ -349,10 +376,11 @@ public static class CustomerEndpoints
                     input.OpeningAsOf,
                     BranchId = branchId,
                     Actor = current.Username
-                },
+                }),
                 cancellationToken: ct));
         }
-        catch (PostgresException ex) when (MapCustomerError(ex.ErrorNumber(), input.NameAr) is { } mapped)
+        catch (PostgresException ex) when ((MapCustomerError(ex.ErrorNumber(), input.NameAr)
+                                            ?? MapBuyerError(ex.ErrorNumber())) is { } mapped)
         {
             return mapped;
         }
@@ -379,6 +407,10 @@ public static class CustomerEndpoints
             return ProcErrors.Field("nameEn", "The name is too long (160 characters at most).", "الاسم طويل جدًا (160 حرفًا على الأكثر).");
         if (TooLong(phone, 30))
             return ProcErrors.Field("phone", "The phone number is too long (30 characters at most).", "رقم الجوال طويل جدًا (30 حرفًا على الأكثر).");
+        if (!string.IsNullOrWhiteSpace(phone) && !PhoneRules.IsValid(phone))
+            return ProcErrors.Field("phone",
+                "Enter a phone number that can be dialled, e.g. 05XXXXXXXX or +966 5X XXX XXXX.",
+                "أدخل رقم هاتف صحيحًا، مثل 05XXXXXXXX أو +966 5X XXX XXXX.");
         if (TooLong(email, 160))
             return ProcErrors.Field("email", "The email is too long (160 characters at most).", "البريد الإلكتروني طويل جدًا (160 حرفًا على الأكثر).");
         if (TooLong(vatNumber, 15))
@@ -386,6 +418,60 @@ public static class CustomerEndpoints
 
         return null;
     }
+
+    /// <summary>Lengths of the buyer details, which would otherwise fail as a truncation (HTTP 500).</summary>
+    private static IResult? CheckAddress(CustomerAddressInput? address)
+    {
+        if (address is null) return null;
+
+        static bool TooLong(string? value, int max) => value is not null && value.Trim().Length > max;
+
+        if (TooLong(address.Street, 160))
+            return ProcErrors.Field("address.street", "The street is too long (160 characters at most).",
+                "اسم الشارع طويل جدًا (160 حرفًا على الأكثر).");
+        if (TooLong(address.District, 120))
+            return ProcErrors.Field("address.district", "The district is too long (120 characters at most).",
+                "اسم الحي طويل جدًا (120 حرفًا على الأكثر).");
+        if (TooLong(address.City, 120))
+            return ProcErrors.Field("address.city", "The city is too long (120 characters at most).",
+                "اسم المدينة طويل جدًا (120 حرفًا على الأكثر).");
+        if (TooLong(address.BuyerId, 50))
+            return ProcErrors.Field("address.buyerId", "The buyer id is too long (50 characters at most).",
+                "رقم هوية المشتري طويل جدًا (50 حرفًا على الأكثر).");
+
+        return null;
+    }
+
+    /// <summary>The buyer details as named parameters, added to <paramref name="rest"/>.</summary>
+    private static DynamicParameters AddressParameters(CustomerAddressInput? address, object rest)
+    {
+        var parameters = new DynamicParameters(rest);
+        parameters.Add("@Street", ProcErrors.Blank(address?.Street));
+        parameters.Add("@BuildingNumber", ProcErrors.Blank(address?.BuildingNumber));
+        parameters.Add("@AdditionalNumber", ProcErrors.Blank(address?.AdditionalNumber));
+        parameters.Add("@District", ProcErrors.Blank(address?.District));
+        parameters.Add("@City", ProcErrors.Blank(address?.City));
+        parameters.Add("@PostalCode", ProcErrors.Blank(address?.PostalCode));
+        parameters.Add("@CountryCode", ProcErrors.Blank(address?.CountryCode));
+        parameters.Add("@BuyerIdScheme", ProcErrors.Blank(address?.BuyerIdScheme));
+        parameters.Add("@BuyerId", ProcErrors.Blank(address?.BuyerId));
+        return parameters;
+    }
+
+    /* The form checks of core.usp_CheckBuyerDetails (023). */
+    private static IResult? MapBuyerError(int number) => number switch
+    {
+        68010 => ProcErrors.Field("vatNumber", "A Saudi VAT number is 15 digits, starting and ending with 3.",
+            "الرقم الضريبي ١٥ رقمًا يبدأ وينتهي بالرقم ٣."),
+        68011 => ProcErrors.Field("address.buildingNumber", "A building number is 4 digits.", "رقم المبنى ٤ أرقام."),
+        68012 => ProcErrors.Field("address.additionalNumber", "An additional number is 4 digits.", "الرقم الإضافي ٤ أرقام."),
+        68013 => ProcErrors.Field("address.postalCode", "A Saudi postal code is 5 digits.", "الرمز البريدي السعودي ٥ أرقام."),
+        68014 => ProcErrors.Field("address.countryCode", "The country is a two-letter code, such as SA.",
+            "الدولة رمز من حرفين، مثل SA."),
+        68015 => ProcErrors.Field("address.buyerId", "Choose the kind of buyer id and enter its number.",
+            "اختر نوع هوية المشتري وأدخل رقمها."),
+        _ => null
+    };
 
     /* The THROW numbers core.usp_CreateCustomer and core.usp_UpdateCustomer share. */
     private static IResult? MapCustomerError(int number, string? nameAr) => number switch
@@ -529,6 +615,9 @@ public static class CustomerEndpoints
                         request.CreditLimitH) is { } invalid)
             return invalid;
 
+        if (CheckAddress(request.Address) is { } badAddress)
+            return badAddress;
+
         await using var connection = db.Create();
 
         try
@@ -539,9 +628,14 @@ public static class CustomerEndpoints
                     p_CustomerId => @CustomerId, p_NameAr => @NameAr, p_NameEn => @NameEn,
                     p_Phone => @Phone, p_Email => @Email, p_VatNumber => @VatNumber,
                     p_CustomerType => @CustomerType, p_CreditLimitH => @CreditLimitH,
-                    p_IsActive => @IsActive, p_Actor => @Actor);
+                    p_IsActive => @IsActive, p_Actor => @Actor,
+                    p_SetAddress => @SetAddress,
+                    p_Street => @Street, p_BuildingNumber => @BuildingNumber,
+                    p_AdditionalNumber => @AdditionalNumber, p_District => @District, p_City => @City,
+                    p_PostalCode => @PostalCode, p_CountryCode => @CountryCode,
+                    p_BuyerIdScheme => @BuyerIdScheme, p_BuyerId => @BuyerId);
                 """,
-                new
+                AddressParameters(request.Address, new
                 {
                     CustomerId = customerId,
                     NameAr = request.NameAr?.Trim(),
@@ -552,11 +646,12 @@ public static class CustomerEndpoints
                     CustomerType = ProcErrors.Blank(request.CustomerType),
                     request.CreditLimitH,
                     IsActive = request.Status is null ? (bool?)null : request.Status == "active",
-                    Actor = current.Username
-                },
+                    Actor = current.Username,
+                    SetAddress = request.Address is not null
+                }),
                 cancellationToken: ct));
         }
-        catch (PostgresException ex) when (MapUpdateError(ex, request) is { } mapped)
+        catch (PostgresException ex) when ((MapUpdateError(ex, request) ?? MapBuyerError(ex.ErrorNumber())) is { } mapped)
         {
             return mapped;
         }

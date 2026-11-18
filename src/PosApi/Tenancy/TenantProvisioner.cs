@@ -44,6 +44,10 @@ public sealed record ProvisionRequest
     /// <summary>admin | self-signup.</summary>
     public string Source { get; init; } = "admin";
     public string? RegisteredBy { get; init; }
+
+    /// <summary>Self sign-up: the Terms of Use / Privacy Policy version accepted, and when.</summary>
+    public string? TermsVersion { get; init; }
+    public DateTime? TermsAcceptedAtUtc { get; init; }
 }
 
 public sealed record ProvisionResult(
@@ -127,12 +131,12 @@ public sealed class TenantProvisioner
                     (TenantId, Name, NameAr, BusinessType, City, Country, CrNumber, VatNumber, Email, Phone,
                      DatabaseName, Status, Source, PocName, PocUsername, PocMobile, PocEmail,
                      PaymentMethods, DefaultVat, PricesIncludeVat, ZatcaCertificate, CertificateExpiry,
-                     BranchAddress, Latitude, Longitude, RegisteredBy)
+                     BranchAddress, Latitude, Longitude, RegisteredBy, TermsVersion, TermsAcceptedAtUtc)
                 VALUES
                     (@TenantId, @Name, @NameAr, @BusinessType, @City, @Country, @CrNumber, @VatNumber, @Email, @Phone,
                      @Database, 'provisioning', @Source, @OwnerName, @OwnerUsername, @OwnerPhone, @OwnerEmail,
                      @PaymentMethods, @DefaultVat, @PricesIncludeVat, @Certificate, @CertificateExpiry,
-                     @BranchAddress, @Latitude, @Longitude, @RegisteredBy);
+                     @BranchAddress, @Latitude, @Longitude, @RegisteredBy, @TermsVersion, @TermsAcceptedAtUtc);
                 """,
                 new
                 {
@@ -142,7 +146,8 @@ public sealed class TenantProvisioner
                     request.OwnerName, OwnerUsername = ownerUsername, OwnerPhone = ownerPhone, OwnerEmail = ownerEmail,
                     PaymentMethods = request.PaymentMethods is { Count: > 0 } pm ? string.Join(",", pm) : null,
                     request.DefaultVat, request.PricesIncludeVat, request.Certificate, request.CertificateExpiry,
-                    request.BranchAddress, request.Latitude, request.Longitude, request.RegisteredBy
+                    request.BranchAddress, request.Latitude, request.Longitude, request.RegisteredBy,
+                    request.TermsVersion, request.TermsAcceptedAtUtc
                 }, cancellationToken: ct));
 
             /*------------------------------------------------ its own database */

@@ -5,6 +5,8 @@ using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
+using PosApi.Features.Zatca;
+using PosApi.Tenancy;
 
 namespace PosApi.Features.Sales;
 
@@ -124,6 +126,8 @@ public static class ReturnEndpoints
         ISqlConnectionFactory db,
         ICurrentUser current,
         HttpContext http,
+        ZatcaIssuer zatca,
+        ITenantContext tenant,
         ILogger<Program> logger,
         CancellationToken ct)
     {
@@ -180,6 +184,10 @@ public static class ReturnEndpoints
         logger.LogInformation("Credit note {NoteNumber} issued against {SaleId} by {Actor}.",
             noteNumber, saleId, current.Username);
         http.Items["AuditEntityId"] = returnId;
+
+        /* The credit note joins the branch's ZATCA chain (retried in the
+           background if this fails). */
+        await zatca.TrySignReturnAsync(connection, tenant.Tenant!.TenantId, returnId, ct);
 
         var note = (await LoadAsync(connection, saleId, returnId, ct)).Single();
 

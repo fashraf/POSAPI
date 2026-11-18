@@ -3,6 +3,8 @@ using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
+using PosApi.Features.Zatca;
+using PosApi.Tenancy;
 
 namespace PosApi.Features.Sales;
 
@@ -100,6 +102,8 @@ public static class SalesEndpoints
         ISqlConnectionFactory db,
         ICurrentUser current,
         IPasswordHasher hasher,
+        ZatcaIssuer zatca,
+        ITenantContext tenant,
         ILogger<Program> logger,
         CancellationToken ct)
     {
@@ -191,6 +195,10 @@ public static class SalesEndpoints
         }
 
         logger.LogInformation("Sale {Invoice} committed at {Branch}.", invoiceNumber, request.BranchId);
+
+        /* Signed now, so the receipt the till fetches next carries the ZATCA
+           QR. The sale stands either way; a failure is retried in the background. */
+        await zatca.TrySignSaleAsync(connection, tenant.Tenant!.TenantId, saleId, ct);
 
         return Results.Created($"/api/sales/{saleId}", new { saleId, invoiceNumber });
     }
@@ -709,6 +717,9 @@ public static class SalesEndpoints
             "This sale is already voided.", "هذه الفاتورة ملغاة مسبقًا."),
         52012 => ApiError.Create("reason_required",
             "A void needs a reason.", "الإلغاء يحتاج إلى سبب."),
+        52013 => ApiError.Create("invoice_issued",
+            "This invoice has been issued to ZATCA and cannot be voided. Return the items instead (a credit note).",
+            "صدرت هذه الفاتورة إلى هيئة الزكاة والضريبة والجمارك ولا يمكن إلغاؤها. أرجع الأصناف بدلًا من ذلك (إشعار دائن)."),
         52020 => ApiError.Create("bad_amount",
             "The amount must be above zero.", "يجب أن يكون المبلغ أكبر من صفر."),
         52021 => ApiError.Create("customer_not_found",

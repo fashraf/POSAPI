@@ -37,7 +37,10 @@ public sealed record RegistrationTax(
 public sealed record RegisterRequest(
     RegistrationOwner Owner,
     RegistrationBusiness Business,
-    RegistrationTax Tax);
+    RegistrationTax Tax,
+    /* The Terms of Use and Privacy Policy, ticked on the review step. */
+    bool AcceptedTerms = false,
+    string? TermsVersion = null);
 public sealed record OtpRequest(string ChallengeId, string Code);
 public sealed record RefreshRequest(string RefreshToken);
 
@@ -108,6 +111,17 @@ public static class AuthEndpoints
         if (string.IsNullOrWhiteSpace(request.Owner.Email))
             fieldErrors["owner.email"] = ["An email address is required."];
 
+        /* Every business trades under a Commercial Registration, VAT registered
+           or not; only the VAT number and start date depend on VAT. */
+        var crNumber = request.Tax.CrNumber?.Trim();
+        if (string.IsNullOrEmpty(crNumber))
+            fieldErrors["tax.crNumber"] = ["The Commercial Registration number is required."];
+        else if (crNumber.Length != 10 || !crNumber.All(char.IsAsciiDigit))
+            fieldErrors["tax.crNumber"] = ["The Commercial Registration number is 10 digits."];
+
+        if (!request.AcceptedTerms)
+            fieldErrors["acceptedTerms"] = ["Accept the Terms of Use and Privacy Policy to create the account."];
+
         /* In single-password mode the password is the only way in, so an owner
            registered without one would be locked out of their own business. */
         var password = request.Owner.Password;
@@ -151,7 +165,7 @@ public static class AuthEndpoints
                 BusinessType = request.Business.BusinessType,
                 City = request.Business.City,
                 Country = request.Business.Country,
-                CrNumber = request.Tax.IsVatRegistered ? request.Tax.CrNumber : null,
+                CrNumber = crNumber,
                 VatNumber = request.Tax.IsVatRegistered ? request.Tax.VatNumber : null,
                 Email = request.Owner.Email.Trim(),
                 Phone = string.IsNullOrWhiteSpace(request.Owner.Mobile) ? null : request.Owner.Mobile.Trim(),
@@ -165,7 +179,9 @@ public static class AuthEndpoints
                 PlanKey = "Trial",
                 Trial = true,
                 Source = "self-signup",
-                RegisteredBy = ownerName
+                RegisteredBy = ownerName,
+                TermsVersion = string.IsNullOrWhiteSpace(request.TermsVersion) ? null : request.TermsVersion.Trim()[..Math.Min(20, request.TermsVersion.Trim().Length)],
+                TermsAcceptedAtUtc = DateTime.UtcNow
             }, ct);
         }
         catch (ProvisionException ex)

@@ -4,6 +4,8 @@ using Npgsql;
 using PosApi.Auth;
 using PosApi.Common;
 using PosApi.Data;
+using PosApi.Features.Zatca;
+using PosApi.Tenancy;
 
 namespace PosApi.Features.Sales;
 
@@ -302,7 +304,8 @@ public static class OfflineSaleEndpoints
     /// </summary>
     private static async Task<IResult> PostAsync(
         string issueId, ResolveOfflineIssueRequest request,
-        ISqlConnectionFactory db, ICurrentUser current, ILogger<Program> logger, CancellationToken ct)
+        ISqlConnectionFactory db, ICurrentUser current, ZatcaIssuer zatca, ITenantContext tenant,
+        ILogger<Program> logger, CancellationToken ct)
     {
         var reason = ProcErrors.Blank(request.Reason);
         if (reason is null)
@@ -346,6 +349,7 @@ public static class OfflineSaleEndpoints
 
         await tx.CommitAsync(ct);
         await RefreshNotificationsAsync(connection, logger, ct);
+        await zatca.TrySignSaleAsync(connection, tenant.Tenant!.TenantId, saleId, ct);
 
         logger.LogInformation("Offline sale {LocalId} posted by {User} as {Invoice}.", issue.LocalId, current.Username, invoiceNumber);
 

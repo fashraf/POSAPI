@@ -252,6 +252,11 @@ public static partial class VendorEndpoints
         if (request.Status is not (null or "active" or "inactive"))
             return ProcErrors.Field("status", "Status must be active or inactive.", "الحالة إما نشط أو غير نشط.");
 
+        if (!string.IsNullOrWhiteSpace(request.Phone) && !PhoneRules.IsValid(request.Phone))
+            return ProcErrors.Field("phone",
+                "Enter a phone number that can be dialled, e.g. 05XXXXXXXX or +966 1X XXX XXXX.",
+                "أدخل رقم هاتف صحيحًا، مثل 05XXXXXXXX أو +966 1X XXX XXXX.");
+
         var email = ProcErrors.Blank(request.Email);
         if (email is not null && !EmailPattern().IsMatch(email))
             return ProcErrors.Field("email", "Enter a valid email address, or leave it empty.",
