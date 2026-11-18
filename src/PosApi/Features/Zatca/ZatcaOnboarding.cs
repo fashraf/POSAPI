@@ -172,7 +172,9 @@ public sealed class ZatcaOnboarding(
 
         /* 5. the unit goes active */
         using var certificate = Certificate(token);
-        await ActivateAsync(connection, tenantId, branchId, env, certificate, token, secret, keyCt, invoiceTypes, serial, ct);
+        if (await TryActivateAsync(attempt, connection, tenantId, branchId, env, certificate, token, secret, keyCt,
+                                   invoiceTypes, serial, ct) is { } failed)
+            return failed;
 
         logger.LogInformation("ZATCA: branch {Branch} onboarded ({Environment}, {Types}).", branchId, env, invoiceTypes);
         return await attempt.EndAsync("active", null, null, ct);
@@ -240,10 +242,36 @@ public sealed class ZatcaOnboarding(
             return await attempt.EndAsync("failed", Unreachable(renewed), "ZATCA did not renew the certificate.", ct);
 
         using var certificate = Certificate(token);
-        await ActivateAsync(connection, tenantId, branchId, env, certificate, token, secret, keyCt, types, serial, ct);
+        if (await TryActivateAsync(attempt, connection, tenantId, branchId, env, certificate, token, secret, keyCt,
+                                   types, serial, ct) is { } failed)
+            return failed;
 
         logger.LogInformation("ZATCA: branch {Branch} certificate renewed.", branchId);
         return await attempt.EndAsync("active", null, null, ct);
+    }
+
+    /// <summary>
+    /// <see cref="ActivateAsync"/>, recording a failure on the attempt instead
+    /// of leaving it half done. ZATCA has issued the certificate by then, but
+    /// it is unusable without being stored: the owner starts again with a new
+    /// OTP (a stray issued certificate is harmless).
+    /// </summary>
+    private async Task<ZatcaOnboardingResult?> TryActivateAsync(
+        Attempt attempt, NpgsqlConnection connection, string tenantId, string branchId, string env,
+        X509Certificate2 certificate, string token, string secret, string keyCt, string invoiceTypes, string serial,
+        CancellationToken ct)
+    {
+        try
+        {
+            await ActivateAsync(connection, tenantId, branchId, env, certificate, token, secret, keyCt, invoiceTypes, serial, ct);
+            return null;
+        }
+        catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or CryptographicException)
+        {
+            logger.LogError(ex, "ZATCA: the certificate for {Branch} was issued but could not be stored.", branchId);
+            return await attempt.EndAsync("failed", "activation_failed",
+                "ZATCA issued the certificate but it could not be saved. Fix the cause in the server log, then onboard again with a new OTP.", ct);
+        }
     }
 
     /// <summary>
