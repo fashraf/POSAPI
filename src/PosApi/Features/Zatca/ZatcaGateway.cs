@@ -17,6 +17,49 @@ public sealed record ZatcaCallResult(
 
     public string? Text(string property) => Body?[property]?.ToString();
 
+    /// <summary>
+    /// ZATCA's own reason for refusing, as one line: the codes and messages of
+    /// "errors" (strings or objects), "message"/"code" and the validation
+    /// errors. Empty when the answer carries none.
+    /// </summary>
+    public string Reason()
+    {
+        var parts = new List<string>();
+
+        void Add(JsonNode? node)
+        {
+            switch (node)
+            {
+                case JsonArray array:
+                    foreach (var item in array) Add(item);
+                    break;
+                case JsonObject item:
+                    var code = item["code"]?.ToString();
+                    var message = item["message"]?.ToString();
+                    var text = string.Join(": ", new[] { code, message }.Where(t => !string.IsNullOrWhiteSpace(t)));
+                    if (text.Length > 0) parts.Add(text);
+                    break;
+                case JsonValue value when !string.IsNullOrWhiteSpace(value.ToString()):
+                    parts.Add(value.ToString());
+                    break;
+            }
+        }
+
+        Add(Body?["errors"]);
+        Add(Body?["validationResults"]?["errorMessages"]);
+        if (parts.Count == 0 && Body is JsonObject body && (body["message"] is not null || body["code"] is not null)) Add(body);
+        if (parts.Count == 0 && Body?["dispositionMessage"] is { } disposition) Add(disposition);
+
+        return string.Join("; ", parts.Distinct());
+    }
+
+    /// <summary>True when ZATCA names the OTP as the problem (or gives no reason at all, as an OTP refusal often does).</summary>
+    public bool BlamesOtp()
+    {
+        var reason = Reason();
+        return reason.Length == 0 || reason.Contains("OTP", StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>ZATCA's messages, for the record: codes and texts, never a secret.</summary>
     public JsonNode Summary()
     {

@@ -11,7 +11,8 @@
 //   - PATCH /{env}/production/csids      renewal: new CSR, OTP, current CSID
 //   - POST  /{env}/invoices/reporting/single, /clearance/single
 //
-// FAKE_ZATCA_MODE changes one answer for a test: "production-timeout" holds the
+// FAKE_ZATCA_MODE changes one answer for a test: "csr-invalid" refuses the CSR
+// (Invalid-CSR) after a good OTP; "production-timeout" holds the
 // production-CSID call for 60 s; "report-400" rejects every report;
 // "report-500" fails every report; "report-401" refuses the credential.
 using System.Collections.Concurrent;
@@ -100,6 +101,12 @@ app.MapPost("/{env}/compliance", async (HttpRequest request) =>
     var body = await JsonNode.ParseAsync(request.Body);
     if (request.Headers["OTP"] != "123456")
         return Json(400, new JsonObject { ["errors"] = new JsonArray("Invalid-OTP") });
+    if (mode() == "csr-invalid")
+        return Json(400, new JsonObject { ["errors"] = new JsonArray(new JsonObject
+        {
+            ["type"] = "ERROR", ["code"] = "Invalid-CSR", ["category"] = "CSR-Validation",
+            ["message"] = "The provided CSR is invalid: VAT number does not match the taxpayer"
+        }) });
     return Json(200, Issue(body!["csr"]!.ToString(), "compliance"));
 });
 

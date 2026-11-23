@@ -130,8 +130,7 @@ public sealed class ZatcaOnboarding(
         await attempt.StepAsync("compliance_csid", compliance, ct);
 
         if (compliance.Outcome == "response" && compliance.Status == 400)
-            return await attempt.EndAsync("otp_rejected", "otp_rejected",
-                "ZATCA did not accept the OTP or the request. OTPs work once and expire after an hour: create a new one in the Fatoora portal.", ct);
+            return await RefusedAsync(attempt, compliance, ct);
         if (!compliance.Ok || compliance.Text("binarySecurityToken") is not { } complianceToken
             || compliance.Text("secret") is not { } complianceSecret || compliance.Text("requestID") is not { } requestId)
             return await attempt.EndAsync("failed", Unreachable(compliance), "ZATCA did not issue a compliance certificate.", ct);
@@ -233,8 +232,7 @@ public sealed class ZatcaOnboarding(
         await attempt.StepAsync("renew_production_csid", renewed, ct);
 
         if (renewed.Outcome == "response" && renewed.Status == 400)
-            return await attempt.EndAsync("otp_rejected", "otp_rejected",
-                "ZATCA did not accept the OTP or the request. Create a new OTP in the Fatoora portal.", ct);
+            return await RefusedAsync(attempt, renewed, ct);
         if (renewed.Outcome == "timeout")
             return await attempt.EndAsync("fate_unknown", "fate_unknown",
                 "ZATCA did not answer in time. The current certificate stays in use; try again with a new OTP.", ct);
@@ -313,6 +311,26 @@ public sealed class ZatcaOnboarding(
     }
 
     /*---------------------------------------------------------------- parts */
+
+    /// <summary>
+    /// ZATCA answered 400 to the OTP call. That is the OTP (wrong, used, expired,
+    /// or from the other environment's portal) only when ZATCA says so; otherwise
+    /// it refused the request itself (most often a VAT number that is not the
+    /// taxpayer who generated the OTP), and the owner needs ZATCA's own words.
+    /// </summary>
+    private async Task<ZatcaOnboardingResult> RefusedAsync(Attempt attempt, ZatcaCallResult result, CancellationToken ct)
+    {
+        var reason = result.Reason();
+        logger.LogWarning("ZATCA refused onboarding attempt {Attempt} ({Environment}): {Reason}",
+            attempt.Id, Environment, reason.Length == 0 ? "(no reason given)" : reason);
+
+        return result.BlamesOtp()
+            ? await attempt.EndAsync("otp_rejected", "otp_rejected",
+                "ZATCA did not accept the OTP" + (reason.Length > 0 ? $" ({reason})" : "") +
+                ". An OTP works once, expires after an hour, and must come from the portal of this server's environment" +
+                (Environment == "simulation" ? " (the Fatoora Simulation portal)." : "."), ct)
+            : await attempt.EndAsync("failed", "request_rejected", $"ZATCA refused the request: {reason}", ct);
+    }
 
     /// <summary>One attempt at a time per branch, across every API process.</summary>
     private static async Task<IAsyncDisposable> BranchLockAsync(NpgsqlConnection connection, string branchId, CancellationToken ct)
