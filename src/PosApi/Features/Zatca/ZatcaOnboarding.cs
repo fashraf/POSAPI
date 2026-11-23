@@ -104,7 +104,7 @@ public sealed class ZatcaOnboarding(
         using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
         var serial = $"1-Nazad|2-NazadPOS|3-{Guid.NewGuid():D}";
         var csr = ZatcaCsr.Build(new ZatcaCsrSubject(
-            CommonName: $"NZD-{branchId}-{seller!.VatNumber}",
+            CommonName: ZatcaCsr.CommonName(branchId, seller!.VatNumber),
             SerialNumber: serial,
             VatNumber: seller.VatNumber,
             OrganizationUnit: Ascii(branch.NameEn, branch.NameAr),
@@ -212,7 +212,7 @@ public sealed class ZatcaOnboarding(
         using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
         var serial = $"1-Nazad|2-NazadPOS|3-{Guid.NewGuid():D}";
         var csr = ZatcaCsr.Build(new ZatcaCsrSubject(
-            $"NZD-{branchId}-{seller.VatNumber}", serial, seller.VatNumber, Ascii(branch.NameEn, branch.NameAr),
+            ZatcaCsr.CommonName(branchId, seller.VatNumber), serial, seller.VatNumber, Ascii(branch.NameEn, branch.NameAr),
             Ascii(companyEn, seller.RegistrationName), types, Address(seller.Address), businessCategory), env, key);
 
         var attempt = new Attempt(this, connection, "zat_" + Guid.NewGuid().ToString("N")[..20]);

@@ -71,5 +71,13 @@ public sealed class ZatcaCsrTests
         Assert.Throws<ArgumentException>(() => ZatcaCsr.Build(Subject with { VatNumber = "123" }, "core", key));
         Assert.Throws<ArgumentException>(() => ZatcaCsr.Build(Subject with { SerialNumber = "x" }, "core", key));
         Assert.Throws<ArgumentException>(() => ZatcaCsr.Build(Subject with { InvoiceTypes = "1111" }, "core", key));
+        Assert.Throws<ArgumentException>(() => ZatcaCsr.Build(Subject with { CommonName = "NZD-brn_001-399999999900003" }, "core", key));
+    }
+
+    [Fact]
+    public void The_common_name_drops_what_ZATCA_refuses()
+    {
+        Assert.Equal("NZD-brn001-399999999900003", ZatcaCsr.CommonName("brn_001", "399999999900003"));
+        Assert.Equal("NZD-b2Riyadh-399999999900003", ZatcaCsr.CommonName("b2 Riyadh!@#$%&*", "399999999900003"));
     }
 }

@@ -36,6 +36,16 @@ public sealed record ZatcaCsrSubject(
 /// </summary>
 public static class ZatcaCsr
 {
+    /// <summary>
+    /// The unit's common name: NZD-&lt;branch&gt;-&lt;VAT number&gt;, letters, digits and
+    /// hyphens only. ZATCA's simulation refuses anything else
+    /// (CSR_MISSING_VALUE_ERROR "The CommonName should only contain alphanumeric
+    /// characters", measured 2026-11-23 on a branch id with an underscore);
+    /// hyphens are what its own SDK example uses.
+    /// </summary>
+    public static string CommonName(string branchId, string vatNumber) =>
+        $"NZD-{System.Text.RegularExpressions.Regex.Replace(branchId, "[^A-Za-z0-9]", "")}-{vatNumber}";
+
     public static string TemplateName(string environment) => environment switch
     {
         "developer-portal" => "TSTZATCA-Code-Signing",
@@ -116,6 +126,8 @@ public static class ZatcaCsr
             throw new ArgumentException("The EGS serial reads 1-…|2-…|3-….");
         if (!System.Text.RegularExpressions.Regex.IsMatch(s.VatNumber, "^3[0-9]{13}3$"))
             throw new ArgumentException("The VAT number is 15 digits, starting and ending with 3.");
+        if (!System.Text.RegularExpressions.Regex.IsMatch(s.CommonName, "^[A-Za-z0-9-]+$"))
+            throw new ArgumentException("The common name may hold only letters, digits and hyphens (ZATCA refuses others).");
         if (s.InvoiceTypes is not ("0100" or "1100"))
             throw new ArgumentException("Invoice types are 0100 (simplified) or 1100 (standard and simplified).");
         foreach (var (value, name) in new[]
