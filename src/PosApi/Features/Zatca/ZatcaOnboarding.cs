@@ -114,6 +114,8 @@ public sealed class ZatcaOnboarding(
             BusinessCategory: businessCategory), env, key);
 
         var attempt = new Attempt(this, connection, "zat_" + Guid.NewGuid().ToString("N")[..20]);
+        logger.LogInformation("ZATCA attempt {Attempt} for {Branch} ({Environment}): CN={CommonName}, serial={Serial}.",
+            attempt.Id, branchId, env, ZatcaCsr.CommonName(branchId, seller.VatNumber), serial);
         var keyCt = vault.Seal(Encoding.UTF8.GetBytes(key.ExportPkcs8PrivateKeyPem()), ZatcaVault.Context(tenantId, branchId, "privateKey"));
 
         await connection.ExecuteAsync(new CommandDefinition(
@@ -216,6 +218,8 @@ public sealed class ZatcaOnboarding(
             Ascii(companyEn, seller.RegistrationName), types, Address(seller.Address), businessCategory), env, key);
 
         var attempt = new Attempt(this, connection, "zat_" + Guid.NewGuid().ToString("N")[..20]);
+        logger.LogInformation("ZATCA attempt {Attempt} for {Branch} ({Environment}): CN={CommonName}, serial={Serial}.",
+            attempt.Id, branchId, env, ZatcaCsr.CommonName(branchId, seller.VatNumber), serial);
         var keyCt = vault.Seal(Encoding.UTF8.GetBytes(key.ExportPkcs8PrivateKeyPem()), ZatcaVault.Context(tenantId, branchId, "privateKey"));
         await connection.ExecuteAsync(new CommandDefinition(
             """
@@ -246,6 +250,37 @@ public sealed class ZatcaOnboarding(
 
         logger.LogInformation("ZATCA: branch {Branch} certificate renewed.", branchId);
         return await attempt.EndAsync("active", null, null, ct);
+    }
+
+    /// <summary>
+    /// Off-board a branch: its unit is retired and it stops signing at once;
+    /// its receipts go back to the simplified (Phase 1) QR. Nothing signed is
+    /// touched: the documents and the chain stay (ZATCA requires them kept),
+    /// and those not yet reported are still reported while the certificate is
+    /// valid, so revoke the unit in the Fatoora portal only once the queue is
+    /// empty. Onboarding the branch again later carries the chain on (same
+    /// environment) and signs only sales made from then.
+    /// Returns how many of its documents ZATCA has not yet accepted.
+    /// </summary>
+    public async Task<int> OffboardAsync(NpgsqlConnection connection, string branchId, string actor, CancellationToken ct)
+    {
+        if (connection.State != System.Data.ConnectionState.Open) await connection.OpenAsync(ct);
+        await using var branchLock = await BranchLockAsync(connection, branchId, ct);
+
+        var retired = await connection.ExecuteAsync(new CommandDefinition(
+            "UPDATE zatca.EgsUnit SET Status = 'retired', UpdatedAtUtc = now() AT TIME ZONE 'utc' " +
+            "WHERE BranchId = @BranchId AND Status = 'active';",
+            new { BranchId = branchId }, cancellationToken: ct));
+        if (retired == 0) throw new InvalidOperationException("This branch is not onboarded with ZATCA.");
+
+        var unreported = await connection.ExecuteScalarAsync<int>(new CommandDefinition(
+            "SELECT COUNT(*)::int FROM zatca.Document " +
+            "WHERE BranchId = @BranchId AND ReportingStatus IN ('pending', 'retrying');",
+            new { BranchId = branchId }, cancellationToken: ct));
+
+        logger.LogWarning("ZATCA: branch {Branch} off-boarded by {Actor}; {Unreported} document(s) not yet reported.",
+            branchId, actor, unreported);
+        return unreported;
     }
 
     /// <summary>
@@ -291,8 +326,11 @@ public sealed class ZatcaOnboarding(
                 LastIcv        = CASE WHEN zatca.EgsUnit.Environment = EXCLUDED.Environment THEN zatca.EgsUnit.LastIcv ELSE 0 END,
                 LastHash       = CASE WHEN zatca.EgsUnit.Environment = EXCLUDED.Environment THEN zatca.EgsUnit.LastHash
                                       ELSE 'NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ==' END,
-                ActivatedAtUtc = CASE WHEN zatca.EgsUnit.Environment = EXCLUDED.Environment THEN zatca.EgsUnit.ActivatedAtUtc
-                                      ELSE EXCLUDED.ActivatedAtUtc END,
+                /* Signing starts now unless the unit was already active here
+                   (renewal): sales made while a branch was off-boarded were
+                   handed out with the simplified QR and are never signed later. */
+                ActivatedAtUtc = CASE WHEN zatca.EgsUnit.Environment = EXCLUDED.Environment AND zatca.EgsUnit.Status = 'active'
+                                      THEN zatca.EgsUnit.ActivatedAtUtc ELSE EXCLUDED.ActivatedAtUtc END,
                 Environment = EXCLUDED.Environment, Status = 'active',
                 CertificateBase64 = EXCLUDED.CertificateBase64, CertificateNotAfter = EXCLUDED.CertificateNotAfter,
                 PrivateKeyCt = EXCLUDED.PrivateKeyCt, SecretCt = EXCLUDED.SecretCt, KekId = EXCLUDED.KekId,

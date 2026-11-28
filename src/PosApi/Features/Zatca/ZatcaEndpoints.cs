@@ -116,6 +116,8 @@ public sealed record OnboardingRequest(string BranchId, string Otp, string? Invo
 
 public sealed record RenewalRequest(string BranchId, string Otp, string? BusinessCategory);
 
+public sealed record OffboardingRequest(string BranchId);
+
 /// <summary>
 /// Onboarding a branch with ZATCA, for the owner:
 ///
@@ -123,6 +125,7 @@ public sealed record RenewalRequest(string BranchId, string Otp, string? Busines
 ///   POST /api/zatca/onboarding             { branchId, otp, invoiceTypes: 0100|1100 }
 ///   POST /api/zatca/renewal                { branchId, otp }
 ///   GET  /api/zatca/onboarding?branchId=…  past attempts and their steps
+///   POST /api/zatca/offboarding            { branchId }: stop signing at this branch
 /// </summary>
 public static class ZatcaOnboardingEndpoints
 {
@@ -137,6 +140,7 @@ public static class ZatcaOnboardingEndpoints
         group.MapGet("/onboarding", AttemptsAsync);
         group.MapPost("/onboarding", OnboardAsync);
         group.MapPost("/renewal", RenewAsync);
+        group.MapPost("/offboarding", OffboardAsync);
     }
 
     private static async Task<IResult> ReadinessAsync(
@@ -200,6 +204,27 @@ public static class ZatcaOnboardingEndpoints
         catch (InvalidOperationException ex)
         {
             return ProcErrors.Conflict("zatca_not_ready", ex.Message, ex.Message);
+        }
+    }
+
+    private static async Task<IResult> OffboardAsync(
+        OffboardingRequest request, ISqlConnectionFactory db, ICurrentUser current, ZatcaOnboarding onboarding,
+        HttpContext http, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.BranchId))
+            return ProcErrors.Field("branchId", "Choose the branch.", "اختر الفرع.");
+        if (!current.CanSeeBranch(request.BranchId)) return Results.Forbid();
+
+        await using var connection = await db.CreateOpenAsync(ct);
+        try
+        {
+            var unreported = await onboarding.OffboardAsync(connection, request.BranchId, current.Username, ct);
+            http.Items["AuditEntityId"] = request.BranchId;
+            return Results.Ok(new { request.BranchId, status = "retired", unreported });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return ProcErrors.Conflict("zatca_not_onboarded", ex.Message, "هذا الفرع غير مرتبط بالهيئة.");
         }
     }
 
